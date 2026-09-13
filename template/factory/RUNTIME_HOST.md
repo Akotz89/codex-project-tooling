@@ -247,6 +247,14 @@ Keep independent holdout scenarios private and unchanged by calibration. Repeat
 this calibration at initial setup and after a material evaluator, assertion,
 runtime-adapter or identity-contract change, not after prose-only edits.
 
+Save the probe command's actual stdout/stderr and exit status, then inspect the
+saved file for the literal measurements and candidate identity before accepting
+it as evidence. On Windows, `Start-Transcript` can capture terminal prompts
+instead of subprocess output; a nonempty transcript alone is not proof of the
+observations. Capture subprocess output directly. If recovering an original tool
+receipt, preserve its provenance and the original artifacts without inventing
+measurements or presenting a replay as the original attempt.
+
 ## Identity and supported shapes
 
 HTTP apps must implement a build-id path that returns the exact
