@@ -45,14 +45,17 @@ class ResourceTests(unittest.TestCase):
         self.git("commit", "-m", "first candidate")
         self.resource = self.base / "candidate"
 
-    def git(self, *args):
+    def git(self, *args, input=None):
         return subprocess.run(["git", *args], cwd=self.repo, check=True, capture_output=True,
-                              text=True).stdout.strip()
+                              text=True, input=input).stdout.strip()
 
-    def prepare(self, revision, destination=None):
-        return subprocess.run([sys.executable, str(self.repo / "factory/runtime_resource.py"),
-                               "prepare", "--destination", str(destination or self.resource),
-                               "--expected-revision", revision], cwd=self.repo,
+    def prepare(self, revision=None, destination=None, config=None, helper=None, cwd=None):
+        command = [sys.executable, str(helper or self.repo / "factory/runtime_resource.py"),
+                   "prepare", "--destination", str(destination or self.resource),
+                   "--config", str(config or self.config())]
+        if revision is not None:
+            command.extend(["--expected-revision", revision])
+        return subprocess.run(command, cwd=cwd or self.repo,
                               capture_output=True, text=True, timeout=30)
 
     def config(self):
@@ -85,7 +88,7 @@ class ResourceTests(unittest.TestCase):
             with urlopen(first_item["target"] + "/health", timeout=2) as response:
                 self.assertEqual(response.read().decode(), "first")
             self.assertEqual(first_item["source_revision"], first)
-            self.assertNotEqual(first_item["input_digest"], first_item["resource_digest"])
+            self.assertEqual(first_item["input_digest"], first_item["resource_digest"])
 
             (self.repo / "app.py").write_text(APP.replace("VALUE", "second"), encoding="utf-8")
             self.git("add", "app.py")
@@ -111,6 +114,62 @@ class ResourceTests(unittest.TestCase):
         sentinel.write_text("keep")
         self.assertNotEqual(self.prepare(revision, unowned).returncode, 0)
         self.assertEqual(sentinel.read_text(), "keep")
+
+        relative = Path("relative-candidate")
+        self.assertNotEqual(self.prepare(revision, relative).returncode, 0)
+        self.assertFalse((self.repo / relative).exists())
+
+    def test_only_configured_committed_application_paths_are_materialized(self):
+        private = self.repo / ".factory/holdout/HOLDOUT.md"
+        private.parent.mkdir(parents=True)
+        private.write_text("SYNTHETIC_PRIVATE_CONTROL", encoding="utf-8")
+        self.git("add", ".factory/holdout/HOLDOUT.md")
+        self.git("commit", "-m", "tracked synthetic evaluator control")
+        revision = self.git("rev-parse", "HEAD")
+
+        result = self.prepare(revision)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.resource / "app.py").is_file())
+        self.assertFalse((self.resource / ".factory").exists())
+
+    def test_invalid_includes_preserve_existing_owned_resource(self):
+        revision = self.git("rev-parse", "HEAD")
+        self.assertEqual(self.prepare(revision).returncode, 0)
+        original_marker = (self.resource / ".factory-resource.json").read_bytes()
+        original_app = (self.resource / "app.py").read_bytes()
+        outside = self.base / "outside.py"
+        outside.write_text("secret", encoding="utf-8")
+
+        blob = self.git("hash-object", "-w", "--stdin", input="outside.py")
+        self.git("update-index", "--add", "--cacheinfo", f"120000,{blob},linked.py")
+        self.git("commit", "-m", "tracked synthetic link")
+        linked_revision = self.git("rev-parse", "HEAD")
+
+        for include in ("../outside.py", ".factory", "missing.py", "linked.py"):
+            with self.subTest(include=include):
+                config = self.base / f"invalid-{len(include)}.json"
+                config.write_text(json.dumps({"version": 1, "include": [include]}))
+                result = self.prepare(linked_revision, config=config)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual((self.resource / ".factory-resource.json").read_bytes(),
+                                 original_marker)
+                self.assertEqual((self.resource / "app.py").read_bytes(), original_app)
+
+    def test_absolute_helper_from_an_old_checkout_is_refused_in_delivering_cwd(self):
+        old_repo = self.base / "old-delivery"
+        shutil.copytree(self.repo, old_repo)
+        (self.repo / "app.py").write_text(APP.replace("VALUE", "new"), encoding="utf-8")
+        self.git("add", "app.py")
+        self.git("commit", "-m", "new delivering candidate")
+        destination = self.base / "old-candidate"
+
+        result = self.prepare(destination=destination,
+                              helper=old_repo / "factory/runtime_resource.py",
+                              cwd=self.repo)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(destination.exists())
 
 
 if __name__ == "__main__":

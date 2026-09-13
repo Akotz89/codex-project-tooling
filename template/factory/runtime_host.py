@@ -22,7 +22,7 @@ from urllib.request import Request, build_opener, ProxyHandler, HTTPRedirectHand
 from urllib.error import URLError
 
 from runtime_process import ProcessTree
-from runtime_resource import MARKER, owned_destination, resource_digest
+from runtime_resource import FORBIDDEN, MARKER, owned_destination, resource_digest
 
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
@@ -30,9 +30,6 @@ class NoRedirect(HTTPRedirectHandler):
 
 
 HTTP = build_opener(ProxyHandler({}), NoRedirect())
-FORBIDDEN = {".git", ".factory", ".archon", ".claude", ".env", ".factory-resource.json", "holdout.md",
-             "node_modules", ".venv", "__pycache__"}
-
 def safe_path(root, relative):
     if (not isinstance(relative, str) or not relative or Path(relative).anchor
             or Path(relative).drive):

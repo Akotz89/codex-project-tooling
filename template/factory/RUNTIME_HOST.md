@@ -80,27 +80,32 @@ Run preparation from the checkout Archon is delivering. Pass the trusted full
 revision selected by that delivery; do not obtain it from the old candidate root:
 
 ```text
-python factory/runtime_resource.py prepare --destination /private/candidate
+python factory/runtime_resource.py prepare --config /private/runtime.json --destination /private/candidate --expected-revision <delivered-sha>
 ```
 
-The portable Python command invokes Git directly, archives only committed bytes,
-and records the source revision, tree and resource digest in the owned root. It
+The portable Python command reads `include` from the same runtime configuration,
+invokes Git directly, and archives only those permitted committed application
+paths. Tracked evaluator, holdout and other repository files outside that list
+never enter the resource. The command records the source revision, tree, include
+list and resource digest in the owned root. It
 refuses modified tracked source, a revision other than the helper's own checkout
-HEAD, links, broad destinations and any existing directory it did not create.
+HEAD, forbidden/escaping/missing/linked includes, broad or relative destinations,
+and any existing directory it did not create.
 It never deletes an unowned directory. No `rm`, `find`, shell pipe or platform
 archive program is part of the normal path.
 
-The helper is anchored to the repository containing its own installed file, so it
-cannot silently prepare a separately configured old root. Automation that already
-owns a trusted full SHA may also pass `--expected-revision <sha>`; a mismatch is
-refused. The scenario cleans its slot and uses the helper's `start` wrapper so the
-same delivering checkout supplies its revision at the runtime boundary:
+The helper and the workflow working directory must resolve to the same delivering
+Git checkout. An absolute helper path into an old checkout is refused even when
+`--expected-revision` is omitted. Automation should pass its trusted full SHA;
+a mismatch is refused. The scenario cleans its slot and uses the helper's `start`
+wrapper so the same delivering checkout supplies its revision at the runtime
+boundary:
 
 ```json
 {
   "environment": {
     "ownership": "external",
-    "setup": "python factory/runtime_resource.py prepare --destination /private/candidate && python factory/runtime_host.py setup --slot baseline --connection-file /private/connection.json",
+    "setup": "python factory/runtime_resource.py prepare --config /private/runtime.json --destination /private/candidate && python factory/runtime_host.py setup --slot baseline --connection-file /private/connection.json",
     "start": "python factory/runtime_resource.py start --slot baseline --root candidate --connection-file /private/connection.json",
     "teardown": "python factory/runtime_host.py teardown --slot baseline --connection-file /private/connection.json",
     "candidate_command": "python factory/runtime_host.py identity --slot baseline --connection-file /private/connection.json"
@@ -108,10 +113,11 @@ same delivering checkout supplies its revision at the runtime boundary:
 }
 ```
 
-Use absolute executable and script paths when the workflow working directory is
-not the delivered checkout. The host reloads and checks the binding on every start,
-so an old prepared root, an explicitly stale expected revision, or changed prepared
-bytes fail before behavioral verification.
+Run these commands with the delivered checkout as the workflow working directory.
+Absolute executable and script paths are safe only when the script belongs to that
+same checkout; never fall back to a helper in an older checkout. The host reloads
+and checks the binding on every start, so an old prepared root, an explicitly stale
+expected revision, or changed prepared bytes fail before behavioral verification.
 
 `setup` is optional and runs inside the new snapshot. `command` is required.
 Both accept argv arrays only, with literal `{python}`, `{source}`, `{state}` and

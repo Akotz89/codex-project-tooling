@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
 import shutil
 import stat
 import subprocess
@@ -15,6 +16,8 @@ import zipfile
 
 
 MARKER = ".factory-resource.json"
+FORBIDDEN = {".git", ".factory", ".archon", ".claude", ".env", MARKER,
+             "holdout.md", "node_modules", ".venv", "__pycache__"}
 
 
 def checked(argv: list[str], cwd: Path) -> str:
@@ -22,6 +25,13 @@ def checked(argv: list[str], cwd: Path) -> str:
     if result.returncode:
         raise ValueError("Git could not verify the delivering revision")
     return result.stdout.strip()
+
+
+def checked_bytes(argv: list[str], cwd: Path) -> bytes:
+    result = subprocess.run(argv, cwd=cwd, capture_output=True, timeout=120)
+    if result.returncode:
+        raise ValueError("Git could not verify the delivering revision")
+    return result.stdout
 
 
 def resource_digest(root: Path) -> str:
@@ -63,6 +73,11 @@ def delivery(expected_revision: str | None = None) -> tuple[Path, str]:
     repository = Path(checked(["git", "rev-parse", "--show-toplevel"], script_root)).resolve()
     if script_root != repository:
         raise ValueError("resource helper must run from its delivering repository")
+    workflow_repository = Path(
+        checked(["git", "rev-parse", "--show-toplevel"], Path.cwd())
+    ).resolve()
+    if workflow_repository != repository:
+        raise ValueError("resource helper and workflow must use the same delivering repository")
     actual_revision = checked(["git", "rev-parse", "HEAD"], repository)
     if expected_revision is not None and expected_revision != actual_revision:
         raise ValueError("expected revision does not match the delivering checkout")
@@ -73,21 +88,73 @@ def delivery(expected_revision: str | None = None) -> tuple[Path, str]:
     return repository, actual_revision
 
 
-def prepare(destination: Path, expected_revision: str | None = None) -> dict:
-    repository, actual_revision = delivery(expected_revision)
+def configured_includes(config: Path) -> list[str]:
+    data = json.loads(config.read_text(encoding="utf-8"))
+    includes = data.get("include") if isinstance(data, dict) and data.get("version") == 1 else None
+    if (not isinstance(includes, list) or not includes
+            or not all(isinstance(value, str) for value in includes)):
+        raise ValueError("runtime config requires version 1 and nonempty include paths")
+    result = []
+    for value in includes:
+        path = PurePosixPath(value)
+        if (not value or value != path.as_posix() or "\\" in value or path.is_absolute()
+                or any(part in {"", ".", ".."} or part.lower() in FORBIDDEN
+                       for part in path.parts)):
+            raise ValueError("private or escaping include path refused")
+        result.append(path.as_posix())
+    return result
 
-    destination = destination.absolute()
+
+def committed_files(repository: Path, revision: str, includes: list[str]) -> None:
+    for include in includes:
+        entry = checked_bytes(["git", "ls-tree", "-z", revision, "--", include], repository)
+        if not entry:
+            raise ValueError("configured include is missing from the delivering revision")
+
+    entries = checked_bytes(
+        ["git", "ls-tree", "-rz", "--full-tree", revision, "--", *includes], repository
+    )
+    if not entries:
+        raise ValueError("configured includes produced an empty resource")
+    for raw in entries.split(b"\0"):
+        if not raw:
+            continue
+        metadata, separator, name = raw.partition(b"\t")
+        fields = metadata.split()
+        if not separator or len(fields) != 3 or fields[0] not in {b"100644", b"100755"}:
+            raise ValueError("linked or unsupported committed source path refused")
+        try:
+            decoded = name.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError("committed source path is not UTF-8") from error
+        path = PurePosixPath(decoded)
+        if ("\\" in decoded or path.is_absolute()
+                or any(part in {"", ".", ".."} or part.lower() in FORBIDDEN
+                       for part in path.parts)):
+            raise ValueError("private or escaping committed source path refused")
+
+
+def validate_destination(destination: Path, repository: Path) -> Path:
+    if (not destination.is_absolute() or destination == Path(destination.anchor)
+            or ".." in destination.parts):
+        raise ValueError("destination must be an explicit absolute directory")
     cursor = destination
     while cursor != cursor.parent:
         if cursor.exists() and (cursor.is_symlink()
                 or (hasattr(cursor, "is_junction") and cursor.is_junction())):
             raise ValueError("linked destinations are unsupported")
         cursor = cursor.parent
-    destination = destination.resolve()
-    if not destination.is_absolute() or destination == Path(destination.anchor):
-        raise ValueError("destination must be an explicit absolute directory")
-    if destination == repository or repository.is_relative_to(destination):
+    resolved = destination.resolve()
+    if resolved == repository or repository.is_relative_to(resolved):
         raise ValueError("destination cannot contain the delivering repository")
+    return resolved
+
+
+def prepare(destination: Path, config: Path, expected_revision: str | None = None) -> dict:
+    repository, actual_revision = delivery(expected_revision)
+    destination = validate_destination(destination, repository)
+    includes = configured_includes(config)
+    committed_files(repository, actual_revision, includes)
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.parent.is_symlink():
         raise ValueError("linked destination parents are unsupported")
@@ -98,7 +165,7 @@ def prepare(destination: Path, expected_revision: str | None = None) -> dict:
     archive = staging.with_suffix(".zip")
     try:
         result = subprocess.run(["git", "archive", "--format=zip", "--output", str(archive),
-                                 actual_revision], cwd=repository, timeout=120)
+                                 actual_revision, "--", *includes], cwd=repository, timeout=120)
         if result.returncode:
             raise ValueError("Git could not materialize the delivering revision")
         with zipfile.ZipFile(archive) as bundle:
@@ -114,6 +181,7 @@ def prepare(destination: Path, expected_revision: str | None = None) -> dict:
             "source_tree": checked(["git", "rev-parse", f"{actual_revision}^{{tree}}"], repository),
             "resource_root": str(destination),
             "resource_digest": resource_digest(staging),
+            "include": includes,
         }
         (staging / MARKER).write_text(json.dumps(mapping, indent=2) + "\n", encoding="utf-8")
         if destination.exists():
@@ -131,6 +199,7 @@ def main(argv=None) -> int:
     sub = parser.add_subparsers(dest="action", required=True)
     node = sub.add_parser("prepare")
     node.add_argument("--destination", required=True, type=Path)
+    node.add_argument("--config", required=True, type=Path)
     node.add_argument("--expected-revision")
     start = sub.add_parser("start", help="start a bound root as this delivering revision")
     start.add_argument("--slot", required=True)
@@ -140,7 +209,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.action == "prepare":
-            print(json.dumps(prepare(args.destination, args.expected_revision)))
+            print(json.dumps(prepare(args.destination, args.config, args.expected_revision)))
             return 0
         repository, revision = delivery()
         command = [sys.executable, str(repository / "factory/runtime_host.py"), "start",

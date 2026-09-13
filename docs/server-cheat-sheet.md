@@ -238,7 +238,7 @@ starts a fresh copy of the candidate on a private port. This is what makes
 
 **💬 Prompt to your agent**
 ```text
-On the server, follow ~/<app>/factory/RUNTIME_HOST.md. Write the bound runtime host configuration and scenario JSON for my journeys, plus a separate holdout scenario, under /root/private (outside the repo, mode 700). Run the runtime host as a systemd service with a private connection file. Use factory/runtime_resource.py from each delivering checkout to prepare and start the candidate, binding both operations to that checkout's committed revision. Do not point the host at a fixed copy of main. Calibrate with the shared runtime suite: a substantive baseline that creates or earns nonempty, nonzero state must verify, a relevant deliberate mutation must fail, and a separate wrong-identity runtime check must stay inconclusive. Prove cleanup without disturbing an unrelated listener. The app must answer /build-id with the host's candidate string.
+On the server, follow ~/<app>/factory/RUNTIME_HOST.md. Write the bound runtime host configuration and scenario JSON for my journeys, plus a separate holdout scenario, under /root/private (outside the repo, mode 700). Run the runtime host as a systemd service with a private connection file. From each delivering checkout, use `python factory/runtime_resource.py prepare --config /root/private/runtime.json --destination /root/private/candidate --expected-revision <delivered-sha>` and the documented start wrapper. The config's explicit include list must contain only application paths. Do not point the host at a fixed copy of main or call a helper in an older checkout. Calibrate with the shared runtime suite: a substantive baseline that creates or earns nonempty, nonzero state must verify, a relevant deliberate mutation must fail, and a separate wrong-identity runtime check must stay inconclusive. Prove cleanup without disturbing an unrelated listener. The app must answer /build-id with the host's candidate string.
 ```
 
 **The candidate root is the one thing here that fails quietly.** Leave it as a
@@ -246,7 +246,8 @@ fixed copy of `main` and every lifecycle run verifies that stale tree instead of
 the pull request. Nothing looks wrong: the app boots, every assertion passes,
 and the report says `verified`. The preparation binding now catches that before
 behavioral credit: stale revision or changed resource bytes are refused at start.
-The root is materialized from committed bytes in the delivering checkout and
+The root is materialized only from the configuration's permitted committed app
+paths in the delivering checkout; tracked private evaluator files stay out. It
 cannot be a symlink. `factory/RUNTIME_HOST.md` carries the exact CLI and schema.
 
 Prove the mutation too, not just the clean start. A runtime host that cannot
