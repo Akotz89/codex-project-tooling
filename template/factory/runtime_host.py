@@ -22,6 +22,7 @@ from urllib.request import Request, build_opener, ProxyHandler, HTTPRedirectHand
 from urllib.error import URLError
 
 from runtime_process import ProcessTree
+from runtime_resource import MARKER, owned_destination, resource_digest
 
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
@@ -29,9 +30,8 @@ class NoRedirect(HTTPRedirectHandler):
 
 
 HTTP = build_opener(ProxyHandler({}), NoRedirect())
-FORBIDDEN = {".git", ".factory", ".archon", ".claude", ".env", "holdout.md",
+FORBIDDEN = {".git", ".factory", ".archon", ".claude", ".env", ".factory-resource.json", "holdout.md",
              "node_modules", ".venv", "__pycache__"}
-
 
 def safe_path(root, relative):
     if (not isinstance(relative, str) or not relative or Path(relative).anchor
@@ -118,11 +118,18 @@ class Environments:
             raise ValueError("runtime config requires version 1 and named roots")
         self.config = config
         self.roots = {}
+        self.bindings = {}
         for name, raw in config["roots"].items():
-            path = Path(raw)
-            if not path.is_absolute() or not path.is_dir() or path.is_symlink():
+            bound = isinstance(raw, dict)
+            path = Path(raw.get("path", "")) if bound else Path(raw)
+            if not path.is_absolute() or path.is_symlink() or (not bound and not path.is_dir()):
                 raise ValueError("roots must be explicit absolute directories")
-            self.roots[name] = path.resolve()
+            path = path.resolve()
+            if bound:
+                if set(raw) != {"path", "binding"} or raw["binding"] != MARKER:
+                    raise ValueError("bound roots require path and .factory-resource.json binding")
+                self.bindings[name] = True
+            self.roots[name] = path
         self.stopping = stopping
         self.base = Path(tempfile.mkdtemp(prefix="factory-runtime-"))
         self.active = {}
@@ -148,11 +155,21 @@ class Environments:
             raise ValueError("invalid slot")
         # Replacement is cleanup-first, including a malformed retry request.
         self.teardown(slot)
-        if set(request) - {"slot", "root", "mutation", "expected_source"}:
+        if set(request) - {"slot", "root", "mutation", "expected_source", "expected_revision"}:
             raise ValueError("unknown start fields; commands and paths cannot be supplied by callers")
         root = self.roots.get(request.get("root"))
         if root is None:
             raise ValueError("unknown configured root")
+        binding = None
+        if self.bindings.get(request.get("root")):
+            if not owned_destination(root):
+                raise ValueError("bound root is not an owned runtime resource")
+            binding = json.loads((root / MARKER).read_text(encoding="utf-8"))
+            expected_revision = request.get("expected_revision")
+            if not isinstance(expected_revision, str) or expected_revision != binding["source_revision"]:
+                raise ValueError("stale expected candidate revision")
+            if resource_digest(root) != binding["resource_digest"]:
+                raise ValueError("prepared candidate resource changed")
         cfg = self.config
         if cfg.get("shape") not in {"http", "cli", "library"}:
             raise ValueError("supported shapes: http, cli, library")
@@ -229,7 +246,7 @@ class Environments:
             proc = ProcessTree(argv, source, env)
             item["processes"].append(proc)
             item.update(candidate=identity, digest=actual, proc=proc, shape=cfg["shape"],
-                        target=f"http://127.0.0.1:{port}", original=before)
+                        target=f"http://127.0.0.1:{port}", original=before, binding=binding)
             if cfg["shape"] == "http":
                 deadline = time.monotonic() + timeout
                 while True:
@@ -281,11 +298,16 @@ class Environments:
             self.probe(item)
             if tree_digest(item["source"]) != item["digest"]:
                 raise ValueError("candidate changed during probe")
-        return {"version": 1, "slot": slot, "candidate": item["candidate"],
+        result = {"version": 1, "slot": slot, "candidate": item["candidate"],
                 "source_digest": item["digest"], "input_digest": item["original"],
                 "shape": item["shape"], "target": item["target"] if item["shape"] == "http" else None,
                 "exit_code": item.get("exit_code"), "snapshot": str(item["source"]),
                 "state": str(item["directory"] / "state")}
+        if item["binding"]:
+            result.update(source_revision=item["binding"]["source_revision"],
+                          source_tree=item["binding"]["source_tree"],
+                          resource_digest=item["binding"]["resource_digest"])
+        return result
 
 
 def serve(config):
@@ -411,6 +433,7 @@ def main(argv=None):
             node.add_argument("--root", required=True)
             node.add_argument("--mutation")
             node.add_argument("--expected-source")
+            node.add_argument("--expected-revision")
     args = parser.parse_args(argv)
     try:
         if args.action == "_serve":

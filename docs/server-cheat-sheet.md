@@ -238,18 +238,16 @@ starts a fresh copy of the candidate on a private port. This is what makes
 
 **💬 Prompt to your agent**
 ```text
-On the server, follow ~/<app>/factory/RUNTIME_HOST.md. Write the runtime host configuration and the scenario JSON for my journeys, plus a separate holdout scenario, under /root/private (outside the repo, mode 700). Run the runtime host as a systemd service with a private connection file. The candidate root must be re-materialised from the delivering checkout at the start of every run, so put that refresh in each scenario's setup command -- do not leave the root pointing at a fixed copy of main. Prove one start, identity and teardown cycle, and prove a deliberate mutation fails. The app must answer /build-id with the host's candidate string.
+On the server, follow ~/<app>/factory/RUNTIME_HOST.md. Write the bound runtime host configuration and scenario JSON for my journeys, plus a separate holdout scenario, under /root/private (outside the repo, mode 700). Run the runtime host as a systemd service with a private connection file. Use factory/runtime_resource.py from each delivering checkout to prepare and start the candidate, binding both operations to that checkout's committed revision. Do not point the host at a fixed copy of main. Calibrate with the shared runtime suite: a substantive baseline that creates or earns nonempty, nonzero state must verify, a relevant deliberate mutation must fail, and a separate wrong-identity runtime check must stay inconclusive. Prove cleanup without disturbing an unrelated listener. The app must answer /build-id with the host's candidate string.
 ```
 
 **The candidate root is the one thing here that fails quietly.** Leave it as a
 fixed copy of `main` and every lifecycle run verifies that stale tree instead of
 the pull request. Nothing looks wrong: the app boots, every assertion passes,
-and the report says `verified`. What catches it is the digest comparison at
-merge — the configured source digest will not match the delivered revision, and
-the gate holds with a target mismatch rather than merging code nobody tested.
-The root has to be refreshed from the delivering checkout before each start, and
-it cannot be a symlink; the host refuses linked source paths.
-`factory/RUNTIME_HOST.md` carries the script.
+and the report says `verified`. The preparation binding now catches that before
+behavioral credit: stale revision or changed resource bytes are refused at start.
+The root is materialized from committed bytes in the delivering checkout and
+cannot be a symlink. `factory/RUNTIME_HOST.md` carries the exact CLI and schema.
 
 Prove the mutation too, not just the clean start. A runtime host that cannot
 fail is not a gate, and a deliberate defect from `harness/mutations/defects.json`

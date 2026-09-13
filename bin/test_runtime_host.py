@@ -151,6 +151,18 @@ class RuntimeTests(unittest.TestCase):
                 request("identity", {"slot": "case"}, host.connection)
             self.assert_clean(item, pids)
 
+    def test_unrelated_listener_survives_owned_runtime_cleanup(self):
+        import socket
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        self.addCleanup(listener.close)
+        with self.host() as host:
+            item = self.start(host)
+            pids = self.pids(item)
+        self.assert_clean(item, pids)
+        self.assertEqual(listener.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR), 0)
+
     def test_stale_source_and_snapshot_changes_refused(self):
         with self.host() as host:
             expected = digest(source_files(self.root, ["app.py"]))

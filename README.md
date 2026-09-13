@@ -131,7 +131,11 @@ runtime host waits, for the start command the first ticket declares (step 5).
 Configure the project's static/unit commands and translate the journeys into the
 runtime scenario inputs required by the shared workflows. Follow the installed
 `factory/RUNTIME_HOST.md` for ordinary app startup, fresh state and candidate
-worktrees. The agent handles this wiring; the user supplies the product intent.
+resources. Bind preparation and start to the delivering commit, then run the
+documented calibration: baseline verified, a relevant deliberate fault failed,
+and a wrong-identity check inconclusive. Assertions must exercise real transitions
+and nonempty/nonzero user value rather than directly seeding the final state. The
+agent handles this wiring; the user supplies the product intent.
 
 **4. Check the installation and hand it back.**
 

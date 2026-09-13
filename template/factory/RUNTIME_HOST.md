@@ -46,7 +46,12 @@ Configuration is operator-owned JSON, loaded once by the owner. Example:
 ```json
 {
   "version": 1,
-  "roots": {"candidate": "/absolute/approved/worktree"},
+  "roots": {
+    "candidate": {
+      "path": "/absolute/private/candidate",
+      "binding": ".factory-resource.json"
+    }
+  },
   "include": ["app.py", "src"],
   "shape": "http",
   "setup": ["{python}", "src/prepare.py"],
@@ -69,47 +74,44 @@ environments, node_modules and bytecode caches are refused in included paths.
 An included directory containing these fails explicitly. Do not list the whole
 checkout. Other private evaluator filenames must also be excluded by the operator.
 
-### The candidate root must track the delivered revision
+### Bind the candidate root to the delivered revision
 
-`roots.candidate` is a real directory holding the exact bytes to verify, and the
-host never updates it for you. A root left pointing at a fixed copy of `main`
-verifies that copy on every run, forever: the app boots, the assertions pass and
-the report says `verified`, while the pull request under review was never
-executed. The merge gate is what catches it, by comparing the configured source
-digest against the delivered revision and holding on a target mismatch. Nothing
-fails earlier, so wire this correctly the first time.
+Run preparation from the checkout Archon is delivering. Pass the trusted full
+revision selected by that delivery; do not obtain it from the old candidate root:
 
-A symlink does not solve it — linked source paths are refused. Re-materialise the
-root from the delivering checkout instead, in each scenario's `setup` command,
-which runs before `start`:
-
-```bash
-#!/usr/bin/env bash
-# /root/private/refresh-candidate.sh -- operator-owned, mode 700.
-# Run from the checkout being delivered; the shared workflow's setup step is
-# already there.
-set -euo pipefail
-SRC="$(git rev-parse --show-toplevel)"
-REV="$(git rev-parse HEAD)"
-rm -rf /root/candidate && mkdir -p /root/candidate
-git -C "$SRC" archive "$REV" | tar -x -C /root/candidate
-find /root/candidate -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null || true
-echo "candidate root synced to $REV from $SRC" >&2
+```text
+python factory/runtime_resource.py prepare --destination /private/candidate
 ```
 
-`git archive` is what keeps the copy clean: it writes only committed bytes, with
-no `.git` directory and none of the ignored files the include rules refuse.
+The portable Python command invokes Git directly, archives only committed bytes,
+and records the source revision, tree and resource digest in the owned root. It
+refuses modified tracked source, a revision other than the helper's own checkout
+HEAD, links, broad destinations and any existing directory it did not create.
+It never deletes an unowned directory. No `rm`, `find`, shell pipe or platform
+archive program is part of the normal path.
 
-Then chain it ahead of the host call in the scenario's `environment.setup`:
+The helper is anchored to the repository containing its own installed file, so it
+cannot silently prepare a separately configured old root. Automation that already
+owns a trusted full SHA may also pass `--expected-revision <sha>`; a mismatch is
+refused. The scenario cleans its slot and uses the helper's `start` wrapper so the
+same delivering checkout supplies its revision at the runtime boundary:
 
 ```json
-"setup": "/root/private/refresh-candidate.sh && python factory/runtime_host.py setup --slot baseline --connection-file /private/connection.json"
+{
+  "environment": {
+    "ownership": "external",
+    "setup": "python factory/runtime_resource.py prepare --destination /private/candidate && python factory/runtime_host.py setup --slot baseline --connection-file /private/connection.json",
+    "start": "python factory/runtime_resource.py start --slot baseline --root candidate --connection-file /private/connection.json",
+    "teardown": "python factory/runtime_host.py teardown --slot baseline --connection-file /private/connection.json",
+    "candidate_command": "python factory/runtime_host.py identity --slot baseline --connection-file /private/connection.json"
+  }
+}
 ```
 
-Verify it once, deliberately: start a slot, and confirm the reported
-`source_digest` changes when the delivered revision changes. A digest that never
-moves between runs means the root is frozen and every later `verified` is about
-the wrong tree.
+Use absolute executable and script paths when the workflow working directory is
+not the delivered checkout. The host reloads and checks the binding on every start,
+so an old prepared root, an explicitly stale expected revision, or changed prepared
+bytes fail before behavioral verification.
 
 `setup` is optional and runs inside the new snapshot. `command` is required.
 Both accept argv arrays only, with literal `{python}`, `{source}`, `{state}` and
@@ -134,11 +136,11 @@ These commands do no evaluation and contain no workflow policy:
 
 ```text
 python factory/runtime_host.py setup --slot baseline
-python factory/runtime_host.py start --slot baseline --root candidate
+python factory/runtime_host.py start --slot baseline --root candidate --expected-revision <delivered-sha>
 python factory/runtime_host.py describe --slot baseline
 python factory/runtime_host.py identity --slot baseline
 python factory/runtime_host.py teardown --slot baseline
-python factory/runtime_host.py start --slot negative --root candidate --mutation negative
+python factory/runtime_host.py start --slot negative --root candidate --expected-revision <delivered-sha> --mutation negative
 ```
 
 Slots are operator-chosen alphanumeric/underscore/hyphen names. Each `start`
@@ -147,8 +149,10 @@ optionally applies ONE uniquely anchored configured mutation, runs setup, freeze
 and hashes source, allocates a new target/state, starts the configured command and
 waits for readiness. `--expected-source <sha256>` optionally rejects stale input
 bytes. A second start is always fresh, whether baseline, holdout or malformed-report
-retry. The shared composition decides when to issue it; there is no Python suite
-loop. Concurrent cases must use distinct slots. This owner serializes requests.
+retry. A bound root also requires `--expected-revision`; legacy unbound ordinary
+roots retain `--expected-source` but make no delivered-revision claim. The shared
+composition decides when to issue it; there is no Python suite loop. Concurrent
+cases must use distinct slots. This owner serializes requests.
 
 `setup` is an idempotent cleanup boundary; provisioning happens atomically in
 `start`. `teardown` is idempotent and terminates descendants before deleting files.
@@ -157,7 +161,8 @@ return a generic error without echoing commands, secrets or evaluator contents.
 Unauthenticated requests return 403 without disturbing running apps.
 
 `start` and `describe` return JSON with `version`, `slot`, `candidate`,
-`source_digest` (post-setup/mutation bytes), `input_digest` (original input bytes),
+`source_digest` (post-setup/mutation included bytes), `input_digest` (included
+bytes before project setup),
 `shape`, `target`, `exit_code`, `snapshot`, and `state`. `identity` prints only the
 candidate string for the producer's `candidate_command`. The local control API
 uses POST `/setup`, `/start`, `/identity`, `/teardown` with these CLI fields as JSON
@@ -169,7 +174,8 @@ For PR3227's external environment contract, set `environment.ownership` to
 `candidate_command` to `identity --slot <case>`. Use absolute, correctly Bash-quoted
 executable/script paths when Archon changes working directory. Commands are fixed
 trusted project strings; never interpolate caller-provided text into shell syntax.
-The producer's current start node logs command output rather than returning target
+Bound results also map the input through `source_revision`, `source_tree` and
+`resource_digest`. The producer's current start node logs command output rather than returning target
 JSON to the verifier. Project assertion data can tell the verifier to read
 `describe --slot <case>` to discover its target; the shared suite may instead map
 typed data natively. Do not hardcode the ephemeral port. An expected candidate
@@ -179,8 +185,61 @@ Keep original `harness/END-TO-END.md`, `.factory/holdout/HOLDOUT.md`, and defect
 unchanged. Convert assertions and case metadata into separate project JSON as
 data only. Store private holdout scenario JSON outside the builder checkout;
 do not include it in app snapshots. Factory does not generate shared instructions.
-The final suite manifest and live Allot cases remain integration work for the root
-owner, alongside the final producer pin.
+### Calibrate the evaluator before relying on it
+
+Author assertions around substantive user behavior: make the user create or earn
+a nonempty value, take a real transition, and verify the resulting nonzero value
+and visible state. Do not seed the final state directly or accept only "the page
+loads". Configure one uniquely anchored mutation that breaks that behavior.
+
+For example, adapt this to the product's public interface in both controls:
+
+```json
+{
+  "assertions": [
+    {
+      "id": "earned-value",
+      "description": "Begin with fresh state, create one real user record through the public interface, perform the user action that earns value, then observe exactly one record, a nonempty display value, and an earned numeric value greater than zero. Do not write the database or seed the resulting state directly."
+    }
+  ],
+  "environment": {
+    "ownership": "external",
+    "candidate_command": "python factory/runtime_host.py identity --slot baseline --connection-file /private/connection.json"
+  }
+}
+```
+
+Start stable baseline and mutation slots, record their exact host identities, and
+write a caller-owned suite manifest accepted by `archon-verify-runtime-suite`:
+
+```json
+{
+  "baseline": "baseline",
+  "cases": [
+    {"id": "baseline", "scenario": "baseline.json", "candidate": "<baseline identity>", "expected_verdict": "verified"},
+    {"id": "relevant-fault", "scenario": "relevant-fault.json", "candidate": "<mutation identity>", "expected_verdict": "failed"}
+  ]
+}
+```
+
+The two scenarios probe those already-running slots and apply the same behavioral
+expectations; the fault description identifies it as a deliberate control. Run:
+
+```text
+python factory/consumer.py run archon-verify-runtime-suite --input manifest=/private/calibration/manifest.json
+```
+
+Require `expectations_passed: true` and `baseline_verified: true`. Do not create
+native return files yourself. Separately run `archon-verify-runtime` with the
+baseline scenario and a deliberately different `candidate` input; require its
+native verdict to be `inconclusive`. The pinned suite manifest schema permits only
+`verified` and `failed` expectations, so the identity/infrastructure control
+cannot truthfully be an expected third suite case. An unavailable case never
+counts as a caught mutation.
+
+Keep independent holdout scenarios private and unchanged by calibration. Repeat
+this calibration at initial setup and after a material evaluator, assertion,
+runtime-adapter or identity-contract change, not after prose-only edits.
 
 ## Identity and supported shapes
 
@@ -231,7 +290,7 @@ caller must supply the trusted native return; JSON alone is not a signed receipt
 No model exit code or synthetic `[PASS]` becomes mutation evidence. Legacy `score`
 remains limited to supplied ordinary check logs.
 
-Repository checks: `python bin/test_runtime_host.py`, `python bin/test_consumer.py`,
+Repository checks: `python bin/test_runtime_resource.py`, `python bin/test_runtime_host.py`, `python bin/test_consumer.py`,
 the installed selftests, `python bin/audit.py`, and `python bin/selfcheck-mutations.py`.
 Real subprocess fixtures verify local ownership; they do not establish live
 provider attribution or a final compatible source pin.
