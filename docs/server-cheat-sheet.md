@@ -238,18 +238,17 @@ starts a fresh copy of the candidate on a private port. This is what makes
 
 **💬 Prompt to your agent**
 ```text
-On the server, follow ~/<app>/factory/RUNTIME_HOST.md. Write the runtime host configuration and the scenario JSON for my journeys, plus a separate holdout scenario, under /root/private (outside the repo, mode 700). Run the runtime host as a systemd service with a private connection file. The candidate root must be re-materialised from the delivering checkout at the start of every run, so put that refresh in each scenario's setup command -- do not leave the root pointing at a fixed copy of main. Prove one start, identity and teardown cycle, and prove a deliberate mutation fails. The app must answer /build-id with the host's candidate string.
+On the server, follow ~/<app>/factory/RUNTIME_HOST.md. Write the bound runtime host configuration and scenario JSON for my journeys, plus a separate holdout scenario, under /root/private (outside the repo, mode 700). Run the runtime host as a systemd service with a private connection file. From each delivering checkout, use `python factory/runtime_resource.py prepare --config /root/private/runtime.json --destination /root/private/candidate --expected-revision <delivered-sha>` and the documented start wrapper. The config's explicit include list must contain only application paths. Do not point the host at a fixed copy of main or call a helper in an older checkout. For lifecycle runs, use `validation_scope` only to narrow ordinary project checks and set `validation_context` to a caller-supplied, nonsecret identity for relevant external validation state. Treat a scope, context, source, or report change as invalidating the applicable ordinary validation evidence; required independent runtime and holdout checks remain separate. Calibrate with the shared runtime suite: a substantive baseline that creates or earns nonempty, nonzero state must verify, a relevant deliberate mutation must fail, and a separate wrong-identity runtime check must stay inconclusive. Prove cleanup without disturbing an unrelated listener. The app must answer /build-id with the host's candidate string.
 ```
 
 **The candidate root is the one thing here that fails quietly.** Leave it as a
 fixed copy of `main` and every lifecycle run verifies that stale tree instead of
 the pull request. Nothing looks wrong: the app boots, every assertion passes,
-and the report says `verified`. What catches it is the digest comparison at
-merge — the configured source digest will not match the delivered revision, and
-the gate holds with a target mismatch rather than merging code nobody tested.
-The root has to be refreshed from the delivering checkout before each start, and
-it cannot be a symlink; the host refuses linked source paths.
-`factory/RUNTIME_HOST.md` carries the script.
+and the report says `verified`. The preparation binding now catches that before
+behavioral credit: stale revision or changed resource bytes are refused at start.
+The root is materialized only from the configuration's permitted committed app
+paths in the delivering checkout; tracked private evaluator files stay out. It
+cannot be a symlink. `factory/RUNTIME_HOST.md` carries the exact CLI and schema.
 
 Prove the mutation too, not just the clean start. A runtime host that cannot
 fail is not a gate, and a deliberate defect from `harness/mutations/defects.json`
