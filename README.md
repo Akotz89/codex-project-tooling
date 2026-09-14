@@ -45,10 +45,11 @@ Your agent can help install the missing tools. The installer brings its own pinn
 Archon source, including the shared workflows; you do not need to check out Archon
 or merge its PRs yourself.
 
-**Current status:** the default uses the workflow additions on Archon's
-[`cleanup/sdlc-workflows-only`](https://github.com/coleam00/Archon/tree/cleanup/sdlc-workflows-only)
-branch. They are not merged upstream yet, and this integration still needs a live
-end-to-end run.
+**Current status:** the default pins exact Archon revision
+`8c1a1d1773f12125177f661088dc2c34c2a3ba06`, whose SDLC pack supports grounded
+intake, reviewed delivery, scoped validation reuse, independent runtime and holdout
+verification, bounded repair, discovery handling, merge queues and deterministic
+deployment. Native live acceptance remains separate from installation readiness.
 
 ---
 

@@ -1,7 +1,7 @@
 {
   "repository": "https://github.com/coleam00/Archon",
-  "integration_revision_required": "f61c9c9e959fce6e6366ff5c02000783a75e6a4a",
-  "description": "Shared workflow integration candidate with deterministic deployment and lifecycle backlog intake. Applicable ordinary validation evidence is reused only while its scope, caller context, source, and report are unchanged; runtime and holdout remain independent. No new forge or scheduling engine features.",
+  "integration_revision_required": "8c1a1d1773f12125177f661088dc2c34c2a3ba06",
+  "description": "Pinned workflow-only SDLC source with grounded intake, reviewed delivery, scoped validation reuse, independent runtime and holdout verification, bounded repair, discovery handling, merge queues, and deterministic deployment. Factory remains a thin consumer; workflow gates own decisions and scheduling remains external.",
   "source_directory": ".archon/workflows/sdlc",
   "entries": {
     "archon-backlog": "Slice a PRD into an ordered backlog of issues",
