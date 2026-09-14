@@ -389,6 +389,7 @@ class InstallTests(Fixture):
                          (TEMPLATE / "factory/consumer.py").read_bytes())
         migration = (self.app / "factory/MIGRATION.md").read_text()
         self.assertIn("revision completed a focused live lifecycle run", migration)
+        self.assertIn("provider/login check", migration)
         self.assertFalse((self.app / ".factory/schedule.json").exists())
         self.assertFalse(custom.exists())
         self.assertEqual((self.app / ".factory/retired/.claude/skills/factory-e2e/SKILL.md").read_bytes(), b"custom original\r\n")
