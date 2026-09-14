@@ -8,7 +8,7 @@ import consumer
 
 class InstalledTests(unittest.TestCase):
     def test_retired_decisions_are_inert(self):
-        for action in ("accept", "level", "merge", "tick", "arm", "deploy"):
+        for action in ("accept", "level", "merge", "arm", "deploy"):
             with contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(consumer.refuse(action), 2)
     def test_all_installed_python_parses(self):

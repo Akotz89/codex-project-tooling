@@ -116,6 +116,10 @@ class Fixture(unittest.TestCase):
 
 
 class ConsumerTests(Fixture):
+    def test_manifest_pins_tested_reliability_revision(self):
+        self.assertEqual(consumer.MANIFEST["integration_revision_required"],
+                         "d4450a9c1e9858e9df0e0d91bf4fd5caff32d059")
+
     def test_runtime_host_detach_and_resume_refused_before_native_launch(self):
         for args in [("--detach",), ("--detach=true",), ("-d",), ("--resume",)]:
             result = self.command("run", "archon-ship", "--runtime-host", "missing.json", *args)
@@ -158,6 +162,37 @@ class ConsumerTests(Fixture):
         self.assertNotIn("--no-worktree", argv)
         self.assertNotIn("provider-must-never-run", self.trace.read_text())
 
+    def test_reliability_inputs_pass_through_direct_and_scheduled_runs(self):
+        direct_inputs = [
+            "prs=[\"owner/repo#12\"]",
+            'evidence=[{"path":"proof.json","sha256":"abc123"}]',
+            "merge_method=merge",
+            "validation_scope=packages/api",
+            "validation_context=ubuntu-postgres-16",
+        ]
+        direct = self.command("run", "archon-merge-queue", "--json", *[
+            value for item in direct_inputs for value in ("--input", item)
+        ])
+        self.assertEqual(direct.returncode, 0, direct.stderr)
+        direct_argv = json.loads(direct.stdout)["argv"]
+        for item in direct_inputs:
+            self.assertEqual(direct_argv.count(item), 1)
+
+        scheduled_inputs = {
+            "merge_method": "merge",
+            "validation_scope": "packages/api",
+            "validation_context": "ubuntu-postgres-16",
+            "scenario": "runtime.json",
+            "holdout": "holdout.json",
+        }
+        schedule = self.app / ".factory/schedule.json"
+        schedule.write_text(json.dumps({"workflow": "archon-lifecycle", "inputs": scheduled_inputs}))
+        scheduled = self.command("tick")
+        self.assertEqual(scheduled.returncode, 0, scheduled.stderr)
+        scheduled_argv = json.loads(scheduled.stdout)["argv"]
+        for key, value in scheduled_inputs.items():
+            self.assertEqual(scheduled_argv.count(f"{key}={value}"), 1)
+
     def test_future_source_workflow_needs_no_alias(self):
         result = self.command("run", "archon-future-queue", "--input", "candidate=pr:1")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -174,7 +209,7 @@ class ConsumerTests(Fixture):
         config.write_text('raise RuntimeError("legacy config must not be imported")')
         receipt = self.app / ".factory/acceptance.json"
         receipt.write_text('{"verdict":"approve","autonomy":4}')
-        for args in [("level", "4"), ("accept", "gh:pr:1"), ("run", "merge", "gh:pr:1"), ("tick",)]:
+        for args in [("level", "4"), ("accept", "gh:pr:1"), ("run", "merge", "gh:pr:1")]:
             result = self.command(*args)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("retired", result.stderr.lower())
@@ -335,7 +370,7 @@ class InstallTests(Fixture):
         self.assertNotIn("install ", out.getvalue())
         self.assertNotIn("preserve ", out.getvalue())
 
-    def test_scaffold_and_missing_integration_pin(self):
+    def test_scaffold_leaves_integration_unconfigured(self):
         (self.app / consumer.SETTINGS).unlink()
         result = self.command("init", "--scaffold-only")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -343,9 +378,6 @@ class InstallTests(Fixture):
         result = self.command("doctor")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Integration pin required", result.stderr)
-        result = self.command("init")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("incomplete", result.stderr)
 
     def test_installer_clones_full_source_and_never_repoints_cache(self):
         cache = self.base / "cache with spaces"
