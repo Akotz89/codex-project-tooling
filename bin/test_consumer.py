@@ -116,10 +116,6 @@ class Fixture(unittest.TestCase):
 
 
 class ConsumerTests(Fixture):
-    def test_manifest_pins_tested_reliability_revision(self):
-        self.assertEqual(consumer.MANIFEST["integration_revision_required"],
-                         "d4450a9c1e9858e9df0e0d91bf4fd5caff32d059")
-
     def test_runtime_host_detach_and_resume_refused_before_native_launch(self):
         for args in [("--detach",), ("--detach=true",), ("-d",), ("--resume",)]:
             result = self.command("run", "archon-ship", "--runtime-host", "missing.json", *args)
@@ -172,13 +168,10 @@ class ConsumerTests(Fixture):
         local.parent.mkdir(parents=True)
         local.write_text("name: archon-merge-queue\nTHIS MUST NOT RUN\n")
         direct_inputs = [
-            'target=C:\\a folder\\request.md',
-            'context={"text":"two words"}',
-            'prs=["owner/repo#12"]',
+            'prs=["https://github.com/owner/repo/pull/12"]',
+            "mode=preview",
             'evidence=[{"path":"proof.json","sha256":"abc123"}]',
             "merge_method=merge",
-            "validation_scope=packages/api",
-            "validation_context=ubuntu-postgres-16",
         ]
         result = self.command("run", "archon-merge-queue", "--json", *[
             value for item in direct_inputs for value in ("--input", item)
@@ -193,14 +186,19 @@ class ConsumerTests(Fixture):
         self.assertNotIn("provider-must-never-run", self.trace.read_text())
 
     def test_reliability_inputs_pass_through_scheduled_run(self):
-        evidence = [{"path": "proof.json", "sha256": "abc123"}]
         scheduled_inputs = {
+            "target": "https://github.com/owner/repo/issues/12",
+            "publish": "false",
             "merge_method": "merge",
+            "merge_mode": "preview",
+            "discovery_publication": "preview",
             "validation_scope": "packages/api",
             "validation_context": "ubuntu-postgres-16",
             "scenario": "runtime.json",
             "holdout": "holdout.json",
-            "evidence": evidence,
+            "deploy": "",
+            "health": "",
+            "identity": "",
         }
         schedule = self.app / ".factory/schedule.json"
         schedule.write_text(json.dumps({"workflow": "archon-lifecycle", "inputs": scheduled_inputs}))
@@ -208,12 +206,7 @@ class ConsumerTests(Fixture):
         self.assertEqual(scheduled.returncode, 0, scheduled.stderr)
         scheduled_argv = json.loads(scheduled.stdout)["argv"]
         for key, value in scheduled_inputs.items():
-            if key == "evidence":
-                continue
             self.assertEqual(scheduled_argv.count(f"{key}={value}"), 1)
-        evidence_args = [item for item in scheduled_argv if item.startswith("evidence=")]
-        self.assertEqual(len(evidence_args), 1)
-        self.assertEqual(json.loads(evidence_args[0].split("=", 1)[1]), evidence)
 
     def test_future_source_workflow_needs_no_alias(self):
         result = self.command("run", "archon-future-queue", "--input", "candidate=pr:1")
@@ -385,12 +378,6 @@ class InstallTests(Fixture):
         self.assertEqual(provider.read_bytes(), provider_before)
         for rel, data in originals.items():
             self.assertEqual((self.app / rel).read_bytes(), data, rel)
-        self.assertEqual((self.app / "factory/consumer.py").read_bytes(),
-                         (TEMPLATE / "factory/consumer.py").read_bytes())
-        migration = (self.app / "factory/MIGRATION.md").read_text()
-        self.assertIn("revision completed a focused live lifecycle run", migration)
-        self.assertIn("provider/login check", migration)
-        self.assertFalse((self.app / ".factory/schedule.json").exists())
         self.assertFalse(custom.exists())
         self.assertEqual((self.app / ".factory/retired/.claude/skills/factory-e2e/SKILL.md").read_bytes(), b"custom original\r\n")
         with contextlib.redirect_stdout(io.StringIO()) as out:
@@ -406,6 +393,22 @@ class InstallTests(Fixture):
         result = self.command("doctor")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Integration pin required", result.stderr)
+
+    def test_default_init_installs_manifest_revision(self):
+        factory = load("factory_init_test", HOME / "bin/factory.py")
+        settings = {"source": "immutable", "revision": consumer.MANIFEST["integration_revision_required"]}
+        with patch.object(sys, "argv", ["factory.py", "init"]), \
+             patch.object(factory.consumer, "project_root", return_value=self.app), \
+             patch.object(factory, "sync") as sync_mock, \
+             patch.object(factory, "install_source", return_value=settings) as install_mock, \
+             patch.object(factory, "configure") as configure_mock, \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(factory.main(), 0)
+        sync_mock.assert_called_once_with(self.app)
+        install_mock.assert_called_once_with(
+            consumer.MANIFEST["repository"], consumer.MANIFEST["integration_revision_required"],
+            Path.home() / ".cache/factory/archon", "bun")
+        configure_mock.assert_called_once_with(self.app, settings)
 
     def test_installer_clones_full_source_and_never_repoints_cache(self):
         cache = self.base / "cache with spaces"

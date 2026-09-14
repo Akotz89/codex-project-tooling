@@ -45,16 +45,11 @@ Your agent can help install the missing tools. The installer brings its own pinn
 Archon source, including the shared workflows; you do not need to check out Archon
 or merge its PRs yourself.
 
-**Current status:** the default pins the exact tested Archon revision
-[`d4450a9c`](https://github.com/coleam00/Archon/commit/d4450a9c1e9858e9df0e0d91bf4fd5caff32d059)
-from [PR #3325](https://github.com/coleam00/Archon/pull/3325), based on
-`cleanup/sdlc-workflows-only`. Native acceptance verified the healthy baseline,
-rejected a relevant injected fault, and kept a wrong-identity check inconclusive. A
-controlled lifecycle run merged its exact reviewed and tested head after approval
-with the requested merge method. The known absence of required CI was accepted,
-and the audit confirmed that validation, runtime, holdout, and approval evidence
-were reused without modification. This tested source is integrated on that
-Archon branch and remains unmerged to Archon's upstream development branch.
+**Current status:** the default pins exact Archon revision
+`4eb8bbbdae7723205bb4bc84c9e373dd27902fd6`, whose SDLC pack supports grounded
+intake, reviewed delivery, scoped validation reuse, independent runtime and holdout
+verification, bounded repair, discovery handling, merge queues and deterministic
+deployment. Native live acceptance remains separate from installation readiness.
 
 ---
 
