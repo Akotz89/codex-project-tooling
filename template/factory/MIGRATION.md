@@ -19,4 +19,5 @@ from a queued merge request or successful local tests.
 Upgrade preserves customized project files and backs up retired generated files.
 Do not run the old stage scheduler alongside the new consumer. No application
 upgrade or scheduler installation was performed during this cleanup. The pinned
-candidate and the new lifecycle still need a focused real run before recording.
+revision completed a focused live lifecycle run; each upgraded application should
+still complete one supervised lap before scheduling.

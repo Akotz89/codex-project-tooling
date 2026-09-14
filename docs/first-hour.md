@@ -18,7 +18,7 @@ The installer selects the shared Archon source revision automatically.
    use `archon-lifecycle` with the prepared runtime/holdout inputs and merge approval.
 6. Inspect the result before asking the agent to configure scheduling.
 
-The current integration still needs live end-to-end validation. Installation checks
-alone do not prove a successful factory run.
+The default revision has completed bounded native acceptance. Installation checks
+still do not prove this project's provider login or first live run.
 
 For an older installation, read the [migration guide](../template/factory/MIGRATION.md).
