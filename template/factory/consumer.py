@@ -252,10 +252,10 @@ def invoke(root: Path, action: str, args: list[str]) -> int:
             if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
                 raise ValueError("Invalid scheduled workflow input name")
             args += ["--input", key + "=" + (value if isinstance(value, str) else json.dumps(value))]
-        if "runtime_host" in schedule:
-            host = schedule["runtime_host"]
-            if not isinstance(host, str) or not host:
-                raise ValueError("runtime_host must be a non-empty configuration path")
+        host = schedule.get("runtime_host")
+        if host:
+            if not isinstance(host, str):
+                raise ValueError("runtime_host must be a configuration path")
             args += ["--runtime-host", host]
         # Scheduling submits exactly one shared workflow, never individual stages.
         return invoke(root, "run", args)

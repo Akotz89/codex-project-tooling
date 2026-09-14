@@ -45,16 +45,10 @@ Your agent can help install the missing tools. The installer brings its own pinn
 Archon source, including the shared workflows; you do not need to check out Archon
 or merge its PRs yourself.
 
-**Current status:** the default pins the exact tested Archon revision
-[`d4450a9c`](https://github.com/coleam00/Archon/commit/d4450a9c1e9858e9df0e0d91bf4fd5caff32d059)
-from [PR #3325](https://github.com/coleam00/Archon/pull/3325), based on
-`cleanup/sdlc-workflows-only`. Native acceptance verified the healthy baseline,
-rejected a relevant injected fault, and kept a wrong-identity check inconclusive. A
-controlled lifecycle run merged its exact reviewed and tested head after approval
-with the requested merge method. The known absence of required CI was accepted,
-and the audit confirmed that validation, runtime, holdout, and approval evidence
-were reused without modification. This tested source is integrated on that
-Archon branch and remains unmerged to Archon's upstream development branch.
+**Current status:** the default uses the workflow additions on Archon's
+[`cleanup/sdlc-workflows-only`](https://github.com/coleam00/Archon/tree/cleanup/sdlc-workflows-only)
+branch. They are not merged upstream yet, and this integration still needs a live
+end-to-end run.
 
 ---
 
