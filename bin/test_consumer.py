@@ -116,6 +116,10 @@ class Fixture(unittest.TestCase):
 
 
 class ConsumerTests(Fixture):
+    def test_manifest_pins_tested_reliability_revision(self):
+        self.assertEqual(consumer.MANIFEST["integration_revision_required"],
+                         "d4450a9c1e9858e9df0e0d91bf4fd5caff32d059")
+
     def test_runtime_host_detach_and_resume_refused_before_native_launch(self):
         for args in [("--detach",), ("--detach=true",), ("-d",), ("--resume",)]:
             result = self.command("run", "archon-ship", "--runtime-host", "missing.json", *args)
@@ -126,7 +130,7 @@ class ConsumerTests(Fixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--detach", json.loads(result.stdout)["argv"])
 
-    def test_foreground_runtime_host_wraps_exactly_one_native_run_and_cleans(self):
+    def test_foreground_runtime_host_wraps_direct_and_scheduled_native_runs_and_cleans(self):
         from test_runtime_host import TARGET
         (self.app / "app.py").write_text(TARGET)
         config = self.app / "runtime.json"
@@ -142,21 +146,74 @@ class ConsumerTests(Fixture):
             self.assertNotIn("--runtime-host", argv)
             item = json.loads(output.read_text())
             self.assertFalse(Path(item["snapshot"]).parent.exists())
-        self.assertEqual(len([row for row in self.calls() if row[:2] == ["workflow", "run"]]), 2)
+        schedule = self.app / ".factory/schedule.json"
+        schedule.write_text(json.dumps({"workflow": "archon-ship", "inputs": {},
+                                        "runtime_host": str(config)}))
+        result = self.command("tick", env={"FACTORY_TEST_HOST_RESULT": str(output)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--runtime-host", json.loads(result.stdout)["argv"])
+        item = json.loads(output.read_text())
+        self.assertFalse(Path(item["snapshot"]).parent.exists())
+        self.assertEqual(len([row for row in self.calls() if row[:2] == ["workflow", "run"]]), 3)
+
+    def test_scheduled_falsey_runtime_hosts_refuse_before_native_launch(self):
+        schedule = self.app / ".factory/schedule.json"
+        for host in ("", None, False, 0, [], {}):
+            with self.subTest(runtime_host=host):
+                schedule.write_text(json.dumps({"workflow": "archon-ship", "inputs": {},
+                                                "runtime_host": host}))
+                result = self.command("tick")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("runtime_host must be a non-empty configuration path", result.stderr)
+                self.assertEqual(self.calls(), [])
 
     def test_pinned_run_ignores_local_conflict_and_provider_override(self):
-        local = self.app / ".archon/workflows/archon-ship.yaml"
+        local = self.app / ".archon/workflows/archon-merge-queue.yaml"
         local.parent.mkdir(parents=True)
-        local.write_text("name: archon-ship\nTHIS MUST NOT RUN\n")
-        result = self.command("run", "archon-ship", "--input", 'target=C:\\a folder\\request.md',
-                              "--input", 'context={"text":"two words"}', "--detach", "--json")
+        local.write_text("name: archon-merge-queue\nTHIS MUST NOT RUN\n")
+        direct_inputs = [
+            'target=C:\\a folder\\request.md',
+            'context={"text":"two words"}',
+            'prs=["owner/repo#12"]',
+            'evidence=[{"path":"proof.json","sha256":"abc123"}]',
+            "merge_method=merge",
+            "validation_scope=packages/api",
+            "validation_context=ubuntu-postgres-16",
+        ]
+        result = self.command("run", "archon-merge-queue", "--json", *[
+            value for item in direct_inputs for value in ("--input", item)
+        ], "--detach")
         self.assertEqual(result.returncode, 0, result.stderr)
         argv = json.loads(result.stdout)["argv"]
         self.assertEqual(argv[argv.index("--workflow-source") + 1], str(self.source))
         self.assertEqual(argv[argv.index("--cwd") + 1], str(self.app))
-        self.assertIn('target=C:\\a folder\\request.md', argv)
+        for item in direct_inputs:
+            self.assertEqual(argv.count(item), 1)
         self.assertNotIn("--no-worktree", argv)
         self.assertNotIn("provider-must-never-run", self.trace.read_text())
+
+    def test_reliability_inputs_pass_through_scheduled_run(self):
+        evidence = [{"path": "proof.json", "sha256": "abc123"}]
+        scheduled_inputs = {
+            "merge_method": "merge",
+            "validation_scope": "packages/api",
+            "validation_context": "ubuntu-postgres-16",
+            "scenario": "runtime.json",
+            "holdout": "holdout.json",
+            "evidence": evidence,
+        }
+        schedule = self.app / ".factory/schedule.json"
+        schedule.write_text(json.dumps({"workflow": "archon-lifecycle", "inputs": scheduled_inputs}))
+        scheduled = self.command("tick")
+        self.assertEqual(scheduled.returncode, 0, scheduled.stderr)
+        scheduled_argv = json.loads(scheduled.stdout)["argv"]
+        for key, value in scheduled_inputs.items():
+            if key == "evidence":
+                continue
+            self.assertEqual(scheduled_argv.count(f"{key}={value}"), 1)
+        evidence_args = [item for item in scheduled_argv if item.startswith("evidence=")]
+        self.assertEqual(len(evidence_args), 1)
+        self.assertEqual(json.loads(evidence_args[0].split("=", 1)[1]), evidence)
 
     def test_future_source_workflow_needs_no_alias(self):
         result = self.command("run", "archon-future-queue", "--input", "candidate=pr:1")
@@ -174,7 +231,7 @@ class ConsumerTests(Fixture):
         config.write_text('raise RuntimeError("legacy config must not be imported")')
         receipt = self.app / ".factory/acceptance.json"
         receipt.write_text('{"verdict":"approve","autonomy":4}')
-        for args in [("level", "4"), ("accept", "gh:pr:1"), ("run", "merge", "gh:pr:1"), ("tick",)]:
+        for args in [("level", "4"), ("accept", "gh:pr:1"), ("run", "merge", "gh:pr:1")]:
             result = self.command(*args)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("retired", result.stderr.lower())
@@ -328,6 +385,12 @@ class InstallTests(Fixture):
         self.assertEqual(provider.read_bytes(), provider_before)
         for rel, data in originals.items():
             self.assertEqual((self.app / rel).read_bytes(), data, rel)
+        self.assertEqual((self.app / "factory/consumer.py").read_bytes(),
+                         (TEMPLATE / "factory/consumer.py").read_bytes())
+        migration = (self.app / "factory/MIGRATION.md").read_text()
+        self.assertIn("revision completed a focused live lifecycle run", migration)
+        self.assertIn("provider/login check", migration)
+        self.assertFalse((self.app / ".factory/schedule.json").exists())
         self.assertFalse(custom.exists())
         self.assertEqual((self.app / ".factory/retired/.claude/skills/factory-e2e/SKILL.md").read_bytes(), b"custom original\r\n")
         with contextlib.redirect_stdout(io.StringIO()) as out:
@@ -335,7 +398,7 @@ class InstallTests(Fixture):
         self.assertNotIn("install ", out.getvalue())
         self.assertNotIn("preserve ", out.getvalue())
 
-    def test_scaffold_and_missing_integration_pin(self):
+    def test_scaffold_leaves_integration_unconfigured(self):
         (self.app / consumer.SETTINGS).unlink()
         result = self.command("init", "--scaffold-only")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -343,9 +406,6 @@ class InstallTests(Fixture):
         result = self.command("doctor")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Integration pin required", result.stderr)
-        result = self.command("init")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("incomplete", result.stderr)
 
     def test_installer_clones_full_source_and_never_repoints_cache(self):
         cache = self.base / "cache with spaces"
