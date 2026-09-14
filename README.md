@@ -53,9 +53,8 @@ rejected a relevant injected fault, and kept a wrong-identity check inconclusive
 controlled lifecycle run merged its exact reviewed and tested head after approval
 with the requested merge method. The known absence of required CI was accepted,
 and the audit confirmed that validation, runtime, holdout, and approval evidence
-were reused without modification. This source is not yet merged to Archon's
-upstream development branch; integrating the factory adoption into the cleanup
-branch remains separate.
+were reused without modification. This tested source is integrated on that
+Archon branch and remains unmerged to Archon's upstream development branch.
 
 ---
 
