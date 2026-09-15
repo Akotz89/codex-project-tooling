@@ -37,7 +37,8 @@ an explicit `{}`:
 Automatic lifecycle intake requires the complete mapping and `publish=true` to
 mark selected issues as touched. Publication remains off by default. Hold-comment
 publication separately requires `publish_holds=true` in approve or auto merge mode;
-preview is always read-only, and a published hold never authorizes a merge.
+`merge_mode=preview` is always read-only, and a published hold never authorizes a
+merge.
 
 ## Runtime and review evidence
 

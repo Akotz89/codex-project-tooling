@@ -143,7 +143,7 @@ class ConsumerTests(Fixture):
                           if arg == "--input"]
                 values += [arg.removeprefix("--input=") for arg in argv
                            if arg.startswith("--input=")]
-                self.assertEqual(values.count("state_labels={}"), 1)
+                self.assertEqual(values, ["state_labels={}"])
 
     def test_defaults_do_not_enter_messages_or_native_continuations(self):
         result = self.command("run", "archon-ship", "--", "--input", "state_labels={}")
@@ -412,20 +412,90 @@ class ConsumerTests(Fixture):
         self.assertEqual(argv[argv.index("--workflow-source") + 1], str(self.source))
 
 
+class SourceConformanceTests(unittest.TestCase):
+    def test_supplied_pinned_source_accepts_factory_state_labels(self):
+        supplied = os.environ.get("FACTORY_ARCHON_CONFORMANCE_SOURCE")
+        if not supplied:
+            self.skipTest("set FACTORY_ARCHON_CONFORMANCE_SOURCE to a complete pinned checkout")
+        source = Path(supplied).resolve()
+        revision = consumer.MANIFEST["integration_revision_required"]
+        self.assertEqual(consumer.checked(["git", "rev-parse", "HEAD"], source).strip(), revision)
+
+        defaults = consumer.MANIFEST["default_inputs"]
+        workflows = ("archon-triage", "archon-ship", "archon-lifecycle")
+        self.assertEqual(set(defaults), set(workflows))
+        mappings = [json.loads(defaults[name]["state_labels"]) for name in workflows]
+        self.assertTrue(all(mapping == mappings[0] for mapping in mappings))
+
+        triage = load("pinned_validate_contract", source / consumer.MANIFEST["source_directory"] /
+                       "triage/scripts/validate-contract.py")
+        lifecycle = load("pinned_select_target", source / consumer.MANIFEST["source_directory"] /
+                          "lifecycle/scripts/select-target.py")
+        self.assertEqual(set(mappings[0]), set(triage.STATE_LABEL_METADATA))
+        self.assertEqual(set(mappings[0]), lifecycle.STATES)
+        for mapping in mappings:
+            self.assertEqual(triage.parse_state_labels(json.dumps(mapping)), mapping)
+            with patch.dict(os.environ, {"INPUTS_STATE_LABELS": json.dumps(mapping)}):
+                labels, complete = lifecycle.state_labels()
+            self.assertTrue(complete)
+            self.assertEqual(labels, {label.casefold() for label in mapping.values()})
+
+        directory = source / consumer.MANIFEST["source_directory"]
+        for name, folder in (("archon-triage", "triage"), ("archon-ship", "ship"),
+                             ("archon-lifecycle", "lifecycle")):
+            lines = (directory / folder / f"{name}.yaml").read_text(encoding="utf-8").splitlines()
+            start = lines.index("inputs:") + 1
+            input_lines = next((lines[start:index] for index in range(start, len(lines))
+                                if lines[index] and not lines[index].startswith(" ")), lines[start:])
+            declared = {line[2:-1] for line in input_lines
+                        if line.startswith("  ") and not line.startswith("    ") and line.endswith(":" )}
+            self.assertIn("state_labels", declared)
+
+        policy_labels = {}
+        for line in (TEMPLATE / "factory/WORKFLOW_POLICY.md").read_text(encoding="utf-8").splitlines():
+            if line.startswith("| `"):
+                state, label = [cell.strip().strip("`") for cell in line.strip("|").split("|")]
+                policy_labels[state] = label
+        self.assertEqual(policy_labels, mappings[0])
+
+
 class InstallTests(Fixture):
     def test_agents_pointer_preserves_existing_bytes_and_is_idempotent(self):
         agents = self.app / "AGENTS.md"
         original = b"# Existing guidance\r\n\r\nKeep this byte-for-byte."
         agents.write_bytes(original)
+        preserved_time = 946684800_000_000_000
+        os.utime(agents, ns=(preserved_time, preserved_time))
         with contextlib.redirect_stdout(io.StringIO()):
             sync(self.app)
         installed = agents.read_bytes()
         self.assertTrue(installed.startswith(original))
         self.assertEqual(installed.count(b"factory/WORKFLOW_POLICY.md"), 1)
+        self.assertEqual(agents.stat().st_mtime_ns, preserved_time)
         with contextlib.redirect_stdout(io.StringIO()):
             sync(self.app)
         self.assertEqual(agents.read_bytes(), installed)
         self.assertTrue((self.app / "factory/WORKFLOW_POLICY.md").is_file())
+
+    def test_agents_pointer_failed_temp_write_preserves_original_and_cleans_temp(self):
+        agents = self.app / "AGENTS.md"
+        original = b"# Existing guidance\n"
+        agents.write_bytes(original)
+        with patch("install.os.fsync", side_effect=OSError("interrupted write")), \
+             self.assertRaisesRegex(OSError, "interrupted write"):
+            install_agents_pointer(self.app, False)
+        self.assertEqual(agents.read_bytes(), original)
+        self.assertEqual(list(self.app.glob(".AGENTS.md.*.tmp")), [])
+
+    def test_agents_pointer_failed_replace_preserves_original_and_cleans_temp(self):
+        agents = self.app / "AGENTS.md"
+        original = b"# Existing guidance\n"
+        agents.write_bytes(original)
+        with patch("install.os.replace", side_effect=OSError("interrupted replace")), \
+             self.assertRaisesRegex(OSError, "interrupted replace"):
+            install_agents_pointer(self.app, False)
+        self.assertEqual(agents.read_bytes(), original)
+        self.assertEqual(list(self.app.glob(".AGENTS.md.*.tmp")), [])
 
     def test_agents_pointer_honors_dry_run_and_creates_missing_file(self):
         agents = self.app / "AGENTS.md"

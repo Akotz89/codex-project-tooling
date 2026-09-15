@@ -217,10 +217,7 @@ def refuse(action: str) -> int:
     return 2
 
 
-def with_default_inputs(name: str, args: list[str]) -> list[str]:
-    options = args[:args.index("--")] if "--" in args else args
-    if any(arg.split("=", 1)[0] == "--resume" for arg in options):
-        return args
+def with_default_inputs(name: str, args: list[str], options: list[str]) -> list[str]:
     supplied = set()
     for index, arg in enumerate(options):
         if arg == "--input" and index + 1 < len(options):
@@ -318,9 +315,10 @@ def invoke(root: Path, action: str, args: list[str]) -> int:
             raise ValueError(f"Shared workflow '{name}' is absent from the pinned SDLC source; no fallback")
         validate(settings, source, name)
         options = args[:args.index("--")] if "--" in args else args
-        if not any(arg.split("=", 1)[0] == "--resume" for arg in options):
+        resuming = any(arg.split("=", 1)[0] == "--resume" for arg in options)
+        if not resuming:
             native += ["--workflow-source", str(source)]
-        args = with_default_inputs(name, args)
+            args = with_default_inputs(name, args, options)
     native += args
     if action == "status":
         print(f"Factory source={source} revision={settings['revision']} local_STOP={stop.exists()}", file=sys.stderr)

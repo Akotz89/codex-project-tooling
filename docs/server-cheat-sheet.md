@@ -78,6 +78,9 @@ Then a read-only sanity check before trusting it with anything:
 What do I have on my <host> account right now? Subscriptions, domains, and any servers.
 ```
 
+This limits what the agent is being asked to do; it is not a provider-enforced
+security sandbox. Connect it with credentials whose permissions fit the task.
+
 ## 2. Generate a key and put the public half on the account
 
 **💬 Prompt to your agent**

@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 HOME = Path(__file__).resolve().parent.parent
@@ -62,7 +63,22 @@ def install_agents_pointer(root: Path, dry: bool) -> None:
     if not dry:
         separator = b"" if not previous or previous.endswith((b"\n", b"\r")) else b"\n"
         gap = b"" if not previous or previous.endswith((b"\n\n", b"\r\n\r\n")) else b"\n"
-        path.write_bytes(previous + separator + gap + AGENTS_POINTER)
+        fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp",
+                                               dir=path.parent)
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                fd = -1
+                handle.write(previous + separator + gap + AGENTS_POINTER)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if path.exists():
+                shutil.copystat(path, temporary)
+            os.replace(temporary, path)
+        finally:
+            if fd != -1:
+                os.close(fd)
+            temporary.unlink(missing_ok=True)
 
 
 def sync(root: Path, dry: bool = False) -> None:

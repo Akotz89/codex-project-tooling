@@ -296,14 +296,22 @@ To opt into evidence-backed hold comments, use the publication inputs together:
 
 ```json
 {
-  "publish": "true",
-  "merge_mode": "approve",
-  "publish_holds": "true"
+  "workflow": "archon-lifecycle",
+  "inputs": {
+    "target": "",
+    "publish": "true",
+    "scenario": "/private/runtime.json",
+    "holdout": "/private/holdout.json",
+    "merge_mode": "approve",
+    "merge_method": "squash",
+    "publish_holds": "true",
+    "discovery_publication": "preview"
+  }
 }
 ```
 
-`publish_holds` does not authorize merging, has no effect in preview mode, and is
-deliberately absent from the default example.
+`publish_holds` does not authorize merging, has no effect when `merge_mode` is
+`preview`, and is deliberately absent from the default example.
 
 ---
 
