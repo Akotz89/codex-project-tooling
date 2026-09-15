@@ -413,6 +413,7 @@ class ConsumerTests(Fixture):
 
 
 class SourceConformanceTests(unittest.TestCase):
+    @patch.object(sys, "dont_write_bytecode", True)
     def test_supplied_pinned_source_accepts_factory_state_labels(self):
         supplied = os.environ.get("FACTORY_ARCHON_CONFORMANCE_SOURCE")
         if not supplied:
@@ -420,6 +421,7 @@ class SourceConformanceTests(unittest.TestCase):
         source = Path(supplied).resolve()
         revision = consumer.MANIFEST["integration_revision_required"]
         self.assertEqual(consumer.checked(["git", "rev-parse", "HEAD"], source).strip(), revision)
+        consumer.verify_source({"source": str(source), "revision": revision})
 
         defaults = consumer.MANIFEST["default_inputs"]
         workflows = ("archon-triage", "archon-ship", "archon-lifecycle")
@@ -457,6 +459,7 @@ class SourceConformanceTests(unittest.TestCase):
                 state, label = [cell.strip().strip("`") for cell in line.strip("|").split("|")]
                 policy_labels[state] = label
         self.assertEqual(policy_labels, mappings[0])
+        consumer.verify_source({"source": str(source), "revision": revision})
 
 
 class InstallTests(Fixture):
