@@ -46,8 +46,8 @@ Archon source, including the shared workflows; you do not need to check out Arch
 or merge its PRs yourself.
 
 **Current status:** the default pins exact Archon revision
-`5674fd428432a0f4678887555f8e2fdc8a7d01fd` on the `factory/sdlc-on-dev` branch (Archon
-dev plus the SDLC pack's factory workflows). Its pack supports dependency-aware intake,
+`02c963428d076ea7905b238b18c5ed45f8fb36e2` on the `factory/sdlc-on-dev` branch (Archon
+dev plus the SDLC pack's factory workflows). `archon-loop` is the recommended scheduled workflow: each lap picks one move and routes it to an in-loop builder or to `archon-ship`, then a black-box app check and a reviewer decide; `archon-manager` steps back on a slower schedule. Its pack also supports dependency-aware intake,
 reviewed delivery, scoped validation reuse, runtime and optional holdout verification,
 bounded repair, discovery handling, a merge queue that reads required checks and protected paths and seals its plan by script,
 deterministic deployment, closing the worked issue once its pull requests are confirmed
@@ -228,6 +228,8 @@ shared SDLC pack. You can run the workflows individually or use the full composi
 | Check PRs and CI, then merge according to the selected approval mode | `archon-merge-queue` |
 | Roll the default branch onto a running service and read the revision back | `archon-deploy` |
 | Run shipping, runtime/holdout verification, bounded repair, discoveries, merge and deployment | `archon-lifecycle` |
+| Keep a backlog moving unattended, one move per lap, with parallel laps if wanted | `archon-loop` |
+| Step back on a slower schedule: steer the backlog, unstick work, record metrics | `archon-manager` |
 
 **Ship runs its own triage.** You do not have to run triage first. Deliver can use
 an existing run's worktree to repair the same PR. Lifecycle connects the shared
@@ -282,9 +284,15 @@ Scheduling is Archon's. `schedule install` writes an Archon trigger binding for 
 scheduled workflow. Each timer tick runs `python factory/consumer.py schedule fire`,
 which calls `archon trigger fire` and then `archon workflow wake`:
 
-- Archon admits the start on one resource per repository and workflow, so laps never
-  overlap. A tick that arrives while a lap runs is skipped; the next tick starts the next
+- Archon admits the start on one resource per repository and workflow, holding at most
+  `parallel` laps at once (a top-level number in `schedule.json`, 1 to 8, default 1). A
+  tick that arrives while every lap is busy is skipped; the next tick starts the next
   lap, so ticks never pile up behind a long lap.
+- Only set `parallel` above 1 for a workflow that keeps parallel laps off each other's
+  work. `archon-loop` does: each lap claims its work item with a comment, the oldest
+  claim holds it, and pick stays out of the areas other laps have claimed. The app's
+  runtime scripts must also let several checkouts run at once (a port and pid file per
+  checkout, never one fixed port).
 - `workflow wake` resumes runs paused on a pending CI check or a provider usage limit.
 
 On macOS Archon installs its own launchd jobs. On Windows the timer is a hidden Task

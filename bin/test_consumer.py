@@ -178,12 +178,30 @@ class ConsumerTests(Fixture):
         self.assertEqual(binding["launch"]["cwd"], str(self.app))
         self.assertEqual(binding["runAsUserId"], "user-123")
         self.assertEqual(binding["resource"], "github:owner/repo:archon-lifecycle")
+        self.assertEqual(binding["capacity"], 1)
         self.assertEqual(binding["overlap"], "skip")
         schedule.write_text(json.dumps({"workflow": "archon-lifecycle",
                                         "inputs": {"state_labels": {}}}))
         result = self.command("schedule", "install")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.trigger_binding()["launch"]["inputs"]["state_labels"], "{}")
+
+    def test_parallel_laps_get_their_own_slot_with_that_capacity(self):
+        schedule = self.app / ".factory/schedule.json"
+        schedule.write_text(json.dumps({"workflow": "archon-lifecycle", "inputs": {}, "parallel": 3}))
+        result = self.command("schedule", "install")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        binding = self.trigger_binding()
+        self.assertEqual(binding["capacity"], 3)
+        # A slot's capacity is fixed once used, so the key names it.
+        self.assertEqual(binding["resource"], "github:owner/repo:archon-lifecycle:x3")
+        for bad in (0, 9, "3", True, 2.5):
+            with self.subTest(parallel=bad):
+                schedule.write_text(json.dumps({"workflow": "archon-lifecycle", "inputs": {},
+                                                "parallel": bad}))
+                result = self.command("schedule", "install")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("parallel must be", result.stderr)
 
     def test_unknown_commands_fail_without_a_native_launch(self):
         for args in (("tick",), ("level", "4"), ("accept", "gh:pr:1")):

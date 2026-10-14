@@ -391,7 +391,13 @@ def trigger_config(root: Path, settings: dict, source: Path, interval: int) -> d
             raise ValueError("Invalid scheduled workflow input name")
     values = {**workflow_defaults(root, workflow),
               **{k: v if isinstance(v, str) else json.dumps(v) for k, v in inputs.items()}}
+    parallel = schedule_data.get("parallel", 1)
+    if not isinstance(parallel, int) or isinstance(parallel, bool) or not 1 <= parallel <= 8:
+        raise ValueError("schedule.json parallel must be a whole number of laps from 1 to 8")
     slug = repository_slug(root)
+    # Archon fixes a slot's capacity when the slot is first used, so a different number
+    # of parallel laps is a different slot.
+    resource = f"github:{slug}:{workflow}" + (f":x{parallel}" if parallel > 1 else "")
     return {
         "version": 1,
         "sourceInstanceId": "factory-" + slug.replace("/", "-"),
@@ -400,9 +406,11 @@ def trigger_config(root: Path, settings: dict, source: Path, interval: int) -> d
             "bindingRevision": None,
             "hostId": "factory-" + re.sub(r"[^A-Za-z0-9-]", "-", platform.node() or "host"),
             "runAsUserId": whoami(settings, source, root),
-            # One resource per repository and workflow, so laps never overlap. A tick
-            # that arrives while a lap runs is skipped; the next tick starts the next lap.
-            "resource": f"github:{slug}:{workflow}",
+            # One resource per repository and workflow, holding at most `parallel` laps.
+            # A tick that arrives while every lap is busy is skipped; the next tick
+            # starts the next lap. The workflow keeps parallel laps off each other's work.
+            "resource": resource,
+            "capacity": parallel,
             "overlap": "skip",
             "launch": {"cwd": str(root), "workflowName": workflow, "inputs": values,
                        "isolation": {"kind": "default"}},

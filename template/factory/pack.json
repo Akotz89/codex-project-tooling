@@ -1,6 +1,6 @@
 {
   "repository": "https://github.com/coleam00/Archon",
-  "integration_revision_required": "5674fd428432a0f4678887555f8e2fdc8a7d01fd",
+  "integration_revision_required": "02c963428d076ea7905b238b18c5ed45f8fb36e2",
   "description": "Pinned workflow-only SDLC source with grounded intake, reviewed delivery, scoped validation reuse, independent runtime and holdout verification, bounded repair, discovery handling, merge queues, and deterministic deployment. Factory remains a thin consumer; workflow gates own decisions and scheduling remains external.",
   "source_directory": ".archon/workflows/sdlc",
   "default_inputs": {
@@ -27,7 +27,9 @@
     "archon-lifecycle": "Issue through delivery, runtime, holdout, discovery and merge",
     "archon-regress": "Validate and diagnose regressions",
     "archon-verify-runtime-suite": "Run baseline and deliberate runtime controls",
-    "archon-deploy": "Roll the default branch onto a running service and read the revision back"
+    "archon-deploy": "Roll the default branch onto a running service and read the revision back",
+    "archon-loop": "One move: pick routes it (finish open work, build simple work in the loop, or ship complex work), then a black-box app check and a reviewer that merges, sends back or returns to the owner. Parallel laps claim their work item and stay out of each other's way",
+    "archon-manager": "Step back on a slower schedule: steer the backlog, unstick work, ask the owner with a default, record metrics"
   },
   "capabilities": {
     "run": [
