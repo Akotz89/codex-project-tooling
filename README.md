@@ -1,17 +1,22 @@
 # AI Software Factory
 
-A repo that takes work in as an issue and ships validated code out, with nobody at
-the keyboard.
+You plan the release. The factory builds it. You test it in staging and anything
+off goes back in.
 
-You file an issue. It gets checked against your mission, planned, built, judged by
-something that did not write it, and merged. A scheduled regression can re-test what
-already merged and publish bugs it finds.
+You start with a PRD for the next release: a proof of concept for something new,
+or a small epic for an app that already exists. The factory splits it into linked
+issues, works out what can run in parallel, and loops on them: an agent picks one,
+builds it, and two reviewers that did not write it decide whether it merges. Merged
+work lands in staging, where you use the whole release like a customer would.
+Anything that is off becomes a new issue, and the factory picks it up.
 
-Some people call this a dark factory, after lights-out manufacturing. Same idea.
-It builds software from a PRD, so I call it a software factory.
+This is not a dark factory. The middle runs on its own, but you stay at the two
+places a human adds the most: deciding what to build, and judging whether what got
+built is right. No plan captures all of your intent up front, and staging is where
+the gaps show up.
 
-The automation is the easy half. Being able to trust a merge nobody read is the
-hard half, and most of what is in here exists for that.
+The automation is the easy half. Being able to trust a merge you did not read is
+the hard half, and most of what is in here exists for that.
 
 All AI work runs through [Archon's SDLC pack](https://github.com/coleam00/Archon).
 This repo supplies the setup, scheduling, project context and ordinary app resources.
