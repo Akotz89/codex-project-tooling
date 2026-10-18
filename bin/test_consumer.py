@@ -765,6 +765,24 @@ class LaunchGateTests(unittest.TestCase):
         self.assertIn("No launch", self.lines[-1])
         self.assertIn("2 lap(s) active, 1 still choosing", self.lines[-1])
 
+    def test_an_empty_lap_on_an_unchanged_board_is_not_repeated(self):
+        # Seen live: the gate counted items workable that pick stayed clear of (they touch
+        # what live claims change); every tick bought another empty pick.
+        board = {"workable": [{"kind": "issue", "number": 7}],
+                 "claims": [{"kind": "issue", "number": 2, "run": "busy"}]}
+        self.runs = [{"id": "busy", "workflow_name": "archon-loop", "status": "running"}]
+        self.assertTrue(self.decide(board))
+        launched = json.loads((self.app / ".factory/gate.json").read_text())["last_launch"]
+        stamp = lambda t: time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(t))
+        self.runs.append({"id": "empty", "workflow_name": "archon-loop", "status": "completed",
+                          "started_at": stamp(launched + 5), "completed_at": stamp(launched + 70)})
+        self.assertFalse(self.decide(board))
+        self.assertIn("nothing to start on this same board", self.lines[-1])
+        # The board changes (that lap ended and released its claim): the next lap may find something.
+        board["claims"] = []
+        self.runs[0]["status"] = "completed"
+        self.assertTrue(self.decide(board))
+
     def test_a_drained_board_launches_only_once_per_idle_period(self):
         self.recent_launch()
         self.assertFalse(self.decide({}))

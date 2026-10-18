@@ -1,6 +1,7 @@
 """Invoke a pinned, complete Archon source installation. No stage policy lives here."""
 from __future__ import annotations
 
+import calendar
 import contextlib
 import json
 import os
@@ -608,6 +609,27 @@ def sweep_worktrees(root: Path, settings: dict, source: Path, log, write) -> Non
             write(f"Worktree sweep exited {result.returncode}.\n")
 
 
+EMPTY_LAP_SECONDS = 300
+
+
+def _when(value) -> float | None:
+    try:
+        return calendar.timegm(time.strptime(str(value)[:19], "%Y-%m-%dT%H:%M:%S"))
+    except (ValueError, OverflowError):
+        return None
+
+
+def empty_lap_since(runs: list[dict], since: float) -> bool:
+    """Whether a lap started at or after `since` ended within a few minutes: it picked nothing."""
+    for run in runs:
+        start, end = _when(run.get("started_at")), _when(run.get("completed_at"))
+        if start is None or end is None or start + 60 < since:
+            continue
+        if run.get("status") in ENDED and end - start < EMPTY_LAP_SECONDS:
+            return True
+    return False
+
+
 def launch_decision(root: Path, settings: dict, source: Path, write) -> bool:
     """Whether this tick should start a lap. A workflow without a launch gate always
     launches. With one, the tick first clears runs that never started and claims of runs
@@ -629,9 +651,11 @@ def launch_decision(root: Path, settings: dict, source: Path, write) -> bool:
         return True
     state = tick_state(root)
 
+    signature = ""
+
     def launch(reason: str) -> bool:
         write(f"Launch: {reason}\n")
-        tick_state(root, last_launch=time.time())
+        tick_state(root, last_launch=time.time(), last_launch_board=signature)
         return True
 
     try:
@@ -654,6 +678,17 @@ def launch_decision(root: Path, settings: dict, source: Path, write) -> bool:
     workable = board.get("workable", [])
     choosing = active - {claim["run"] for claim in board.get("claims", [])}
     names = ", ".join(f"#{item['number']}" for item in workable) or "nothing"
+    # The board as a lap would see it. A lap that ended within minutes of starting picked
+    # nothing (a real lap takes far longer); if the board is unchanged since that launch,
+    # another lap would see the same and pick nothing too, so wait for the board to change
+    # (seen live: items the gate counts as workable that pick stays clear of, because they
+    # touch what a live claim is changing).
+    signature = json.dumps([sorted(f"{item.get('kind')}:{item.get('number')}" for item in workable),
+                            sorted(claim["run"] for claim in board.get("claims", []))])
+    if workable and not choosing and signature == state.get("last_launch_board") and \
+            empty_lap_since(runs, state.get("last_launch", 0)):
+        write(f"No launch: the last lap found nothing to start on this same board (workable {names}).\n")
+        return False
     # One pick at a time: two laps choosing at once converge on the same item and the
     # later one loses the claim race (seen live). The next tick sees the first lap's claim.
     if workable and not choosing:
