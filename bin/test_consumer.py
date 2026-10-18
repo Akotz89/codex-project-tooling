@@ -732,11 +732,22 @@ class LaunchGateTests(unittest.TestCase):
     def recent_launch(self):
         (self.app / ".factory/gate.json").write_text(json.dumps({"last_launch": time.time()}))
 
-    def test_launches_while_workable_items_outnumber_laps_still_choosing(self):
+    def test_launches_when_work_is_workable_and_no_lap_is_still_choosing(self):
+        # A lap holding a claim is not choosing: it does not hold back the next launch.
         self.runs = [{"id": "a", "workflow_name": "archon-loop", "status": "running"}]
-        self.assertTrue(self.decide({"workable": [{"kind": "issue", "number": 4},
-                                                  {"kind": "issue", "number": 5}]}))
-        self.assertIn("workable #4, #5; 1 lap(s) still choosing", self.lines[-1])
+        board = {"workable": [{"kind": "issue", "number": 4}, {"kind": "issue", "number": 5}],
+                 "claims": [{"kind": "issue", "number": 2, "run": "a"}]}
+        self.assertTrue(self.decide(board))
+        self.assertIn("workable #4, #5; no lap still choosing", self.lines[-1])
+
+    def test_one_pick_at_a_time(self):
+        # Seen live: two laps choosing at once both picked the lowest item and the later one
+        # did nothing. While a lap is still choosing, the next waits for the next tick.
+        self.recent_launch()
+        self.runs = [{"id": "a", "workflow_name": "archon-loop", "status": "running"}]
+        self.assertFalse(self.decide({"workable": [{"kind": "issue", "number": 4},
+                                                   {"kind": "issue", "number": 5}]}))
+        self.assertIn("1 lap(s) active, 1 still choosing", self.lines[-1])
         seen = json.loads(self.seen.read_text())
         self.assertEqual(seen["INPUTS_CLAIM_HOURS"], "3")
         self.assertEqual(Path(seen["cwd"]).resolve(), self.app.resolve())

@@ -654,8 +654,10 @@ def launch_decision(root: Path, settings: dict, source: Path, write) -> bool:
     workable = board.get("workable", [])
     choosing = active - {claim["run"] for claim in board.get("claims", [])}
     names = ", ".join(f"#{item['number']}" for item in workable) or "nothing"
-    if len(workable) > len(choosing):
-        return launch(f"workable {names}; {len(choosing)} lap(s) still choosing.")
+    # One pick at a time: two laps choosing at once converge on the same item and the
+    # later one loses the claim race (seen live). The next tick sees the first lap's claim.
+    if workable and not choosing:
+        return launch(f"workable {names}; no lap still choosing.")
     idle = schedule_data.get("idle_pick_minutes", 60)
     if not isinstance(idle, (int, float)) or isinstance(idle, bool) or idle < 0:
         raise ValueError("schedule.json idle_pick_minutes must be a number of minutes (0 turns it off)")
