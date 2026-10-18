@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -238,7 +239,15 @@ class ConsumerTests(Fixture):
         fired = self.calls()[before:]
         self.assertEqual(fired[0][:3], ["trigger", "fire", "--config"])
         self.assertEqual(Path(fired[0][3]), self.app / ".factory/trigger.json")
-        self.assertEqual(fired[1][:2], ["workflow", "wake"])
+        # The first tick of a period also sweeps this project's merged run worktrees,
+        # keeping remote branches; later ticks in the period do not.
+        self.assertEqual(fired[1][:5], ["isolation", "cleanup", "--merged", "--keep-remote", "--cwd"])
+        self.assertEqual(Path(fired[1][5]).resolve(), self.app.resolve())
+        self.assertEqual(fired[2][:2], ["workflow", "wake"])
+        before = len(self.calls())
+        self.assertEqual(self.command("schedule", "fire").returncode, 0)
+        self.assertEqual([row[:2] for row in self.calls()[before:]],
+                         [["trigger", "fire"], ["workflow", "wake"]])
         self.assertEqual(self.command("halt").returncode, 0)
         before = len(self.calls())
         result = self.command("schedule", "fire")
@@ -257,7 +266,8 @@ class ConsumerTests(Fixture):
         result = self.command("schedule", "fire")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Scheduled launches paused", result.stderr)
-        self.assertEqual([row[:2] for row in self.calls()[before:]], [["workflow", "wake"]])
+        self.assertEqual([row[:2] for row in self.calls()[before:]],
+                         [["isolation", "cleanup"], ["workflow", "wake"]])
         # An explicit run is the operator's own launch and is not paused.
         before = len(self.calls())
         self.command("run", "archon-lifecycle", "--input", "target=7")
@@ -288,9 +298,63 @@ class ConsumerTests(Fixture):
         self.assertEqual(task.find("t:Triggers/t:TimeTrigger/t:Repetition/t:Interval", ns).text,
                          "PT10M")
         self.assertEqual(task.find("t:Settings/t:Hidden", ns).text, "true")
-        self.assertEqual(task.find("t:Settings/t:MultipleInstancesPolicy", ns).text, "IgnoreNew")
+        self.assertEqual(task.find("t:Settings/t:MultipleInstancesPolicy", ns).text, "Parallel")
         self.assertEqual(task.find("t:Principals/t:Principal/t:LogonType", ns).text,
                          "InteractiveToken")
+
+    def test_laps_start_from_the_locally_known_default_branch(self):
+        # Seen live: with no base known, each launch ran ls-remote; a failed one left the
+        # run pending with its slot held for hours.
+        schedule = self.app / ".factory/schedule.json"
+        schedule.write_text(json.dumps({"workflow": "archon-lifecycle", "inputs": {}}))
+        result = self.command("schedule", "install")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.trigger_binding()["launch"]["isolation"], {"kind": "default"})
+        self.assertIn("every launch asks the remote", result.stdout)
+        head = self.git(self.app, "rev-parse", "HEAD").strip()
+        self.git(self.app, "update-ref", "refs/remotes/origin/trunk", head)
+        self.git(self.app, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk")
+        result = self.command("schedule", "install")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.trigger_binding()["launch"]["isolation"],
+                         {"kind": "worktree", "baseOverride": "trunk"})
+        self.assertIn("Laps start from trunk.", result.stdout)
+        schedule.write_text(json.dumps({"workflow": "archon-lifecycle", "inputs": {},
+                                        "base_branch": "release/2"}))
+        self.assertEqual(self.command("schedule", "install").returncode, 0)
+        self.assertEqual(self.trigger_binding()["launch"]["isolation"]["baseOverride"], "release/2")
+        schedule.write_text(json.dumps({"workflow": "archon-lifecycle", "inputs": {},
+                                        "base_branch": "bad name"}))
+        self.assertNotEqual(self.command("schedule", "install").returncode, 0)
+
+    def test_single_flight_admits_one_holder_and_frees_on_exit(self):
+        lock = self.app / ".factory/fire.lock"
+        with consumer.single_flight(lock) as first:
+            self.assertTrue(first)
+            with consumer.single_flight(lock) as second:
+                self.assertFalse(second)
+        with consumer.single_flight(lock) as again:
+            self.assertTrue(again)
+
+    def test_a_tick_that_finds_a_launch_in_progress_skips_it_but_still_wakes(self):
+        (self.app / ".factory/schedule.json").write_text(
+            json.dumps({"workflow": "archon-lifecycle", "inputs": {}}))
+        self.assertEqual(self.command("schedule", "install").returncode, 0)
+        before = len(self.calls())
+        with consumer.single_flight(self.app / ".factory/fire.lock") as held:
+            self.assertTrue(held)
+            result = self.command("schedule", "fire")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Another tick is still launching", result.stderr)
+        self.assertEqual([row[:2] for row in self.calls()[before:]],
+                         [["isolation", "cleanup"], ["workflow", "wake"]])
+        # A sweep period of 0 turns the sweep off.
+        (self.app / ".factory/schedule.json").write_text(
+            json.dumps({"workflow": "archon-lifecycle", "inputs": {}, "cleanup_minutes": 0}))
+        (self.app / ".factory/gate.json").unlink()
+        before = len(self.calls())
+        self.assertEqual(self.command("schedule", "fire").returncode, 0)
+        self.assertNotIn(["isolation", "cleanup"], [row[:2] for row in self.calls()[before:]])
 
     def test_a_windowless_tick_logs_its_output_and_opens_no_console(self):
         (self.app / ".factory").mkdir(exist_ok=True)
@@ -308,10 +372,11 @@ class ConsumerTests(Fixture):
              patch.object(consumer, "shared_root", return_value=self.app), \
              patch.object(consumer, "execute", side_effect=fake_execute):
             self.assertEqual(consumer.schedule(self.app, ["fire"]), 0)
-        self.assertEqual([argv[1:3] for argv, _ in calls], [["trigger", "fire"], ["workflow", "wake"]])
+        self.assertEqual([argv[1:3] for argv, _ in calls],
+                         [["trigger", "fire"], ["isolation", "cleanup"], ["workflow", "wake"]])
         log = (self.app / ".factory/schedule.log").read_text(encoding="utf-8")
         self.assertIn("=== schedule fire", log)
-        self.assertEqual(log.count("native output"), 2)
+        self.assertEqual(log.count("native output"), 3)
 
     @unittest.skipUnless(sys.platform == "win32", "Windows console creation flags")
     def test_children_get_no_console_window_only_when_nothing_shows_their_output(self):
@@ -596,6 +661,142 @@ class ConsumerTests(Fixture):
         argv = json.loads(result.stdout)["argv"]
         self.assertEqual(argv[argv.index("--cwd") + 1], str(worktree))
         self.assertEqual(argv[argv.index("--workflow-source") + 1], str(self.source))
+
+
+GATE_SCRIPT = r'''
+import json, os, sys
+from pathlib import Path
+state = Path.cwd() / ".factory"
+names = ("INPUTS_CLAIM_HOURS", "INPUTS_ENDED_RUNS")
+seen = {name: os.getenv(name) for name in names}
+seen["cwd"] = os.getcwd()
+(state / "test-seen.json").write_text(json.dumps(seen))
+if (state / "test-fail").exists():
+    sys.exit("gh: could not resolve host")
+print((state / "test-board.json").read_text())
+'''
+
+
+class LaunchGateTests(unittest.TestCase):
+    """The launch gate decides from the board and the run list; nothing here launches."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix="factory gate ")
+        self.addCleanup(temp.cleanup)
+        self.base = Path(temp.name)
+        self.app = self.base / "app"
+        (self.app / ".factory").mkdir(parents=True)
+        self.source = self.base / "source"
+        gate = self.source / consumer.MANIFEST["source_directory"] / consumer.MANIFEST["launch_gates"]["archon-loop"]
+        gate.parent.mkdir(parents=True)
+        # The gate runs under settings["bun"]; here that is Python, so the fake is Python.
+        gate.write_text(GATE_SCRIPT, encoding="utf-8")
+        self.settings = {"bun": sys.executable}
+        (self.app / ".factory/trigger.json").write_text(json.dumps({"binding": {"launch": {
+            "workflowName": "archon-loop", "inputs": {"claim_hours": "3"}}}}))
+        self.home = self.base / "archon home"
+        (self.home / "logs").mkdir(parents=True)
+        self.seen = self.app / ".factory/test-seen.json"
+        self.runs = []
+        self.abandoned = []
+        self.lines = []
+        env = patch.dict(os.environ, {"ARCHON_HOME": str(self.home)})
+        env.start()
+        self.addCleanup(env.stop)
+        for target, value in (("shared_root", lambda root: self.app),
+                              ("native_json", lambda *a: {"runs": self.runs})):
+            patcher = patch.object(consumer, target, side_effect=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        real_execute = consumer.execute
+
+        def execute(argv, cwd, **kwargs):
+            if "abandon" in argv:
+                self.abandoned.append(argv[argv.index("abandon") + 1])
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            return real_execute(argv, cwd, **kwargs)
+        patcher = patch.object(consumer, "execute", side_effect=execute)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch.object(consumer, "cli", return_value=["archon"])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def decide(self, board, schedule=None):
+        (self.app / ".factory/test-board.json").write_text(json.dumps(
+            {"workable": [], "claims": [], "ended": [], "waiting": [], **board}))
+        if schedule is not None:
+            (self.app / ".factory/schedule.json").write_text(json.dumps(schedule))
+        return consumer.launch_decision(self.app, self.settings, self.source, self.lines.append)
+
+    def recent_launch(self):
+        (self.app / ".factory/gate.json").write_text(json.dumps({"last_launch": time.time()}))
+
+    def test_launches_while_workable_items_outnumber_laps_still_choosing(self):
+        self.runs = [{"id": "a", "workflow_name": "archon-loop", "status": "running"}]
+        self.assertTrue(self.decide({"workable": [{"kind": "issue", "number": 4},
+                                                  {"kind": "issue", "number": 5}]}))
+        self.assertIn("workable #4, #5; 1 lap(s) still choosing", self.lines[-1])
+        seen = json.loads(self.seen.read_text())
+        self.assertEqual(seen["INPUTS_CLAIM_HOURS"], "3")
+        self.assertEqual(Path(seen["cwd"]).resolve(), self.app.resolve())
+
+    def test_skips_when_every_workable_item_already_has_a_lap_choosing(self):
+        # One workable item and one lap that has not claimed yet: a second lap would
+        # race it for the same item and do nothing.
+        self.recent_launch()
+        self.runs = [{"id": "a", "workflow_name": "archon-loop", "status": "running"},
+                     {"id": "b", "workflow_name": "archon-loop", "status": "running"},
+                     {"id": "m", "workflow_name": "archon-manager", "status": "running"}]
+        board = {"workable": [{"kind": "issue", "number": 4}],
+                 "claims": [{"kind": "issue", "number": 2, "run": "b"}]}
+        self.assertFalse(self.decide(board))
+        self.assertIn("No launch", self.lines[-1])
+        self.assertIn("2 lap(s) active, 1 still choosing", self.lines[-1])
+
+    def test_a_drained_board_launches_only_once_per_idle_period(self):
+        self.recent_launch()
+        self.assertFalse(self.decide({}))
+        (self.app / ".factory/gate.json").write_text(json.dumps({"last_launch": time.time() - 3700}))
+        self.assertTrue(self.decide({}))
+        self.assertIn("bookkeeping", self.lines[-1])
+        self.assertFalse(self.decide({}))
+        (self.app / ".factory/gate.json").write_text(json.dumps({"last_launch": 0}))
+        self.assertFalse(self.decide({}, schedule={"idle_pick_minutes": 0}))
+
+    def test_an_unreadable_board_launches_as_before_the_gate(self):
+        self.recent_launch()
+        (self.app / ".factory/test-fail").write_text("1")
+        self.assertTrue(self.decide({}))
+        self.assertIn("could not read the board", self.lines[-1])
+
+    def test_a_workflow_without_a_gate_always_launches(self):
+        (self.app / ".factory/trigger.json").write_text(json.dumps({"binding": {"launch": {
+            "workflowName": "archon-lifecycle", "inputs": {}}}}))
+        self.assertTrue(self.decide({}))
+        self.assertFalse(self.seen.exists())
+
+    def test_runs_that_never_started_are_abandoned_and_ended_runs_named(self):
+        self.recent_launch()
+        stuck = self.home / "logs/trigger-run-ghost.log"
+        stuck.write_text('{"level":40}\nError: Failed to fetch base branch from \'origin\'\n')
+        old = time.time() - 900
+        os.utime(stuck, (old, old))
+        fresh = self.home / "logs/trigger-run-new.log"
+        fresh.write_text("Error: still writing\n")
+        self.runs = [{"id": "ghost", "workflow_name": "archon-loop", "status": "pending"},
+                     {"id": "new", "workflow_name": "archon-loop", "status": "pending"},
+                     {"id": "done", "workflow_name": "archon-loop", "status": "completed"},
+                     {"id": "killed", "workflow_name": "archon-loop", "status": "failed"}]
+        board = {"workable": [{"kind": "issue", "number": 9}],
+                 "ended": [{"kind": "issue", "number": 9, "run": "killed", "url": "u"}]}
+        # The ghost no longer counts as a lap choosing work; the fresh pending one does.
+        self.assertFalse(self.decide(board))
+        self.assertEqual(self.abandoned, ["ghost"])
+        self.assertEqual(json.loads(self.seen.read_text())["INPUTS_ENDED_RUNS"], "done,killed")
+        self.assertTrue(any("Released the claim run killed left on #9" in l for l in self.lines))
+        self.runs = [r for r in self.runs if r["id"] != "new"]
+        self.assertTrue(self.decide(board))
 
 
 class SourceConformanceTests(unittest.TestCase):

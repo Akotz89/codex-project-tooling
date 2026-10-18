@@ -1,6 +1,7 @@
 """Invoke a pinned, complete Archon source installation. No stage policy lives here."""
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import platform
@@ -278,7 +279,7 @@ def invoke(root: Path, action: str, args: list[str]) -> int:
             raise ValueError("--runtime-host requires a configuration path")
     if action == "schedule":
         return schedule(root, args)
-    if action not in {"run", "list", "get", "status", "approve", "reject", "respond",
+    if action not in {"run", "list", "get", "status", "runs", "abandon", "approve", "reject", "respond",
                       "cancel", "resume", "doctor", "halt", "unhalt", "pause", "unpause"}:
         raise ValueError(f"Unknown command '{action}'. Run factory --help for the commands.")
     stop = shared_root(root) / ".factory/STOP"
@@ -371,6 +372,20 @@ def whoami(settings: dict, source: Path, root: Path) -> str:
     raise ValueError("archon trigger whoami returned no runAsUserId")
 
 
+def base_branch(root: Path, schedule_data: dict) -> str | None:
+    """The branch laps start from: schedule.json `base_branch`, else what the last fetch
+    recorded as the remote's default (origin/HEAD), read locally. None when neither is
+    known; the launch then asks the remote itself."""
+    named = schedule_data.get("base_branch")
+    if named is not None:
+        if not isinstance(named, str) or not re.fullmatch(r"[A-Za-z0-9._/-]+", named):
+            raise ValueError("schedule.json base_branch must be a branch name")
+        return named
+    result = execute(["git", "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], root)
+    head = result.stdout.strip() if result.returncode == 0 else ""
+    return head.split("/", 1)[1] if head.startswith("origin/") else None
+
+
 def trigger_config(root: Path, settings: dict, source: Path, interval: int) -> dict:
     """An Archon trigger binding for the scheduled shared workflow. Archon owns admission,
     the durable queue and overlap; this only names what to start."""
@@ -398,6 +413,10 @@ def trigger_config(root: Path, settings: dict, source: Path, interval: int) -> d
     # Archon fixes a slot's capacity when the slot is first used, so a different number
     # of parallel laps is a different slot.
     resource = f"github:{slug}:{workflow}" + (f":x{parallel}" if parallel > 1 else "")
+    # Without a known base branch every launch asks the remote for its default branch
+    # (one ls-remote, no retry); when that fails the run never starts and holds its slot.
+    base = base_branch(root, schedule_data)
+    isolation = {"kind": "worktree", "baseOverride": base} if base else {"kind": "default"}
     return {
         "version": 1,
         "sourceInstanceId": "factory-" + slug.replace("/", "-"),
@@ -413,7 +432,7 @@ def trigger_config(root: Path, settings: dict, source: Path, interval: int) -> d
             "capacity": parallel,
             "overlap": "skip",
             "launch": {"cwd": str(root), "workflowName": workflow, "inputs": values,
-                       "isolation": {"kind": "default"}},
+                       "isolation": isolation},
         },
         "schedule": {"intervalSeconds": interval, "runAtLoad": False},
     }
@@ -437,7 +456,7 @@ def task_xml(python: Path, root: Path, minutes: int) -> str:
   </Triggers>
   <Principals><Principal id="Author"><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
   <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
@@ -463,8 +482,9 @@ def timer_commands(root: Path, interval: int) -> dict:
     if sys.platform == "win32":
         # pythonw has no console, so a tick flashes no window; schtasks /TR cannot set a
         # working directory, so the task is defined in XML. It runs only while the user
-        # is logged on (a rendered runtime check needs the desktop session) and never
-        # starts a second instance while a tick is still running.
+        # is logged on (a rendered runtime check needs the desktop session). Ticks run in
+        # parallel: a wake that resumes a long lap must not hold back the next tick's
+        # launch. `schedule fire` single-flights each phase itself, so ticks cannot stack.
         pythonw = Path(fire[0]).with_name("pythonw.exe")
         task = shared_root(root) / ".factory/schedule-task.xml"
         return {"task_xml": {task: task_xml(pythonw if pythonw.exists() else Path(fire[0]),
@@ -488,6 +508,163 @@ def timer_commands(root: Path, interval: int) -> dict:
         "remove": [["systemctl", "--user", "disable", "--now", f"{unit}.timer"]]}
 
 
+@contextlib.contextmanager
+def single_flight(path: Path):
+    """Yield True to the one process holding an OS lock on `path`, False to the rest.
+    The lock dies with its process, so a killed tick never wedges later ones."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a+", encoding="utf-8")
+    try:
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        yield True
+    finally:
+        handle.close()
+
+
+ENDED = {"completed", "failed", "cancelled"}
+ACTIVE = {"pending", "running", "paused"}
+# A launch that died before its run started has written its last line by now.
+STUCK_AFTER_SECONDS = 600
+
+
+def archon_home() -> Path:
+    return Path(os.environ.get("ARCHON_HOME") or Path.home() / ".archon")
+
+
+def sweep_stuck(root: Path, settings: dict, source: Path, runs: list[dict], write) -> set[str]:
+    """Abandon runs whose launch failed before they started. Such a run stays `pending`
+    with its slot held until someone abandons it; its launch log ends in the error."""
+    swept = set()
+    for run in runs:
+        if run.get("status") != "pending" or not isinstance(run.get("id"), str):
+            continue
+        launch_log = archon_home() / "logs" / f"trigger-run-{run['id']}.log"
+        try:
+            if time.time() - launch_log.stat().st_mtime < STUCK_AFTER_SECONDS:
+                continue
+            lines = [line for line in launch_log.read_text(encoding="utf-8", errors="replace").splitlines()
+                     if line.strip()]
+        except OSError:
+            continue
+        if not lines or not lines[-1].startswith("Error:"):
+            continue
+        result = execute([*cli(settings, source), "workflow", "abandon", run["id"], "--cwd", str(root)], root)
+        if result.returncode == 0:
+            swept.add(run["id"])
+            write(f"Abandoned run {run['id']}, whose launch failed before it started: {lines[-1][:300]}\n")
+        else:
+            write(f"Could not abandon stuck run {run['id']}: {(result.stderr or result.stdout)[-300:]}\n")
+    return swept
+
+
+def tick_state(root: Path, **updates) -> dict:
+    """The tick's small memory between runs (.factory/gate.json), updated in place."""
+    path = shared_root(root) / ".factory/gate.json"
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        state = {}
+    if updates:
+        state.update(updates)
+        path.write_text(json.dumps(state) + "\n", encoding="utf-8")
+    return state
+
+
+def sweep_worktrees(root: Path, settings: dict, source: Path, log, write) -> None:
+    """Once per period, remove this project's run worktrees whose branches are merged into
+    the base branch. A lap that changed nothing leaves a branch the base already contains,
+    so this is also how empty laps' worktrees go. Archon keeps any worktree a live or
+    resumable run owns, or one with uncommitted changes. Remote branches are kept: a local
+    sweep does not change the forge. `cleanup_minutes` in schedule.json, 0 turns it off."""
+    try:
+        schedule_data = json.loads((shared_root(root) / SCHEDULE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        schedule_data = {}
+    period = schedule_data.get("cleanup_minutes", 60)
+    if not isinstance(period, (int, float)) or isinstance(period, bool) or period <= 0:
+        return
+    if time.time() - tick_state(root).get("last_cleanup", 0) < period * 60:
+        return
+    with single_flight(shared_root(root) / ".factory/cleanup.lock") as held:
+        if not held:
+            return
+        tick_state(root, last_cleanup=time.time())
+        write("Sweeping merged run worktrees.\n")
+        if log:
+            log.flush()
+        result = execute([*cli(settings, source), "isolation", "cleanup", "--merged", "--keep-remote",
+                          "--cwd", str(root)], root, capture=False, timeout=None, output=log)
+        if result.returncode:
+            write(f"Worktree sweep exited {result.returncode}.\n")
+
+
+def launch_decision(root: Path, settings: dict, source: Path, write) -> bool:
+    """Whether this tick should start a lap. A workflow without a launch gate always
+    launches. With one, the tick first clears runs that never started and claims of runs
+    that ended, then launches only while there is more workable work than laps still
+    choosing theirs, plus one lap per idle period for bookkeeping. Any failure to read
+    the board launches, as before the gate existed."""
+    try:
+        launch_config = json.loads((shared_root(root) / TRIGGER).read_text(encoding="utf-8"))["binding"]["launch"]
+        workflow, inputs = launch_config["workflowName"], launch_config.get("inputs") or {}
+    except (OSError, ValueError, KeyError, TypeError):
+        return True
+    try:
+        schedule_data = json.loads((shared_root(root) / SCHEDULE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        schedule_data = {}
+    gate = MANIFEST.get("launch_gates", {}).get(workflow)
+    script = source / MANIFEST["source_directory"] / gate if gate else None
+    if script is None or not script.is_file():
+        return True
+    state = tick_state(root)
+
+    def launch(reason: str) -> bool:
+        write(f"Launch: {reason}\n")
+        tick_state(root, last_launch=time.time())
+        return True
+
+    try:
+        listed = native_json(settings, source, ["workflow", "runs", "--limit", "100"], root)
+        runs = [run for run in listed.get("runs", []) if run.get("workflow_name") == workflow]
+        swept = sweep_stuck(root, settings, source, runs, write)
+        ended = [run["id"] for run in runs if run.get("status") in ENDED]
+        active = {run["id"] for run in runs if run.get("status") in ACTIVE} - swept
+        result = execute([settings.get("bun", "bun"), str(script)], root, timeout=180, env={
+            **os.environ,
+            "INPUTS_CLAIM_HOURS": str(inputs.get("claim_hours", "")),
+            "INPUTS_ENDED_RUNS": ",".join(ended)})
+        if result.returncode:
+            raise ValueError((result.stderr or result.stdout)[-500:])
+        board = json.loads(result.stdout.strip().splitlines()[-1])
+    except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
+        return launch(f"the launch gate could not read the board ({str(error)[:300]}).")
+    for claim in board.get("ended", []):
+        write(f"Released the claim run {claim['run']} left on #{claim['number']} when it ended.\n")
+    workable = board.get("workable", [])
+    choosing = active - {claim["run"] for claim in board.get("claims", [])}
+    names = ", ".join(f"#{item['number']}" for item in workable) or "nothing"
+    if len(workable) > len(choosing):
+        return launch(f"workable {names}; {len(choosing)} lap(s) still choosing.")
+    idle = schedule_data.get("idle_pick_minutes", 60)
+    if not isinstance(idle, (int, float)) or isinstance(idle, bool) or idle < 0:
+        raise ValueError("schedule.json idle_pick_minutes must be a number of minutes (0 turns it off)")
+    if idle and not active and time.time() - state.get("last_launch", 0) >= idle * 60:
+        return launch(f"nothing workable, but no lap has looked in {idle} minutes (bookkeeping).")
+    write(f"No launch: workable {names}; {len(active)} lap(s) active, {len(choosing)} still choosing.\n")
+    return False
+
+
 def schedule(root: Path, args: list[str]) -> int:
     action = args[0] if args else ""
     flags = args[1:]
@@ -508,6 +685,10 @@ def schedule(root: Path, args: list[str]) -> int:
         config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
         plan = timer_commands(root, interval)
         print(f"Wrote {config_path} (Archon trigger binding for {config['binding']['launch']['workflowName']}).")
+        base = config["binding"]["launch"]["isolation"].get("baseOverride")
+        print(f"Laps start from {base}." if base else
+              "No default branch is known locally, so every launch asks the remote for it. "
+              "Run `git remote set-head origin --auto` or set base_branch in schedule.json.")
         if sys.platform == "darwin":
             plan = {"install": [[*native, "trigger", "schedule", "install", "--config", str(config_path)],
                                 [*native, "workflow", "wake", "schedule", "install", "--interval", "60"]]}
@@ -541,16 +722,30 @@ def schedule(root: Path, args: list[str]) -> int:
             if log:
                 log.write(f"=== schedule fire {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
                 log.flush()
+            write = log.write if log else sys.stderr.write
+            fired = 0
             if (shared_root(root) / PAUSE).exists():
-                fired = 0
-                message = "Scheduled launches paused; no trigger fired, waking only. Use unpause to resume.\n"
-                (log.write if log else sys.stderr.write)(message)
+                write("Scheduled launches paused; no trigger fired, waking only. Use unpause to resume.\n")
             else:
-                fired = execute([*native, "trigger", "fire", "--config", str(config_path)], root,
-                                capture=False, timeout=None, output=log).returncode
+                # Ticks run in parallel (a long wake must not hold back the next launch), so
+                # each phase admits one tick at a time; a tick that finds a phase busy skips it.
+                with single_flight(shared_root(root) / ".factory/fire.lock") as held:
+                    if not held:
+                        write("Another tick is still launching; this one skips the launch.\n")
+                    elif launch_decision(root, settings, source, write):
+                        fired = execute([*native, "trigger", "fire", "--config", str(config_path)], root,
+                                        capture=False, timeout=None, output=log).returncode
+            if log:
+                log.flush()
+            sweep_worktrees(root, settings, source, log, write)
             # Resume due durable waits (CI pauses, usage-limit resumes) in the same tick.
-            woken = execute([*native, "workflow", "wake"], root, capture=False, timeout=None,
-                            output=log).returncode
+            woken = 0
+            with single_flight(shared_root(root) / ".factory/wake.lock") as held:
+                if held:
+                    woken = execute([*native, "workflow", "wake"], root, capture=False, timeout=None,
+                                    output=log).returncode
+                else:
+                    write("A wake from an earlier tick is still running; this one skips it.\n")
         finally:
             if log:
                 log.close()
@@ -578,8 +773,8 @@ def main(argv: list[str] | None = None) -> int:
               "factory run <shared-workflow> --runtime-host <config.json> [foreground native arguments]\n"
               "Runtime host: fresh ordinary apps; detach/resume unsupported. Manual: python factory/runtime_host.py serve --help\n"
               "factory schedule install [--interval <seconds>] [--apply] | fire | remove [--apply] | status\n"
-              "factory list | doctor | status | get <run-id>\n"
-              "factory approve | reject | respond | cancel | resume <run-id>\n"
+              "factory list | doctor | status | runs | get <run-id>\n"
+              "factory approve | reject | respond | cancel | resume | abandon <run-id>\n"
               "factory halt | unhalt (local launch brake only)\n"
               "factory pause | unpause (stop scheduled launches; the timer keeps waking active runs)")
         return 0
