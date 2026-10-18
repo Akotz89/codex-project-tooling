@@ -239,11 +239,8 @@ class ConsumerTests(Fixture):
         fired = self.calls()[before:]
         self.assertEqual(fired[0][:3], ["trigger", "fire", "--config"])
         self.assertEqual(Path(fired[0][3]), self.app / ".factory/trigger.json")
-        # The first tick of a period also sweeps this project's merged run worktrees,
-        # keeping remote branches; later ticks in the period do not.
-        self.assertEqual(fired[1][:5], ["isolation", "cleanup", "--merged", "--keep-remote", "--cwd"])
-        self.assertEqual(Path(fired[1][5]).resolve(), self.app.resolve())
-        self.assertEqual(fired[2][:2], ["workflow", "wake"])
+        self.assertEqual(fired[1][:2], ["workflow", "wake"])
+        self.assertEqual(len(fired), 2)
         before = len(self.calls())
         self.assertEqual(self.command("schedule", "fire").returncode, 0)
         self.assertEqual([row[:2] for row in self.calls()[before:]],
@@ -267,7 +264,7 @@ class ConsumerTests(Fixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Scheduled launches paused", result.stderr)
         self.assertEqual([row[:2] for row in self.calls()[before:]],
-                         [["isolation", "cleanup"], ["workflow", "wake"]])
+                         [["workflow", "wake"]])
         # An explicit run is the operator's own launch and is not paused.
         before = len(self.calls())
         self.command("run", "archon-lifecycle", "--input", "target=7")
@@ -347,14 +344,7 @@ class ConsumerTests(Fixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Another tick is still launching", result.stderr)
         self.assertEqual([row[:2] for row in self.calls()[before:]],
-                         [["isolation", "cleanup"], ["workflow", "wake"]])
-        # A sweep period of 0 turns the sweep off.
-        (self.app / ".factory/schedule.json").write_text(
-            json.dumps({"workflow": "archon-lifecycle", "inputs": {}, "cleanup_minutes": 0}))
-        (self.app / ".factory/gate.json").unlink()
-        before = len(self.calls())
-        self.assertEqual(self.command("schedule", "fire").returncode, 0)
-        self.assertNotIn(["isolation", "cleanup"], [row[:2] for row in self.calls()[before:]])
+                         [["workflow", "wake"]])
 
     def test_a_windowless_tick_logs_its_output_and_opens_no_console(self):
         (self.app / ".factory").mkdir(exist_ok=True)
@@ -373,10 +363,10 @@ class ConsumerTests(Fixture):
              patch.object(consumer, "execute", side_effect=fake_execute):
             self.assertEqual(consumer.schedule(self.app, ["fire"]), 0)
         self.assertEqual([argv[1:3] for argv, _ in calls],
-                         [["trigger", "fire"], ["isolation", "cleanup"], ["workflow", "wake"]])
+                         [["trigger", "fire"], ["workflow", "wake"]])
         log = (self.app / ".factory/schedule.log").read_text(encoding="utf-8")
         self.assertIn("=== schedule fire", log)
-        self.assertEqual(log.count("native output"), 3)
+        self.assertEqual(log.count("native output"), 2)
 
     @unittest.skipUnless(sys.platform == "win32", "Windows console creation flags")
     def test_children_get_no_console_window_only_when_nothing_shows_their_output(self):
