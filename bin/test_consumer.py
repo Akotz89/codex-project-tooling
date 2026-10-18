@@ -778,6 +778,10 @@ class LaunchGateTests(unittest.TestCase):
                           "started_at": stamp(launched + 5), "completed_at": stamp(launched + 70)})
         self.assertFalse(self.decide(board))
         self.assertIn("nothing to start on this same board", self.lines[-1])
+        # Seen live: laps that failed in seconds on a used-up usage limit held the factory
+        # idle for hours. A failed lap says nothing about the board.
+        self.runs[-1]["status"] = "failed"
+        self.assertTrue(self.decide(board))
         # The board changes (that lap ended and released its claim): the next lap may find something.
         board["claims"] = []
         self.runs[0]["status"] = "completed"

@@ -592,12 +592,13 @@ def _when(value) -> float | None:
 
 
 def empty_lap_since(runs: list[dict], since: float) -> bool:
-    """Whether a lap started at or after `since` ended within a few minutes: it picked nothing."""
+    """Whether a lap started at or after `since` completed within a few minutes: it picked
+    nothing. A lap that failed (a usage limit, an outage) says nothing about the board."""
     for run in runs:
         start, end = _when(run.get("started_at")), _when(run.get("completed_at"))
         if start is None or end is None or start + 60 < since:
             continue
-        if run.get("status") in ENDED and end - start < EMPTY_LAP_SECONDS:
+        if run.get("status") == "completed" and end - start < EMPTY_LAP_SECONDS:
             return True
     return False
 
