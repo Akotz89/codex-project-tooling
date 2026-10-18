@@ -640,7 +640,7 @@ def launch_decision(root: Path, settings: dict, source: Path, write) -> bool:
         binding = json.loads((shared_root(root) / TRIGGER).read_text(encoding="utf-8"))["binding"]
         launch_config = binding["launch"]
         workflow, inputs = launch_config["workflowName"], launch_config.get("inputs") or {}
-        capacity = binding.get("capacity", 1)
+        capacity = binding.get("capacity")
     except (OSError, ValueError, KeyError, TypeError):
         return True
     try:
