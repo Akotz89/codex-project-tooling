@@ -611,8 +611,8 @@ def sweep_worktrees(root: Path, settings: dict, source: Path, log, write) -> Non
 def launch_decision(root: Path, settings: dict, source: Path, write) -> bool:
     """Whether this tick should start a lap. A workflow without a launch gate always
     launches. With one, the tick first clears runs that never started and claims of runs
-    that ended, then launches only while there is more workable work than laps still
-    choosing theirs, plus one lap per idle period for bookkeeping. Any failure to read
+    that ended, then launches only when there is workable work and no lap is still
+    choosing its item, plus one lap per idle period for bookkeeping. Any failure to read
     the board launches, as before the gate existed."""
     try:
         launch_config = json.loads((shared_root(root) / TRIGGER).read_text(encoding="utf-8"))["binding"]["launch"]
