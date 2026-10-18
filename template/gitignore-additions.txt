@@ -9,6 +9,8 @@ __pycache__/
 .factory/schedule.log
 .factory/schedule-task.xml
 .factory/trigger.json
+.factory/gate.json
+.factory/*.lock
 harness/.results/
 .factory/holdout/.results/
 .env
