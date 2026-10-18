@@ -740,6 +740,16 @@ class LaunchGateTests(unittest.TestCase):
         self.assertTrue(self.decide(board))
         self.assertIn("workable #4, #5; no lap still choosing", self.lines[-1])
 
+    def test_no_launch_when_every_slot_is_busy(self):
+        (self.app / ".factory/trigger.json").write_text(json.dumps({"binding": {"capacity": 2, "launch": {
+            "workflowName": "archon-loop", "inputs": {}}}}))
+        self.runs = [{"id": r, "workflow_name": "archon-loop", "status": "running"} for r in ("a", "b")]
+        board = {"workable": [{"kind": "issue", "number": 4}],
+                 "claims": [{"kind": "issue", "number": 2, "run": "a"},
+                            {"kind": "issue", "number": 3, "run": "b"}]}
+        self.assertFalse(self.decide(board))
+        self.assertIn("all 2 slot(s) busy", self.lines[-1])
+
     def test_one_pick_at_a_time(self):
         # Seen live: two laps choosing at once both picked the lowest item and the later one
         # did nothing. While a lap is still choosing, the next waits for the next tick.

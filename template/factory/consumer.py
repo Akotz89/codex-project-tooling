@@ -637,8 +637,10 @@ def launch_decision(root: Path, settings: dict, source: Path, write) -> bool:
     choosing its item, plus one lap per idle period for bookkeeping. Any failure to read
     the board launches, as before the gate existed."""
     try:
-        launch_config = json.loads((shared_root(root) / TRIGGER).read_text(encoding="utf-8"))["binding"]["launch"]
+        binding = json.loads((shared_root(root) / TRIGGER).read_text(encoding="utf-8"))["binding"]
+        launch_config = binding["launch"]
         workflow, inputs = launch_config["workflowName"], launch_config.get("inputs") or {}
+        capacity = binding.get("capacity", 1)
     except (OSError, ValueError, KeyError, TypeError):
         return True
     try:
@@ -685,6 +687,10 @@ def launch_decision(root: Path, settings: dict, source: Path, write) -> bool:
     # touch what a live claim is changing).
     signature = json.dumps([sorted(f"{item.get('kind')}:{item.get('number')}" for item in workable),
                             sorted(claim["run"] for claim in board.get("claims", []))])
+    # Archon skips a start when every slot is busy; say so instead of recording a launch.
+    if isinstance(capacity, int) and len(active) >= capacity:
+        write(f"No launch: all {capacity} slot(s) busy; workable {names}.\n")
+        return False
     if workable and not choosing and signature == state.get("last_launch_board") and \
             empty_lap_since(runs, state.get("last_launch", 0)):
         write(f"No launch: the last lap found nothing to start on this same board (workable {names}).\n")
