@@ -4,6 +4,22 @@ This project uses Archon's shared SDLC workflows. The requirements below are
 project guidance for those workflows; they do not replace workflow gates or grant
 permission to publish, comment, merge, deploy, or change schedules.
 
+## Native shared execution
+
+Read `.factory/project-context.md` and this project's
+`_bmad/custom/ticketing-store-config.toml` before a selected native workflow.
+The exact local Linear project remains the accepted-work authority. The native
+Core coordinator retains claims, worker liveness, writer ownership and dispatch;
+Archon owns the selected bounded delivery/review workflow. Installation and
+readiness do not select backlog work or authorize a scheduler. Use one accepted
+implementation/review route and preserve the original caller's acceptance.
+
+Worker choices are limited to `gpt-6-luna` with currently supported effort and
+`gpt-6.1-sol` with low, medium or high effort. Preserve an explicit permitted pair;
+refuse a forbidden pair. Optional Jev assessment failure permits only an already
+validated ordinary pair. Current coordinator settings remain unchanged. Usage
+collection is explicit and project-local; no collector daemon is installed.
+
 ## Scope and backlog bootstrap
 
 Read `MISSION.md` in full. Its product scope, exclusions, hard invariants, and
