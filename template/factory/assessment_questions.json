@@ -1,0 +1,43 @@
+{
+  "task_kind": {
+    "type": "choice",
+    "instructions": "Infer this task feature from the supplied natural work description in state.task. Use stated work, targets, interactions and checks; no required headings or template. Do not invent unseen repository/runtime facts, histories, credentials, prices, performance rankings or execution permission. Ordinary worker and allowed catalog show feasible choices, not task difficulty. Choose insufficient_information only when this particular dimension is actually unclear. Answer independently from every other question. What kind of work is primarily requested? Ignore urgency and material consequence.",
+    "criteria": {
+      "mechanical": "Exact extraction, collection, or mechanical transformation under a stated rule, with known targets; no unresolved behavior/design/cause decision.",
+      "known_pattern_implementation": "Implement or repair within a known pattern; the required behavior and cause/plan are already supplied, with ordinary local edge cases.",
+      "diagnosis_or_design": "Discover an unexplained cause, reconcile competing explanations, or choose a new behavior/interface/design approach.",
+      "verification": "Execute or interpret stated checks/observations to establish whether an existing candidate or behavior meets an observable acceptance criterion.",
+      "insufficient_information": "The requested outcome, scope or relevant facts are missing/contradictory, or none of these categories can be justified from the task."
+    }
+  },
+  "reasoning_demand": {
+    "type": "choice",
+    "instructions": "Infer this task feature from the supplied natural work description in state.task. Use stated work, targets, interactions and checks; no required headings or template. Do not invent unseen repository/runtime facts, histories, credentials, prices, performance rankings or execution permission. Ordinary worker and allowed catalog show feasible choices, not task difficulty. Choose insufficient_information only when this particular dimension is actually unclear. Answer independently from every other question. How much interpretation, unresolved causal reasoning and interface coupling does this task require? Use actual interactions and known unknowns, not file count, task length, prestige, urgency or consequence.",
+    "criteria": {
+      "mechanical": "The rule and target are explicit; no unresolved interpretation or causal decision is needed. Several files alone do not make this harder.",
+      "bounded_local": "Known cause/pattern in one understood subsystem; clear requirements and acceptance, with local interpretation or edge cases but no unexplained interacting-interface failure.",
+      "diagnostic_or_cross_interface": "Requires a new causal/design inference or understanding the behavior of interacting module/native/database/service interfaces; interactions can be isolated. A settled mechanical edit across files is not enough.",
+      "difficult_coupled": "Requires reconciliation of conflicting evidence, interacting ambiguous requirements, or several plausible causal chains across coupled behavior. Mere deployment importance does not qualify.",
+      "insufficient_information": "Relevant scope/interfaces, known facts or unresolved questions are too incomplete/contradictory to justify one of these demands."
+    }
+  },
+  "verification_difficulty": {
+    "type": "choice",
+    "instructions": "Infer this task feature from the supplied natural work description in state.task. Use stated work, targets, interactions and checks; no required headings or template. Do not invent unseen repository/runtime facts, histories, credentials, prices, performance rankings or execution permission. Ordinary worker and allowed catalog show feasible choices, not task difficulty. Choose insufficient_information only when this particular dimension is actually unclear. Answer independently from every other question. How is success distinguished from plausible-looking work, using only the supplied acceptance? Assess the oracle, not whether the implementation is difficult or consequential.",
+    "criteria": {
+      "direct_deterministic": "A stated direct comparison, assertion, parser result or other deterministic check has a concrete expected outcome.",
+      "integration_checks": "Success requires several stated caller/config/interface integration observations with concrete expected outcomes; a source unit check alone is insufficient.",
+      "runtime_or_gameplay": "Acceptance needs specified service, persisted-state, client/runtime or gameplay observations in the authorized environment; source/build/health alone cannot establish it.",
+      "insufficient_information": "No observable acceptance, expected result, required target/environment or means of distinguishing success is supplied."
+    }
+  },
+  "material_consequence": {
+    "type": "choice",
+    "instructions": "Infer this task feature from the supplied natural work description in state.task. Use stated work, targets, interactions and checks; no required headings or template. Do not invent unseen repository/runtime facts, histories, credentials, prices, performance rankings or execution permission. Ordinary worker and allowed catalog show feasible choices, not task difficulty. Choose insufficient_information only when this particular dimension is actually unclear. Answer independently from every other question. Could an incorrect authorized action materially affect persisted data, service availability or protected user activity? This identifies safeguard context only; it grants no authority and does not imply high reasoning effort.",
+    "criteria": {
+      "bounded_reversible": "The task is expressly read-only, isolated source/candidate work, or otherwise bounded/reversible without touching persisted runtime state, availability or protected user activity.",
+      "persisted_service_or_protected": "The stated action could materially affect persisted data, a service or protected user activity, even when it follows a simple known runbook.",
+      "insufficient_information": "The target, effects or execution boundary are too unclear to establish either consequence class."
+    }
+  }
+}

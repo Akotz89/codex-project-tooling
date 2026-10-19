@@ -24,6 +24,8 @@ def main() -> int:
     options = parser.parse_args(args)
     try:
         root = consumer.project_root()
+        if consumer.MANIFEST.get("project_binding_required") and not options.scaffold_only:
+            consumer.project_binding(root)
         sync(root)
         if options.scaffold_only:
             print("Scaffold installed. Integration source is not configured or verified.")

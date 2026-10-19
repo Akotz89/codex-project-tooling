@@ -126,6 +126,9 @@ def install_source(repository: str, revision: str, cache: Path, bun: str) -> dic
 
 
 def configure(root: Path, settings: dict) -> None:
+    settings = dict(settings)
+    if consumer.MANIFEST.get("project_binding_required"):
+        settings["project_binding"] = consumer.project_binding(root)
     path = within(consumer.shared_root(root), consumer.shared_root(root) / consumer.SETTINGS)
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(".tmp")

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import calendar
 import contextlib
+import hashlib
+import tomllib
 import json
 import os
 import platform
@@ -45,6 +47,23 @@ def execute(argv: list[str], cwd: Path, *, capture: bool = True,
                           timeout=timeout, env=env, **streams, **flags)
 
 
+def with_runtime_path(env: dict, settings: dict) -> dict:
+    """Expose the configured Bun executable to workflow scripts and commands."""
+    result = dict(env)
+    bun = settings.get("bun", "bun")
+    if not isinstance(bun, str) or not bun:
+        return result
+    resolved = shutil.which(bun, path=result.get("PATH"))
+    if not resolved:
+        return result
+    directory = str(Path(resolved).absolute().parent)
+    entries = result.get("PATH", "").split(os.pathsep)
+    normalized = {os.path.normcase(os.path.abspath(entry)) for entry in entries if entry}
+    if os.path.normcase(directory) not in normalized:
+        result["PATH"] = os.pathsep.join([directory, *entries])
+    return result
+
+
 def checked(argv: list[str], cwd: Path, timeout: int = 180) -> str:
     result = execute(argv, cwd, timeout=timeout)
     if result.returncode:
@@ -70,13 +89,33 @@ def read_settings(root: Path) -> dict:
     settings = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(settings, dict):
         raise ValueError(f"Invalid consumer settings: {path}")
+    if MANIFEST.get("project_binding_required"):
+        expected = project_binding(root)
+        if settings.get("project_binding") != expected:
+            raise ValueError("Project binding drift: root, local tracker address or context changed; explicitly reconfigure this project")
     return settings
+
+
+def project_binding(root: Path) -> dict:
+    """Attest local routing facts; this neither accepts nor dispatches work."""
+    root = shared_root(root)
+    store = root / "_bmad/custom/ticketing-store-config.toml"
+    tickets = tomllib.loads(store.read_text(encoding="utf-8"))["tickets"]
+    if tickets.get("store") != "linear" or not tickets.get("project"):
+        raise ValueError("An explicit project-local Linear address is required")
+    context = root / ".factory/project-context.md"
+    if not context.is_file() or context.is_symlink() or not context.resolve().is_relative_to(root):
+        raise ValueError("Project-local .factory/project-context.md is required")
+    return {"root": str(root), "tracker": "linear", "project": tickets["project"],
+            "context": ".factory/project-context.md", "context_sha256": hashlib.sha256(context.read_bytes()).hexdigest()}
 
 
 def verify_source(settings: dict) -> Path:
     revision = settings.get("revision", "")
     if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise ValueError("Integration revision must be a full lowercase commit SHA")
+    if revision != MANIFEST["integration_revision_required"]:
+        raise ValueError("CPI236 worker policy requires this consumer's exact immutable native source pin; no legacy/fallback launch")
     source = Path(settings["source"]).resolve()
     if source.name != revision:
         raise ValueError("Source must use an immutable per-pin directory named with its full SHA")
@@ -256,8 +295,15 @@ def with_default_inputs(name: str, args: list[str], options: list[str], root: Pa
     return [args[0], *injected, *args[1:]]
 
 
-def invoke(root: Path, action: str, args: list[str]) -> int:
+def invoke(root: Path, action: str, args: list[str], *, jev_services: dict | None = None) -> int:
     args = list(args)
+    # Factory-only opt-in; text after -- remains literal worker input.
+    from jev_router import strip_opt_in, explicit_choice, resolve_generated_config
+    args, jev_requested, generated_config = strip_opt_in(args)
+    if generated_config is not None:
+        args, generated_config = resolve_generated_config(args, generated_config, root)
+    launch_env = {key: value for key, value in os.environ.items()
+                  if key not in {"ARCHON_JEV_BRIDGE", "ARCHON_JEV_GENERATED_CONFIG"}}
     runtime_config = None
     options = args[:args.index("--")] if "--" in args else args[:]
     runtime_flags = [a for a in options if a.split("=", 1)[0] == "--runtime-host"]
@@ -278,6 +324,10 @@ def invoke(root: Path, action: str, args: list[str]) -> int:
             args.pop(index)
         if not runtime_config:
             raise ValueError("--runtime-host requires a configuration path")
+    if generated_config is not None and (
+            action != "run" or runtime_config is not None
+            or any(arg.split("=", 1)[0] in {"--detach", "--resume", "-d"} for arg in options)):
+        raise ValueError("--jev-generated-config supports fresh foreground runs only")
     if action == "schedule":
         return schedule(root, args)
     if action not in {"run", "list", "get", "status", "runs", "abandon", "approve", "reject", "respond",
@@ -338,6 +388,21 @@ def invoke(root: Path, action: str, args: list[str]) -> int:
         if not resuming:
             native += ["--workflow-source", str(source)]
             args = with_default_inputs(name, args, options, root)
+            if (jev_requested and name == "archon-implement" and runtime_config is None
+                    and not any(arg.split("=", 1)[0] in {"--detach", "-d"} for arg in options)
+                    and not explicit_choice(args, generated_config)):
+                bridge = Path(__file__).with_name("jev_prepared_bridge.py").resolve()
+                if bridge.is_file() and (source / "packages/cli/src/commands/jev-preflight.ts").is_file():
+                    route = settings.get("jev_router", {})
+                    if not isinstance(route, dict):
+                        route = {}
+                    bridge_argv = [sys.executable, str(bridge), "--root", str(root),
+                                   "--jev-model", route.get("jev_model", "jev-latest")]
+                    if route.get("key_file"):
+                        bridge_argv += ["--credential-file", str(route["key_file"])]
+                    launch_env["ARCHON_JEV_BRIDGE"] = json.dumps(bridge_argv)
+                    if generated_config is not None:
+                        launch_env["ARCHON_JEV_GENERATED_CONFIG"] = generated_config
     native += args
     if action == "status":
         print(f"Factory source={source} revision={settings['revision']} local_STOP={stop.exists()}", file=sys.stderr)
@@ -346,10 +411,15 @@ def invoke(root: Path, action: str, args: list[str]) -> int:
     if runtime_config:
         from runtime_host import RuntimeHost
         with RuntimeHost(root / runtime_config) as host:
+            runtime_env = {**launch_env, **host.environment()}
+            runtime_env.pop("ARCHON_JEV_BRIDGE", None)
+            runtime_env.pop("ARCHON_JEV_GENERATED_CONFIG", None)
+            runtime_env = with_runtime_path(runtime_env, settings)
             return execute([*cli(settings, source), *native], root, capture=False,
-                           timeout=None, env={**os.environ, **host.environment()}).returncode
+                           timeout=None, env=runtime_env).returncode
     return execute([*cli(settings, source), *native], root,
-                   capture=False, timeout=None).returncode
+                   capture=False, timeout=None,
+                   env=with_runtime_path(launch_env, settings)).returncode
 
 
 def repository_slug(root: Path) -> str:
@@ -785,6 +855,7 @@ def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if not args or args[0] in {"--help", "-h"}:
         print("factory run <shared-workflow> [native arguments]\n"
+              "factory run archon-implement --jev-route [fresh foreground native arguments]\n"
               "factory run <shared-workflow> --runtime-host <config.json> [foreground native arguments]\n"
               "Runtime host: fresh ordinary apps; detach/resume unsupported. Manual: python factory/runtime_host.py serve --help\n"
               "factory schedule install [--interval <seconds>] [--apply] | fire | remove [--apply] | status\n"
