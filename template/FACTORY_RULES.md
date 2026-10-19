@@ -1,8 +1,11 @@
 # Project workflow guidance
 
 Keep project constraints and irreversible-action requirements in this file and the
-native project guidance. Shared workflow gates own authorization. The factory does
-not interpret this document as a private merge policy.
+native project guidance. Shared workflow gates validate the selected workflow.
+Authorization comes from current user scope, accepted Linear work and native
+coordinator boundaries; installation, readiness or a passing gate grants no
+additional authority. The factory does not interpret this document as a private
+merge policy.
 
 Preserve scope, tests, security invariants and secrets. Report failed or unavailable
 checks truthfully. Ordinary static/unit success does not replace required runtime
