@@ -58,9 +58,10 @@ def with_runtime_path(env: dict, settings: dict) -> dict:
         return result
     directory = str(Path(resolved).absolute().parent)
     entries = result.get("PATH", "").split(os.pathsep)
-    normalized = {os.path.normcase(os.path.abspath(entry)) for entry in entries if entry}
-    if os.path.normcase(directory) not in normalized:
-        result["PATH"] = os.pathsep.join([directory, *entries])
+    configured = os.path.normcase(os.path.realpath(directory))
+    entries = [entry for entry in entries
+               if os.path.normcase(os.path.realpath(entry)) != configured]
+    result["PATH"] = os.pathsep.join([directory, *entries])
     return result
 
 

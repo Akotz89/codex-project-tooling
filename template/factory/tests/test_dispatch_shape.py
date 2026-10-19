@@ -85,6 +85,26 @@ class DispatchArgsTests(unittest.TestCase):
             self.assertEqual(result["KEEP"], "yes")
             self.assertEqual(consumer.with_runtime_path(result, {"bun": str(bun)}), result)
 
+    def test_configured_bun_precedes_ambient_even_when_already_later_in_path(self):
+        with tempfile.TemporaryDirectory(prefix="dispatch-path-order-", dir=TASK_WORK) as scratch:
+            root = Path(scratch)
+            ambient, configured = root / "ambient", root / "configured"
+            ambient.mkdir(); configured.mkdir()
+            for directory in (ambient, configured):
+                executable = directory / "bun"
+                executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                executable.chmod(0o755)
+            alias = root / "configured-alias"
+            alias.symlink_to(configured, target_is_directory=True)
+            path = os.pathsep.join([str(ambient), str(configured), str(configured / ".." / "configured"), str(alias), "/bin"])
+            original = {"PATH": path, "KEEP": "yes"}
+            result = consumer.with_runtime_path(original, {"bun": str(configured / "bun")})
+            self.assertEqual(result["PATH"].split(os.pathsep), [str(configured), str(ambient), "/bin"])
+            self.assertEqual(consumer.shutil.which("bun", path=result["PATH"]), str(configured / "bun"))
+            self.assertEqual(consumer.with_runtime_path(result, {"bun": str(configured / "bun")}), result)
+            self.assertEqual(original["PATH"], path)
+            self.assertEqual(result["KEEP"], "yes")
+
     def test_invoke_passes_generated_provenance_and_bun_path_but_not_for_human_config(self):
         with tempfile.TemporaryDirectory(prefix="dispatch-invoke-", dir=TASK_WORK) as scratch:
             root = Path(scratch)
