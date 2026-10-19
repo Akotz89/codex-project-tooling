@@ -102,6 +102,20 @@ class Fixture(unittest.TestCase):
         self.git(self.base, "clone", "-q", "--no-hardlinks", str(self.origin), str(self.source))
         (self.source / "node_modules").mkdir()
         self.settings = {"source": str(self.source), "revision": self.revision, "bun": sys.executable}
+        # Bind the real consumer guards to this disposable fake source, without a
+        # production bypass or mutation of the pinned source under test.
+        self.pin_patch = patch.dict(consumer.MANIFEST, {"integration_revision_required": self.revision})
+        self.pin_patch.start()
+        self.addCleanup(self.pin_patch.stop)
+        (self.app / "_bmad/custom").mkdir(parents=True)
+        (self.app / "_bmad/custom/ticketing-store-config.toml").write_text('[tickets]\nstore="linear"\nproject="fixture-project"\n')
+        (self.app / ".factory").mkdir()
+        (self.app / ".factory/project-context.md").write_text("Fixture context\n")
+        self.settings["project_binding"] = consumer.project_binding(self.app)
+        self.fixture_factory = self.base / "factory-installation"
+        shutil.copytree(HOME / "bin", self.fixture_factory / "bin", ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copytree(TEMPLATE, self.fixture_factory / "template", ignore=shutil.ignore_patterns("__pycache__", "work"))
+        (self.fixture_factory / "template/factory/pack.json").write_text(json.dumps(consumer.MANIFEST))
         self.trace = self.base / "argv.jsonl"
         self.env = patch.dict(os.environ, {"FACTORY_TEST_TRACE": str(self.trace),
                          "FACTORY_AGENT_CMD": "provider-must-never-run", "FACTORY_AUTONOMY": "4"})
@@ -115,7 +129,7 @@ class Fixture(unittest.TestCase):
         return result.stdout
 
     def command(self, *args, env=None):
-        return subprocess.run([sys.executable, str(HOME / "bin/factory.py"), *args], cwd=self.app,
+        return subprocess.run([sys.executable, str(self.fixture_factory / "bin/factory.py"), *args], cwd=self.app,
                               env={**os.environ, **(env or {})}, capture_output=True, text=True,
                               encoding="utf-8", timeout=60)
 
@@ -589,7 +603,7 @@ class ConsumerTests(Fixture):
         self.assertFalse(any(row[:2] == ["workflow", "run"] for row in self.calls()))
 
     def test_sha_dirty_and_ignored_authoring_drift_refused(self):
-        with self.assertRaisesRegex(ValueError, "SHA mismatch"):
+        with self.assertRaisesRegex(ValueError, "SHA mismatch|exact immutable native source pin"):
             other = self.base / ("a" * 40)
             other.mkdir()
             self.git(self.base, "clone", "-q", str(self.origin), str(other))
@@ -645,7 +659,7 @@ class ConsumerTests(Fixture):
         worktree = self.base / "application worktree"
         self.git(self.app, "worktree", "add", "-b", "fixture-branch", str(worktree))
         self.assertEqual(consumer.read_settings(worktree), self.settings)
-        result = subprocess.run([sys.executable, str(HOME / "bin/factory.py"), "run", "archon-ship", "--json"],
+        result = subprocess.run([sys.executable, str(self.fixture_factory / "bin/factory.py"), "run", "archon-ship", "--json"],
                                 cwd=worktree, capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
         argv = json.loads(result.stdout)["argv"]
