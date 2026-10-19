@@ -19,3 +19,7 @@ harness/.results/
 *.pem
 secrets.json
 credentials.json
+
+# Project-owned native factory test scratch and usage ledger.
+work/factory-tests/
+work/factory-usage/
