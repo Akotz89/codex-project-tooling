@@ -297,9 +297,10 @@ def with_default_inputs(name: str, args: list[str], options: list[str], root: Pa
 
 def invoke(root: Path, action: str, args: list[str], *, jev_services: dict | None = None) -> int:
     args = list(args)
-    # Factory-only opt-in; text after -- remains literal worker input.
-    from .jev_router import strip_opt_in, explicit_choice, resolve_generated_config
-    args, jev_requested, generated_config = strip_opt_in(args)
+    # Legacy routing flags remain accepted syntax; provider admission is mandatory.
+    # Text after -- remains literal worker input.
+    from .jev_router import strip_opt_in, resolve_generated_config
+    args, _jev_requested, generated_config = strip_opt_in(args)
     if generated_config is not None:
         args, generated_config = resolve_generated_config(args, generated_config, root)
     launch_env = {key: value for key, value in os.environ.items()
@@ -388,21 +389,8 @@ def invoke(root: Path, action: str, args: list[str], *, jev_services: dict | Non
         if not resuming:
             native += ["--workflow-source", str(source)]
             args = with_default_inputs(name, args, options, root)
-            if (jev_requested and name == "archon-implement" and runtime_config is None
-                    and not any(arg.split("=", 1)[0] in {"--detach", "-d"} for arg in options)
-                    and not explicit_choice(args, generated_config)):
-                bridge = Path(__file__).with_name("jev_prepared_bridge.py").resolve()
-                if bridge.is_file() and (source / "packages/cli/src/commands/jev-preflight.ts").is_file():
-                    route = settings.get("jev_router", {})
-                    if not isinstance(route, dict):
-                        route = {}
-                    bridge_argv = [sys.executable, str(bridge), "--root", str(root),
-                                   "--jev-model", route.get("jev_model", "jev-latest")]
-                    if route.get("key_file"):
-                        bridge_argv += ["--credential-file", str(route["key_file"])]
-                    launch_env["ARCHON_JEV_BRIDGE"] = json.dumps(bridge_argv)
-                    if generated_config is not None:
-                        launch_env["ARCHON_JEV_GENERATED_CONFIG"] = generated_config
+            # Mandatory assessment is owned by actual provider admission for every
+            # new logical worker, never the old opt-in CLI ordinary-fallback bridge.
     native += args
     if action == "status":
         print(f"Factory source={source} revision={settings['revision']} local_STOP={stop.exists()}", file=sys.stderr)
@@ -854,7 +842,7 @@ def schedule(root: Path, args: list[str]) -> int:
 def route_subagent(root: Path, args: list[str]) -> int:
     """Prepare a bound request from bounded stdin; never invoke a native worker."""
     import argparse
-    from .jev_prepared_bridge import prepare_subagent, read_request
+    from .jev_prepared_bridge import prepare_subagent, read_request, SUCCESS
     parser = argparse.ArgumentParser(prog="project-factory route-subagent",
         description="Prepare native subagent arguments only; caller owns launch, reconciliation and acceptance.")
     parser.add_argument("--caller-id", required=True, help="Current native coordinator identity, repeated in the request")
@@ -862,13 +850,54 @@ def route_subagent(root: Path, args: list[str]) -> int:
     options = parser.parse_args(args)
     result = prepare_subagent(read_request(sys.stdin.buffer), root, options.caller_id, options.work_dir)
     print(json.dumps(result, sort_keys=True))
-    return 1 if result["status"] == "refused" else 0
+    return 0 if result["status"] in SUCCESS else 1
+
+
+def route_worker(root: Path, args: list[str]) -> int:
+    import argparse
+    from .jev_prepared_bridge import prepare_worker, read_request, SUCCESS
+    parser = argparse.ArgumentParser(prog="project-factory route-worker")
+    parser.add_argument("--caller-id", required=True)
+    parser.add_argument("--work-dir", required=True)
+    parser.add_argument("--reuse-receipt")
+    options = parser.parse_args(args)
+    try:
+        result = prepare_worker(read_request(sys.stdin.buffer), root, options.caller_id,
+                                options.work_dir, reuse_receipt=options.reuse_receipt)
+    except Exception as error:
+        result = {"status": "refused", "receipt": {"reason": "provider_admission_" + type(error).__name__}}
+    print(json.dumps(result, sort_keys=True))
+    return 0 if result["status"] in SUCCESS else 1
+
+
+def native_gate(args: list[str]) -> int:
+    """Existing shared CLI entry selects only its actual bound project, never a fixed adopter."""
+    from .native_hook import handle, deny
+    from .jev_prepared_bridge import read_request
+    try:
+        if args:
+            raise ValueError('native-hook takes no root override')
+        event = read_request(sys.stdin.buffer)
+        root = shared_root(project_root())
+        if (not isinstance(event, dict) or not isinstance(event.get('cwd'), str)
+                or not Path(event['cwd']).is_absolute()
+                or shared_root(Path(event['cwd']).resolve()) != root):
+            raise ValueError('native hook command/event project mismatch')
+        result = handle(event, root)
+    except Exception as error:
+        result = deny('Native worker command refused (' + type(error).__name__ + ').')
+    print(json.dumps(result, sort_keys=True))
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] == "native-hook":
+        return native_gate(args[1:])
     if not args or args[0] in {"--help", "-h"}:
-        print("project-factory route-subagent --caller-id <native-caller> --work-dir work/<task> < request.json\n"
+        print("project-factory native-hook < native-event.json\n"
+              "project-factory route-worker --caller-id <logical-caller> --work-dir work/<run>/<task> [--reuse-receipt <original>] < request.json\n"
+              "project-factory route-subagent --caller-id <native-caller> --work-dir work/<task> < request.json\n"
               "factory run <shared-workflow> [native arguments]\n"
               "factory run archon-implement --jev-route [fresh foreground native arguments]\n"
               "factory run <shared-workflow> --runtime-host <config.json> [foreground native arguments]\n"
@@ -880,6 +909,8 @@ def main(argv: list[str] | None = None) -> int:
               "factory pause | unpause (stop scheduled launches; the timer keeps waking active runs)")
         return 0
     try:
+        if args[0] == "route-worker":
+            return route_worker(project_root(), args[1:])
         if args[0] == "route-subagent":
             return route_subagent(project_root(), args[1:])
         return invoke(project_root(), args[0], args[1:])

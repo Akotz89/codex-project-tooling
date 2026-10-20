@@ -21,6 +21,7 @@ sys.path.insert(0, str(BASE / 'bin'))
 import consumer
 import jev_prepared_bridge as bridge
 import jev_router
+import native_hook
 spec = importlib.util.spec_from_file_location('factory_entry', BASE / 'bin/factory.py')
 entry = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(entry)
@@ -82,11 +83,11 @@ class RoutingTests(unittest.TestCase):
         self.assertNotIn('model', result)
         self.assertNotIn('effort', result)
 
-    def command(self, request=None, root=None, transport=None, work='work/control'):
+    def command(self, request=None, root=None, transport=None, work='work/control', caller_id='native:fixture'):
         request = self.request if request is None else request
         root = self.a if root is None else root
         output, errors = io.StringIO(), io.StringIO()
-        with patch.object(sys, 'argv', ['factory', 'route-subagent', '--caller-id', 'native:fixture', '--work-dir', work]), \
+        with patch.object(sys, 'argv', ['factory', 'route-subagent', '--caller-id', caller_id, '--work-dir', work]), \
              patch.object(sys, 'stdin', io.TextIOWrapper(io.BytesIO(json.dumps(request).encode()))), \
              patch.object(consumer, 'project_root', return_value=root), \
              patch.object(bridge, 'http_choice', side_effect=transport or (lambda payload, *_: self.answer(payload))), \
@@ -152,6 +153,27 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(result['spawn_agent'], {'model': 'gpt-6-luna', 'reasoning_effort': 'max', 'fork_turns': 'none'})
         self.assertEqual(json.loads(Path(result['receipt_path']).read_text()), result)
 
+    def test_safe_actual_response_provenance_preserves_unknowns_and_redacts_credential(self):
+        code, result, _ = self.command(transport=lambda p, *_: {
+            **self.answer(p), '_http': {'status': 200, 'request_id': 'offline-request-id'},
+            'status': 'completed'})
+        self.assertEqual(code, 0)
+        receipt = result['receipt']
+        self.assertEqual(receipt['endpoint'], 'https://api.typesafe.ai/v1/systemone')
+        self.assertEqual(receipt['returned_request_id'], 'offline-request-id')
+        self.assertEqual(receipt['http_status'], 200)
+        self.assertEqual(receipt['returned_status'], 'completed')
+        self.assertEqual(receipt['usage'], {'input_tokens': 10, 'output_tokens': 4})
+        self.assertIsNone(result['observed_effort'])
+        self.assertNotIn('account', receipt)
+        self.assertNotIn('offline-fixture-key', json.dumps(result))
+        _, invalid, _ = self.command(transport=lambda p, *_: {
+            **self.answer(p), '_http': {'status': True, 'request_id': 'offline-fixture-key'},
+            'status': 'offline-fixture-key'})
+        self.assertNotIn('returned_request_id', invalid['receipt'])
+        self.assertNotIn('http_status', invalid['receipt'])
+        self.assertNotIn('returned_status', invalid['receipt'])
+
     def test_public_provider_payload_ignores_malformed_optional_descriptors(self):
         for bad in [None, 7, False, [], {}, '   ']:
             with self.subTest(descriptor=bad):
@@ -170,21 +192,26 @@ class RoutingTests(unittest.TestCase):
                 self.assertTrue(all(r['description'] == r['effort_description'] == '' for r in rows))
                 self.assertEqual(result['spawn_agent']['reasoning_effort'], 'medium')
 
-    def test_explicit_uses_same_receipt_without_credential_or_http(self):
+    def test_explicit_pair_requires_actual_assessment_and_exact_constraint(self):
         self.request['explicit_choice'] = self.override()
-        with patch.object(bridge, 'read_credential', side_effect=AssertionError('credential accessed')) as credential:
-            code, result, _ = self.command(transport=lambda *_: self.fail('HTTP accessed'))
-        credential.assert_not_called()
+        seen = []
+        code, result, _ = self.command(transport=lambda p, *_: seen.append(p) or self.answer(p, effort='max'))
         self.assertEqual(code, 0)
-        self.assertEqual(result['status'], 'human_override')
-        self.assertEqual(result['receipt']['ordinary_worker'], self.request['ordinary'])
-        self.assertEqual(result['spawn_agent'], {'model': 'gpt-6-luna', 'reasoning_effort': 'max', 'fork_turns': 'none'})
-        self.assertEqual(result['receipt']['attempts'], 0)
-        self.assertEqual(json.loads(Path(result['receipt_path']).read_text()), result)
+        self.assertEqual(result['status'], 'selected')
+        self.assertEqual(result['receipt']['attempts'], 1)
+        self.assertEqual(len(seen[0]['state']['allowed_catalog']), 8)
+        self.assertIn('Human pair constraint', seen[0]['state']['task'])
+        self.assertEqual(result['spawn_agent']['reasoning_effort'], 'max')
+        code, result, _ = self.command()  # fixture selects medium, conflicting with max constraint
+        self.assertEqual(code, 1)
+        self.assertEqual(result['receipt']['reason'], 'human_constraint_not_selected')
+        self.no_args(result)
+        with patch.object(bridge, 'read_credential', return_value=None):
+            code, result, _ = self.command(transport=lambda *_: self.fail('HTTP accessed'))
+        self.assertEqual(code, 1)
+        self.no_args(result)
         self.request['explicit_choice'] = self.override('gpt-6.1-sol', 'xhigh')
-        code, result, _ = self.command(transport=lambda *_: self.fail('HTTP accessed'))
-        self.assertEqual((code, result['status']), (1, 'refused'))
-        self.assertNotIn('spawn_agent', result)
+        self.assertEqual(self.command(transport=lambda *_: self.fail('HTTP accessed'))[0], 1)
 
     def test_valid_human_override_cannot_bypass_ordinary_policy_or_current_capability(self):
         cases = [
@@ -335,10 +362,62 @@ class RoutingTests(unittest.TestCase):
         instruction = self.a / 'AGENTS.md'
         instruction.write_text('Use gpt-6-luna at max for this bounded worker.')
         self.request['explicit_choice'] = {**self.override(), 'instruction_reference': {'kind': 'governing_instruction', 'path': str(instruction)}}
-        code, result, _ = self.command(transport=lambda *_: self.fail('HTTP accessed'))
+        code, result, _ = self.command(transport=lambda p, *_: self.answer(p, effort='max'))
         self.assertEqual(code, 0)
-        self.assertEqual(result['receipt']['assessment_status'], 'unassessed_human_override')
+        self.assertEqual(result['receipt']['assessment_status'], 'selected')
         self.assertEqual(result['receipt']['human_override'], {k: v for k, v in self.request['explicit_choice'].items() if k not in {'model', 'effort'}})
+
+    def test_governing_override_requires_exact_quote_in_safe_bounded_readable_file(self):
+        instruction = self.a / 'AGENTS.md'
+        quote = self.override()['instruction_quote']
+        self.request['explicit_choice'] = {
+            **self.override(),
+            'instruction_reference': {'kind': 'governing_instruction', 'path': str(instruction)}}
+
+        def command():
+            return self.command(transport=lambda p, *_: self.answer(p, effort='max'))
+
+        instruction.write_text('Current governing instruction:\n' + quote + '\n')
+        code, result, _ = command()
+        self.assertEqual(code, 0)
+        self.assertEqual(result['status'], 'selected')
+        self.assertEqual(result['receipt']['human_override']['instruction_quote'], quote)
+
+        instruction.write_text('Different instruction. private-reference-must-not-leak')
+        code, result, errors = command()
+        self.assertEqual(code, 1)
+        self.no_args(result)
+        self.assertNotIn('private-reference-must-not-leak', json.dumps(result) + errors)
+
+        instruction.write_text(quote)
+        instruction.chmod(0)
+        try:
+            code, result, _ = command()
+            self.assertEqual(code, 1)
+            self.no_args(result)
+        finally:
+            instruction.chmod(0o644)
+
+        instruction.write_text(quote + '\n' + 'x' * bridge.MAX_INSTRUCTION_REFERENCE)
+        code, result, _ = command()
+        self.assertEqual(code, 1)
+        self.no_args(result)
+
+        instruction.write_text(quote)
+        instruction.chmod(0o666)
+        try:
+            code, result, _ = command()
+            self.assertEqual(code, 1)
+            self.no_args(result)
+        finally:
+            instruction.chmod(0o644)
+
+        original = instruction.with_suffix('.original')
+        instruction.rename(original)
+        instruction.symlink_to(original)
+        code, result, _ = command()
+        self.assertEqual(code, 1)
+        self.no_args(result)
 
     def test_invalid_ordinary_refuses_before_optional_access(self):
         for model, effort in [('gpt-5.6-sol', 'medium'), ('gpt-6.1-sol', 'xhigh'), ('gpt-6-luna', 'ultra')]:
@@ -356,7 +435,7 @@ class RoutingTests(unittest.TestCase):
                 request['explicit_choice'] = self.override()
             for failing in ('open', 'fsync'):
                 with self.subTest(explicit=explicit, failing=failing), patch.object(bridge.os, failing, side_effect=PermissionError()):
-                    code, result, _ = self.command(request)
+                    code, result, _ = self.command(request, transport=lambda p, *_: self.answer(p, effort='max' if explicit else 'medium'))
                 self.assertEqual(code, 1)
                 self.assertEqual(result['persistence']['status'], 'failed')
                 self.assertEqual(result['status'], 'refused')
@@ -383,7 +462,7 @@ class RoutingTests(unittest.TestCase):
                 code, result, _ = self.command(request, transport=lambda *_: self.fail('HTTP accessed'))
                 self.assertEqual((code, result), (1, None))
         self.assertEqual(self.command(root=self.b)[0], 1)
-        for path in ['work', '../escape', str(self.b / 'work/outside')]:
+        for path in ['work', '../escape', 'work/../work/other-task', str(self.b / 'work/outside')]:
             self.assertEqual(self.command(work=path)[0], 1)
         (self.a / 'work').mkdir(exist_ok=True)
         (self.a / 'work/escape').symlink_to(self.b, target_is_directory=True)
@@ -427,10 +506,11 @@ class RoutingTests(unittest.TestCase):
             argv = [sys.executable, '-B', str(BASE / 'bin/factory.py'), 'route-subagent',
                     '--caller-id', 'native:fixture', '--work-dir', 'work/subprocess']
             result = subprocess.run(argv, input=json.dumps(request), text=True, capture_output=True, cwd=root, env=env)
-            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.returncode, 1, result.stderr)
             output = json.loads(result.stdout)
             roots.append(output['project_binding']['root'])
-            self.assertEqual(output['status'], 'human_override')
+            self.assertEqual(output['status'], 'refused')
+            self.no_args(output)
             request.pop('explicit_choice')
             # Existing insecure key and missing key are distinct real IO controls.
             for insecure in (False, True):
@@ -445,6 +525,549 @@ class RoutingTests(unittest.TestCase):
                 self.assertEqual(output['receipt']['attempts'], 0)
                 self.no_args(output)
         self.assertNotEqual(*roots)
+
+
+class WorkerAdmissionTests(unittest.TestCase):
+    setUp = RoutingTests.setUp
+    project = RoutingTests.project
+    bound_request = RoutingTests.bound_request
+    answer = RoutingTests.answer
+    override = RoutingTests.override
+    no_args = RoutingTests.no_args
+
+    def worker(self):
+        request = copy.deepcopy(self.request)
+        request['schema'] = 'CPI414PROVIDERWORKERV1'
+        request.pop('capability_provenance')
+        connection = '46edcd0d-a394-4516-a68e-214dc61ef7a0'
+        captured = time.time()
+        request['catalog_provenance'] = {'source': 'codex_app_server_same_connection',
+                                        'connection_id': connection, 'captured_at': captured}
+        request['catalog'] = {'same_account': True, 'identity': connection, 'fetched_at': captured,
+            'models': [{'model': model, 'supportedReasoningEfforts': sorted(efforts)}
+                       for model, efforts in jev_router.WORKER_EFFORTS.items()]}
+        return request
+
+    def command(self, request=None, reuse=None, transport=None, work='work/worker'):
+        request = self.worker() if request is None else request
+        args = ['route-worker', '--caller-id', 'native:fixture', '--work-dir', work]
+        if reuse is not None:
+            args += ['--reuse-receipt', reuse]
+        output = io.StringIO()
+        with (
+            patch.object(sys, 'stdin', io.TextIOWrapper(io.BytesIO(json.dumps(request).encode()))),
+            patch.object(consumer, 'project_root', return_value=self.a),
+            patch.object(consumer, 'verify_source', return_value=self.a),
+            patch.object(bridge, 'http_choice', side_effect=transport or (lambda p, *_: self.answer(p))),
+            contextlib.redirect_stdout(output),
+        ):
+            with patch.object(sys, 'argv', ['factory', *args]):
+                code = entry.main()
+        return code, json.loads(output.getvalue())
+
+    def prepared_native(self, caller_prefix='native:', work='work/native'):
+        request = copy.deepcopy(self.request)
+        session_id = '01a15564-fd5f-7550-aadb-de6160ef7b5d'
+        caller_id = caller_prefix + session_id
+        request['caller_id'] = caller_id
+        request['capability_provenance']['caller_id'] = caller_id
+        request['native_dispatch'] = {'task_name': 'parser_fix',
+                                     'message': 'Repair the bounded parser and run its regression checks.'}
+        code, prepared, _ = RoutingTests.command(self, request, work=work, caller_id=caller_id)
+        self.assertEqual(code, 0)
+        message = request['native_dispatch']['message'] + '\n[CPI414 preparation=' + str(
+            Path(prepared['receipt_path']).relative_to(self.a)) + ']'
+        event = {'hook_event_name': 'PreToolUse', 'cwd': str(self.a),
+                 'session_id': session_id, 'turn_id': 'turn:1', 'tool_use_id': 'tool:1',
+                 'tool_name': 'spawn_agent', 'tool_input': {'task_name': 'parser_fix',
+                 'message': message, 'model': 'gpt-6.1-sol', 'reasoning_effort': 'high',
+                 'fork_turns': 'all'}}
+        return prepared, event
+
+    def hook(self, event):
+        with patch.object(consumer, 'verify_source', return_value=self.a):
+            return native_hook.handle(event, self.a)
+
+    def assert_denied(self, result):
+        output = result['hookSpecificOutput']
+        self.assertEqual(output['permissionDecision'], 'deny')
+        self.assertTrue(output['permissionDecisionReason'])
+        self.assertNotIn('updatedInput', output)
+
+    def test_provider_outer_api_selected_ordinary_and_human_are_private_persisted(self):
+        for model, effort in [('gpt-6-luna', 'max'), ('gpt-6.1-sol', 'medium')]:
+            code, result = self.command(transport=lambda p, *_: self.answer(p, model, effort))
+            self.assertEqual(code, 0)
+            self.assertEqual((result['model'], result['effort']), (model, effort))
+            self.assertEqual(result['status'], 'confirmed_ordinary' if model == 'gpt-6.1-sol' else 'selected')
+            self.assertEqual(json.loads(Path(result['receipt_path']).read_text()), result)
+            self.assertEqual(Path(result['receipt_path']).stat().st_mode & 0o777, 0o600)
+            self.assertNotIn('offline-fixture-key', json.dumps(result))
+        request = self.worker()
+        request['explicit_choice'] = self.override()
+        request['human_attribution_verification'] = {
+            'checked': True, 'checked_by': 'native:actual-caller', 'checked_at': '2026-10-20T12:00:00-05:00'}
+        code, result = self.command(request, transport=lambda p, *_: self.answer(p, effort='max'))
+        self.assertEqual(code, 0)
+        self.assertEqual(result['status'], 'selected')
+
+    def test_provider_human_override_requires_caller_verification_and_persists_it(self):
+        request = self.worker()
+        request['explicit_choice'] = self.override()
+        checked = {'checked': True, 'checked_by': 'native:actual-caller',
+                   'checked_at': '2026-10-20T12:00:00-05:00'}
+        invalid = [None, {}, {**checked, 'checked': False}, {**checked, 'checked': 1},
+                   {**checked, 'checked_by': ' '}, {**checked, 'checked_by': ''},
+                   {**checked, 'checked_at': 'not-a-timestamp'},
+                   {**checked, 'checked_at': '2026-10-20'},
+                   {**checked, 'checked_at': '2026-10-20T12:00:00'}]
+        for verification in invalid:
+            request['human_attribution_verification'] = verification
+            with patch.object(bridge, 'read_credential', side_effect=AssertionError('credential accessed')):
+                code, result = self.command(request, transport=lambda *_: self.fail('human override assessed'))
+            self.assertEqual(code, 1, verification)
+            self.no_args(result)
+        request['human_attribution_verification'] = checked
+        code, result = self.command(request, transport=lambda p, *_: self.answer(p, effort='max'))
+        self.assertEqual(code, 0)
+        self.assertEqual(result['status'], 'selected')
+        persisted = json.loads(Path(result['receipt_path']).read_text())
+        self.assertEqual(persisted['receipt']['human_attribution_verification'], checked)
+        self.assertEqual(persisted['human_attribution_verification'], checked)
+        self.assertEqual(persisted['receipt']['assessment_status'], 'selected')
+
+        request['continuation'] = True
+        code, reused = self.command(request, result['receipt_path'],
+                                    transport=lambda *_: self.fail('human continuation reassessed'))
+        self.assertEqual(code, 0)
+        self.assertEqual(reused['preparation_id'], result['preparation_id'])
+        self.assertEqual(reused['receipt']['human_attribution_verification'], checked)
+        request['human_attribution_verification'] = {**checked, 'checked_by': 'different-caller'}
+        self.assertEqual(self.command(request, result['receipt_path'])[0], 1)
+
+    def test_provider_all_admission_failures_have_zero_launch_ready_fields(self):
+        modifications = [
+            lambda r: r.update(project_binding={}),
+            lambda r: r.update(caller_id='wrong'),
+            lambda r: r.update(task_id=None),
+            lambda r: r.update(task=''),
+            lambda r: r['catalog'].update(same_account=False),
+            lambda r: r['catalog_provenance'].update(connection_id='not-a-uuid'),
+            lambda r: r['catalog_provenance'].update(captured_at=time.time()-70),
+            lambda r: r['catalog'].update(identity='wrong-account'),
+            lambda r: r['ordinary'].update(effort='xhigh'),
+            lambda r: r.update(continuation=True),
+            lambda r: r.update(remaining_ms=0),
+            lambda r: r.update(explicit_choice={'model': 'gpt-6-luna', 'effort': 'low'}),
+        ]
+        for mutate in modifications:
+            request = self.worker()
+            mutate(request)
+            code, result = self.command(request)
+            self.assertEqual(code, 1, result)
+            self.assertNotIn('model', result)
+            self.assertNotIn('effort', result)
+            self.assertNotIn('spawn_agent', result)
+        for answer in ({}, {'answers': None}):
+            code, result = self.command(transport=lambda *_: answer)
+            self.assertEqual(code, 1)
+            self.assertNotIn('model', result)
+        with patch.object(bridge, 'persist_private', side_effect=OSError('fixture')):
+            code, result = self.command()
+        self.assertEqual(code, 1)
+        self.assertEqual(result['persistence']['status'], 'failed')
+        self.assertNotIn('model', result)
+
+    def test_provider_persistence_failure_withholds_every_shared_route_launch_copy(self):
+        # The shared route has real native and provider result variants. A
+        # persistence failure cannot expose callable copies from either variant.
+        for model, effort in [('gpt-6-luna', 'medium'), ('gpt-6.1-sol', 'medium')]:
+            with self.subTest(model=model, effort=effort):
+                routed = bridge.route(self.request, self.a, transport=lambda p, *_:
+                                      self.answer(p, model=model, effort=effort))
+                self.assertIn('spawn_agent', routed)
+                self.assertIn('dispatch_receipt', routed)
+                self.assertIn('spawn_agent_request', routed['receipt'])
+                with patch.object(bridge, 'route', return_value=copy.deepcopy(routed)),                      patch.object(bridge, 'persist_private', side_effect=OSError('fixture persistence failure')):
+                    code, result = self.command()
+                self.assertEqual(code, 1)
+                self.assertEqual(result['persistence']['status'], 'failed')
+                self.no_args(result)
+                self.assertEqual(result['receipt']['spawn_arguments'], 'unavailable')
+                self.assertEqual(result['receipt']['prepared_pair'], {'model': model, 'effort': effort})
+
+                def launch_copies(value):
+                    if isinstance(value, dict):
+                        return [key for key in value if key in
+                                {'spawn_agent', 'dispatch_receipt', 'spawn_agent_request'}] + [
+                                found for nested in value.values() for found in launch_copies(nested)]
+                    if isinstance(value, list):
+                        return [found for nested in value for found in launch_copies(nested)]
+                    return []
+                self.assertEqual(launch_copies(result), [])
+
+    def test_provider_final_prompt_bound_is_not_truncated(self):
+        request = self.worker()
+        request['task'] = 'x' * 65536
+        seen = []
+        code, result = self.command(request, transport=lambda p, *_: seen.append(p) or self.answer(p))
+        self.assertEqual(code, 0)
+        self.assertEqual(seen[0]['state']['task'], request['task'])
+        request['task'] += 'x'
+        code, result = self.command(request)
+        self.assertEqual(code, 1)
+        self.assertNotIn('model', result)
+
+    def test_provider_source_and_binding_checked_before_credential_access(self):
+        request = self.worker()
+        with (
+            patch.object(consumer, 'verify_source', side_effect=ValueError('source drift')),
+            patch.object(bridge, 'read_credential', side_effect=AssertionError('credential accessed')),
+        ):
+            with self.assertRaises(ValueError):
+                bridge.prepare_worker(request, self.a, 'native:fixture', 'work/worker')
+
+    def test_continuation_reuses_exact_original_and_rechecks_catalog_and_identity(self):
+        code, first = self.command()
+        self.assertEqual(code, 0)
+        request = self.worker()
+        request.update(continuation=True, task='Continue same bounded task with new verified facts.')
+        code, reused = self.command(request, first['receipt_path'],
+                                    transport=lambda *_: self.fail('continuation reassessed'))
+        self.assertEqual(code, 0)
+        self.assertEqual(reused['preparation_id'], first['preparation_id'])
+        self.assertEqual(reused['model'], first['model'])
+        self.assertEqual(reused['reuse'], 'same_logical_task')
+        for mutate in [lambda r: r.update(task_id='different'),
+                       lambda r: r['catalog']['models'][0].update(supportedReasoningEfforts=['low'])]:
+            invalid = copy.deepcopy(request)
+            mutate(invalid)
+            code, result = self.command(invalid, first['receipt_path'])
+            self.assertEqual(code, 1)
+            self.assertNotIn('model', result)
+        path = Path(first['receipt_path'])
+        original = path.read_text()
+        changed = json.loads(original)
+        changed['source_binding']['revision'] = 'another-source'
+        path.write_text(json.dumps(changed))
+        self.assertEqual(self.command(request, str(path))[0], 1)
+        path.write_text(original)
+        path.chmod(0o644)
+        self.assertEqual(self.command(request, str(path))[0], 1)
+
+
+    def test_native_preparation_and_marker_share_legitimate_task_directory_names(self):
+        for directory in ['work/réparation_日本語', 'work/parser+checks',
+                          'work/parser (review)', 'work/修復 + (review) [checked]/nested']:
+            for absolute in (False, True):
+                with self.subTest(directory=directory, absolute=absolute):
+                    supplied = str(self.a / directory) if absolute else directory
+                    prepared, event = self.prepared_native(work=supplied)
+                    path = Path(prepared['receipt_path'])
+                    self.assertEqual(path.parent, self.a / directory)
+                    self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                    output = self.hook(event)['hookSpecificOutput']
+                    self.assertEqual(output['permissionDecision'], 'allow')
+                    applied = output['updatedInput']
+                    self.assertEqual(applied, {**event['tool_input'], **prepared['spawn_agent']})
+                    self.assert_denied(self.hook(event))
+                    post = {**event, 'hook_event_name': 'PostToolUse', 'tool_input': applied,
+                            'tool_response': {'agent_id': 'worker:unicode_path'}}
+                    self.assertEqual(self.hook(post), {})
+                    recorded = json.loads(path.with_suffix('.result.json').read_text())
+                    self.assertEqual(recorded['native_handle'], 'worker:unicode_path')
+
+    def test_provider_preparation_and_reuse_preserve_legitimate_task_directory_names(self):
+        for directory in ['work/réparation_日本語', 'work/parser+checks',
+                          'work/parser (review)', 'work/修復 + (review) [checked]/nested']:
+            with self.subTest(directory=directory):
+                code, prepared = self.command(work=directory)
+                self.assertEqual(code, 0)
+                self.assertEqual(Path(prepared['receipt_path']).parent, self.a / directory)
+                request = self.worker()
+                request['continuation'] = True
+                locator = str(Path(prepared['receipt_path']).relative_to(self.a))
+                code, reused = self.command(request, locator, work=directory,
+                    transport=lambda *_: self.fail('same task reassessed'))
+                self.assertEqual(code, 0)
+                self.assertEqual(reused['preparation_id'], prepared['preparation_id'])
+
+    def test_control_separator_workdirs_refuse_before_assessment_or_persistence(self):
+        controls = ['\0', '\t', '\n', '\r', '\x1c', '\x1d', '\x1e', '\x1f',
+                    '\x7f', '\x85', '\u2028', '\u2029', '\ud800']
+        for char in controls:
+            for absolute in (False, True):
+                directory = 'work/control' + char + 'separator'
+                supplied = str(self.a / directory) if absolute else directory
+                for provider in (False, True):
+                    with self.subTest(control=ascii(char), absolute=absolute, provider=provider):
+                        with (patch.object(bridge, 'read_credential', return_value='offline-fixture-key') as key,
+                              patch.object(bridge, 'http_choice') as chooser,
+                              patch.object(bridge, 'persist_private') as writer):
+                            if provider:
+                                code, result = self.command(work=supplied, transport=chooser)
+                                self.assertNotIn('model', result)
+                                self.assertNotIn('effort', result)
+                            else:
+                                code, result, _ = RoutingTests.command(self, work=supplied, transport=chooser)
+                                self.assertIsNone(result)
+                            self.assertEqual(code, 1)
+                            key.assert_not_called()
+                            chooser.assert_not_called()
+                            writer.assert_not_called()
+                        self.assertFalse((self.a / 'work').exists())
+
+    def test_native_marker_control_separators_refuse_before_receipt_read(self):
+        _, event = self.prepared_native()
+        for char in ['\0', '\t', '\n', '\r', '\x1e', '\x7f', '\x85', '\u2028', '\u2029', '\ud800']:
+            with self.subTest(control=ascii(char)):
+                invalid = copy.deepcopy(event)
+                invalid['tool_input']['message'] = invalid['tool_input']['message'].replace(
+                    'work/native/', 'work/native' + char + '/')
+                with patch.object(native_hook, 'private_json') as reader:
+                    self.assert_denied(self.hook(invalid))
+                    reader.assert_not_called()
+
+
+    def test_native_extended_marker_keeps_root_symlink_and_final_line_controls(self):
+        prepared, event = self.prepared_native(work='work/修復 + (review)')
+        path = Path(prepared['receipt_path'])
+        link = self.a / 'work/link + (review)'
+        link.symlink_to(path.parent, target_is_directory=True)
+        locator = str(path.relative_to(self.a))
+        for invalid_locator in [
+                str(path), 'work/link + (review)/' + path.name,
+                'work/../work/修復 + (review)/' + path.name,
+                'work/../../b/work/修復 + (review)/' + path.name]:
+            with self.subTest(locator=invalid_locator):
+                invalid = copy.deepcopy(event)
+                invalid['tool_input']['message'] = invalid['tool_input']['message'].replace(
+                    locator, invalid_locator)
+                self.assert_denied(self.hook(invalid))
+        for suffix in ['\n', '\r\n', ' extra']:
+            invalid = copy.deepcopy(event)
+            invalid['tool_input']['message'] += suffix
+            self.assert_denied(self.hook(invalid))
+        self.assertFalse(path.with_suffix('.consume.json').exists())
+        self.assertEqual(self.hook(event)['hookSpecificOutput']['permissionDecision'], 'allow')
+
+    def test_native_exact_rewrite_once_and_actual_handle_receipt(self):
+        prepared, event = self.prepared_native()
+        for tool in ['spawn_agent', 'Agent']:
+            with self.subTest(tool=tool):
+                event['tool_name'] = tool
+                result = self.hook(event)
+                if tool == 'Agent':
+                    self.assert_denied(result)  # same preparation cannot replay under alias
+                    continue
+                output = result['hookSpecificOutput']
+                self.assertEqual(output['permissionDecision'], 'allow')
+                applied = output['updatedInput']
+                self.assertEqual(applied, {**event['tool_input'], **prepared['spawn_agent']})
+                self.assertEqual(applied['fork_turns'], 'none')
+        post = {**event, 'hook_event_name': 'PostToolUse',
+                'tool_input': applied, 'tool_response': {'agent_id': 'worker:actual'}}
+        self.assertEqual(self.hook(post), {})
+        result_path = Path(prepared['receipt_path']).with_suffix('.result.json')
+        result = json.loads(result_path.read_text())
+        self.assertEqual(result['native_handle'], 'worker:actual')
+        self.assertIsNone(result['observed_model'])
+        self.assertEqual(result['acceptance'], 'not_performed')
+
+    def test_native_post_conflicting_actual_pair_never_records_reported_handle(self):
+        changes = [
+            ('model', 'gpt-6.1-sol'), ('reasoning_effort', 'high'), ('fork_turns', 'all'),
+            ('model', None), ('reasoning_effort', None), ('fork_turns', None)]
+        for key, value in changes:
+            with self.subTest(field=key, actual=value):
+                prepared, event = self.prepared_native()
+                applied = self.hook(event)['hookSpecificOutput']['updatedInput']
+                path = Path(prepared['receipt_path'])
+                reservation = path.with_suffix('.consume.json')
+                original_reservation = reservation.read_bytes()
+                actual = copy.deepcopy(applied)
+                if value is None:
+                    actual.pop(key)
+                else:
+                    actual[key] = value
+                response = self.hook({**event, 'hook_event_name': 'PostToolUse',
+                    'tool_input': actual, 'tool_response': {'agent_id': 'worker:must-not-be-recorded'}})
+                self.assertFalse(path.with_suffix('.result.json').exists(),
+                                 'conflicting actual arguments must not produce a handle receipt')
+                self.assertIn('requires reconciliation',
+                              response['hookSpecificOutput']['additionalContext'])
+                self.assertEqual(reservation.read_bytes(), original_reservation)
+                self.assertNotIn('worker:must-not-be-recorded', json.dumps(response))
+
+    def test_native_post_checks_pair_even_when_reservation_hash_matches_conflicting_args(self):
+        prepared, event = self.prepared_native()
+        applied = self.hook(event)['hookSpecificOutput']['updatedInput']
+        path = Path(prepared['receipt_path'])
+        actual = {**applied, 'fork_turns': 'all'}
+        reservation = path.with_suffix('.consume.json')
+        saved = json.loads(reservation.read_text())
+        saved['applied_arguments_sha256'] = __import__('hashlib').sha256(
+            json.dumps(actual, sort_keys=True).encode()).hexdigest()
+        reservation.write_text(json.dumps(saved))
+        response = self.hook({**event, 'hook_event_name': 'PostToolUse',
+                             'tool_input': actual, 'tool_response': {'agent_id': 'worker:wrong-pair'}})
+        self.assertIn('requires reconciliation', response['hookSpecificOutput']['additionalContext'])
+        self.assertFalse(path.with_suffix('.result.json').exists())
+
+    def test_native_post_exact_args_still_require_original_reservation_hash(self):
+        prepared, event = self.prepared_native()
+        applied = self.hook(event)['hookSpecificOutput']['updatedInput']
+        path = Path(prepared['receipt_path'])
+        reservation = path.with_suffix('.consume.json')
+        saved = json.loads(reservation.read_text())
+        saved['applied_arguments_sha256'] = '0' * 64
+        reservation.write_text(json.dumps(saved))
+        response = self.hook({**event, 'hook_event_name': 'PostToolUse',
+                             'tool_input': applied, 'tool_response': {'agent_id': 'worker:wrong-receipt'}})
+        self.assertIn('requires reconciliation', response['hookSpecificOutput']['additionalContext'])
+        self.assertFalse(path.with_suffix('.result.json').exists())
+
+    def test_native_missing_wrong_task_session_root_expired_or_forbidden_denied(self):
+        prepared, event = self.prepared_native()
+        for mutate in [
+            lambda e: e['tool_input'].update(message='unprepared'),
+            lambda e: e['tool_input'].update(message=e['tool_input']['message'].replace('Repair', 'Change')),
+            lambda e: e['tool_input'].update(task_name='another_task'),
+            lambda e: e.update(session_id='wrong'),
+            lambda e: e.update(cwd=str(self.b)),
+            lambda e: e.pop('tool_use_id'),
+            lambda e: e['tool_input'].update(preparation_id='unsupported'),
+        ]:
+            invalid = copy.deepcopy(event)
+            mutate(invalid)
+            self.assert_denied(self.hook(invalid))
+        path = Path(prepared['receipt_path'])
+        for mutate in [
+            lambda r: r.update(capability_captured_at=time.time()-70),
+            lambda r: r.update(native_dispatch=None),
+            lambda r: r['spawn_agent'].update(reasoning_effort='ultra'),
+            lambda r: r.update(project_binding={}),
+            lambda r: r.update(source_binding={'revision': 'wrong', 'source': 'wrong-source'}),
+            lambda r: r.update(status='refused'),
+            lambda r: r.update(persistence={'status': 'failed'}),
+        ]:
+            receipt = copy.deepcopy(prepared)
+            mutate(receipt)
+            path.write_text(json.dumps(receipt))
+            self.assert_denied(self.hook(event))
+        self.assertFalse(path.with_suffix('.consume.json').exists())
+
+    def test_native_private_path_symlink_and_internal_failure_denied(self):
+        prepared, event = self.prepared_native()
+        path = Path(prepared['receipt_path'])
+        path.chmod(0o644)
+        self.assert_denied(self.hook(event))
+        path.chmod(0o600)
+        renamed = path.with_suffix('.original')
+        path.rename(renamed)
+        path.symlink_to(renamed)
+        self.assert_denied(self.hook(event))
+        path.unlink()
+        renamed.rename(path)
+        with patch.object(native_hook, 'persist_private', side_effect=OSError('credential-like-secret')):
+            result = self.hook(event)
+        self.assert_denied(result)
+        self.assertNotIn('credential-like-secret', json.dumps(result))
+        self.assertFalse(path.with_suffix('.consume.json').exists())
+
+    def test_actual_hook_entry_emits_supported_deny_on_malformed_input(self):
+        result = subprocess.run([sys.executable, '-B', str(BASE / 'template/factory/native_hook.py'),
+                                 '--root', str(self.a)], cwd=BASE, input='{bad',
+                                text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_denied(json.loads(result.stdout))
+
+    def test_native_caller_accepts_only_raw_or_exact_native_prefix_uuid(self):
+        for prefix in ['', 'native:']:
+            prepared, event = self.prepared_native(caller_prefix=prefix)
+            output = self.hook(event)['hookSpecificOutput']
+            self.assertEqual(output['permissionDecision'], 'allow')
+            consumed = json.loads(Path(prepared['receipt_path']).with_suffix('.consume.json').read_text())
+            self.assertEqual(consumed['prepared_caller_id'], prepared['caller_id'])
+            self.assertEqual(consumed['identity']['session_id'], event['session_id'])
+            self.assertEqual(consumed['caller_mapping'],
+                             'native_prefix_session_uuid' if prefix else 'exact_session_uuid')
+
+        prepared, event = self.prepared_native()
+        path = Path(prepared['receipt_path'])
+        for caller in ['native:01a15564-fd5f-7550-aadb-de6160ef7b5e',
+                       '01a15564-fd5f-7550-aadb-de6160ef7b5e',
+                       'native:/root/real_system_implementation', '/root/real_system_implementation',
+                       'native:native:' + event['session_id']]:
+            modified = copy.deepcopy(prepared)
+            modified['caller_id'] = caller
+            path.write_text(json.dumps(modified))
+            self.assert_denied(self.hook(event))
+        path.write_text(json.dumps(prepared))
+        for session in ['/root/real_system_implementation',
+                        'native:' + event['session_id'], event['session_id'].upper()]:
+            invalid = copy.deepcopy(event)
+            invalid['session_id'] = session
+            self.assert_denied(self.hook(invalid))
+        modified = copy.deepcopy(prepared)
+        modified['capability_provenance'] = 'unrelated_provider'
+        path.write_text(json.dumps(modified))
+        self.assert_denied(self.hook(event))
+        self.assertFalse(path.with_suffix('.consume.json').exists())
+
+    def test_shared_native_command_uses_actual_adopter_and_refuses_foreign_event_root(self):
+        for root in [self.a, self.b]:
+            self.a, original = root, self.a
+            try:
+                self.request = self.bound_request(root)
+                prepared, event = self.prepared_native()
+                output = io.StringIO()
+                with patch.object(sys, 'stdin', io.TextIOWrapper(io.BytesIO(json.dumps(event).encode()))), \
+                     patch.object(consumer, 'project_root', return_value=root), \
+                     patch.object(consumer, 'verify_source', return_value=root), contextlib.redirect_stdout(output):
+                    self.assertEqual(consumer.main(['native-hook']), 0)
+                self.assertEqual(json.loads(output.getvalue())['hookSpecificOutput']['permissionDecision'], 'allow')
+                event['cwd'] = str(self.b if root == original else original)
+                output = io.StringIO()
+                with patch.object(sys, 'stdin', io.TextIOWrapper(io.BytesIO(json.dumps(event).encode()))), \
+                     patch.object(consumer, 'project_root', return_value=root), contextlib.redirect_stdout(output):
+                    self.assertEqual(consumer.main(['native-hook']), 0)
+                self.assert_denied(json.loads(output.getvalue()))
+            finally:
+                self.a = original
+
+    def test_native_consumption_refuses_legacy_or_malformed_assessment_even_with_valid_pair(self):
+        for mutate in [
+            lambda r: r.update(status='human_override'),
+            lambda r: r['receipt'].update(attempts=0),
+            lambda r: r['receipt'].update(assessment_status='unassessed_human_override'),
+            lambda r: r['receipt'].update(assessments={}),
+            lambda r: r['receipt'].update(request_sha256='missing'),
+            lambda r: r['receipt']['assessments']['worker_pair'].update(choice='uncertain'),
+        ]:
+            prepared, event = self.prepared_native()
+            path = Path(prepared['receipt_path'])
+            mutate(prepared)
+            path.write_text(json.dumps(prepared))
+            self.assert_denied(self.hook(event))
+            self.assertFalse(path.with_suffix('.consume.json').exists())
+
+    def test_same_task_continuation_cannot_reuse_legacy_unassessed_provider_receipt(self):
+        request = self.worker()
+        code, prepared = self.command(request)
+        self.assertEqual(code, 0)
+        path = Path(prepared['receipt_path'])
+        prepared['receipt']['attempts'] = 0
+        path.write_text(json.dumps(prepared))
+        request['continuation'] = True
+        code, refused = self.command(request, reuse=str(path), transport=lambda *_: self.fail('reassessed'))
+        self.assertEqual(code, 1)
+        self.no_args(refused)
+
+    def test_native_alias_is_independently_rewritten(self):
+        _, event = self.prepared_native()
+        event['tool_name'] = 'Agent'
+        self.assertEqual(self.hook(event)['hookSpecificOutput']['permissionDecision'], 'allow')
 
 
 if __name__ == '__main__':

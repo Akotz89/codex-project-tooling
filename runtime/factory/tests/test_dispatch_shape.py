@@ -105,7 +105,7 @@ class DispatchArgsTests(unittest.TestCase):
             self.assertEqual(original["PATH"], path)
             self.assertEqual(result["KEEP"], "yes")
 
-    def test_invoke_passes_generated_provenance_and_bun_path_but_not_for_human_config(self):
+    def test_invoke_preserves_config_and_bun_without_optional_preflight_authority(self):
         with tempfile.TemporaryDirectory(prefix="dispatch-invoke-", dir=TASK_WORK) as scratch:
             root = Path(scratch)
             source = root / "source"
@@ -138,9 +138,9 @@ class DispatchArgsTests(unittest.TestCase):
             argv, env = captured[-1]
             self.assertIn("--config", argv)
             self.assertIn(str(config), argv)
-            self.assertEqual(env["ARCHON_JEV_GENERATED_CONFIG"], str(config.resolve()))
+            self.assertNotIn("ARCHON_JEV_GENERATED_CONFIG", env)
             self.assertIn(str(bindir), env["PATH"].split(os.pathsep))
-            self.assertIn("ARCHON_JEV_BRIDGE", env)
+            self.assertNotIn("ARCHON_JEV_BRIDGE", env)
 
             captured.clear()
             with patch.dict(os.environ, {"PATH": "/usr/bin", "ARCHON_JEV_GENERATED_CONFIG": "stale"}, clear=True), \
@@ -221,7 +221,10 @@ class TypedAssessmentBridgeTests(unittest.TestCase):
         receipt = {'capability_provenance': 'caller_supplied_tool_metadata',
                    'capability_tool': 'collaboration.spawn_agent', 'spawn_capability_pairs': rows}
         for row in rows:
-            self.assertEqual(bridge.spawn_agent_request(row, receipt),
+            self.assertIsNone(bridge.spawn_agent_request(row, receipt))
+            with patch.object(bridge, 'read_credential', return_value='offline-test-token'):
+                prepared = bridge.route(self.request(), ROOT, transport=lambda p, *_: self.answer(p, model=row['model'], effort=row['effort']))
+            self.assertEqual(prepared['spawn_agent'],
                              {'model': row['model'], 'reasoning_effort': row['effort'], 'fork_turns': 'none'})
         for model, effort in [('gpt-6.1-sol', 'xhigh'), ('gpt-6-luna', 'ultra'), ('gpt-6-luna', 'persistent')]:
             self.assertIsNone(bridge.spawn_agent_request({'model': model, 'effort': effort}, receipt))

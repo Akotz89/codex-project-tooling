@@ -10,14 +10,16 @@ import types
 ABI = 1
 ENTRIES = (
     "factory/consumer.py", "factory/jev_prepared_bridge.py", "factory/jev_router.py",
+    "factory/native_hook.py",
     "factory/runtime_host.py", "factory/runtime_process.py", "factory/runtime_resource.py",
     "factory/usage_collector.py", "harness/ci.py", "harness/appproc.py",
     "harness/mutations/run.py", "factory/tests/test_dispatch_shape.py",
     "factory/tests/test_usage_collector.py",
 )
 DEPENDENCIES = {
-    "consumer": ("jev_router", "runtime_host", "jev_prepared_bridge"),
+    "consumer": ("jev_router", "runtime_host", "jev_prepared_bridge", "native_hook"),
     "jev_prepared_bridge": ("jev_router", "consumer"),
+    "native_hook": ("consumer", "jev_prepared_bridge", "jev_router"),
     "runtime_host": ("runtime_process", "runtime_resource"),
     "test_dispatch_shape": ("consumer", "jev_prepared_bridge", "jev_router"),
     "test_usage_collector": ("usage_collector",),

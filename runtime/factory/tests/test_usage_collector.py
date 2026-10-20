@@ -11,7 +11,9 @@ from unittest.mock import patch
 from factory.usage_collector import (collect_event, collect_future_source_file, collect_rollout, collect_source_file, estimate_groups,
                                      api_price_proxy, expected_cost_per_accepted, quota_interval, read_records)
 
-ROOT = PROJECT_ROOT
+# The development collector owns template data; installed adapters own project data.
+from factory import usage_collector as _collector
+ROOT = _collector.ROOT
 (ROOT / "work/factory-tests/collector").mkdir(parents=True, exist_ok=True)
 THREAD = "0123456789abcdef"
 PARENT_SESSION = "fedcba9876543210"

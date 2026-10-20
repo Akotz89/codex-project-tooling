@@ -481,5 +481,22 @@ The installed shared entry also exposes prepare-only native Jev routing through
 [project-factory route-subagent](template/factory/NATIVE_SUBAGENTS.md).
 The caller keeps dispatch, liveness and independent acceptance ownership. See the
 contract for project binding, current native capabilities, assessed selection,
-attributable human overrides, no-argument failures, receipt persistence and
+assessed human pair constraints, no-argument failures, receipt persistence and
 uncertain-send recovery.
+
+Actual provider worker preparation and continuation are documented in
+[PROVIDER_WORKERS.md](template/factory/PROVIDER_WORKERS.md). The old --jev-route
+syntax remains compatible, but optional CLI ordinary-fallback preflight is
+removed; actual new logical workers use mandatory provider admission. Native
+message-bound hook adoption and the host callback fail-open limit are in
+[NATIVE_SUBAGENTS.md](template/factory/NATIVE_SUBAGENTS.md). The principal consumer
+check also registers public provider/native admission tests.
+
+For a source release, run the registered source audit with the actual candidate
+and exact configured Bun:
+~~~sh
+python3 -B bin/audit.py --worker-policy-source /actual/archon-source --bun /exact/bun
+~~~
+This compares actual TypeScript allowedWorkerPair behavior over its current
+effort ladder and forbidden controls against the maintained Python owner cap.
+A policy mismatch fails the audit; no extra policy copy or service is installed.

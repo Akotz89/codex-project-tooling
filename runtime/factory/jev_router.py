@@ -17,7 +17,7 @@ import urllib.request
 
 FLAG = '--jev-route'
 GENERATED_CONFIG_FLAG = '--jev-generated-config'
-MAX_BYTES = 65536
+MAX_BYTES = 131072
 class ModelPolicyError(ValueError):
     pass
 
@@ -212,6 +212,8 @@ def _http_once(payload, credential, deadline):
     request = urllib.request.Request('https://api.typesafe.ai/v1/systemone', data=body,
         headers={'Authorization': 'Bearer ' + credential, 'Content-Type': 'application/json'})
     with urllib.request.urlopen(request, timeout=remaining) as response:
+        http_status = response.status
+        request_id = response.headers.get('x-request-id') or response.headers.get('request-id')
         chunks = []
         size = 0
         while True:
@@ -226,7 +228,10 @@ def _http_once(payload, credential, deadline):
                 raise ValueError('response limit')
     if time.monotonic() >= deadline:
         raise TimeoutError('routing deadline')
-    return json.loads(b''.join(chunks))
+    answer = json.loads(b''.join(chunks))
+    if isinstance(answer, dict):
+        answer['_http'] = {'status': http_status, 'request_id': request_id}
+    return answer
 
 
 class TransportFailure(RuntimeError):
@@ -331,8 +336,32 @@ def selected_pair(items, pairs):
     return pairs[selected], 'direct_pair_selected'
 
 
+def assert_actual_assessment(receipt, model, effort):
+    """Reject legacy/manual receipts at consumption, including same-task reuse."""
+    if (not isinstance(receipt, dict) or receipt.get('schema') != 'CPI236TASKASSESSMENTV1'
+            or type(receipt.get('attempts')) is not int or receipt['attempts'] != 1
+            or receipt.get('assessment_status') not in {'selected', 'confirmed_ordinary'}
+            or not re.fullmatch(r'[0-9a-f]{64}', str(receipt.get('request_sha256', '')))
+            or receipt.get('prepared_pair') != {'model': model, 'effort': effort}):
+        raise ModelPolicyError('actual persisted Jev assessment required')
+    rows = receipt.get('spawn_capability_pairs', receipt.get('catalog_pairs'))
+    if not isinstance(rows, list) or not rows:
+        raise ModelPolicyError('assessed capability set missing')
+    pairs = {}
+    for row in rows:
+        if not isinstance(row, dict) or not allowed_pair(row.get('model'), row.get('effort')):
+            raise ModelPolicyError('assessed capability pair refused')
+        ident = 'pair_' + hashlib.sha256(f"{row['model']}\0{row['effort']}".encode()).hexdigest()[:16]
+        pairs[ident] = {**row, 'description': '', 'effort_description': ''}
+    items = assessments({'answers': {k: {'type': 'choice', **v} for k, v in receipt.get('assessments', {}).items()}},
+                        selection_questions(pairs))
+    pair, _ = selected_pair(items, pairs)
+    if pair is None or (pair['model'], pair['effort']) != (model, effort):
+        raise ModelPolicyError('actual Jev selection mismatch')
+
+
 def choose(task, catalog, credential, jev_model, deadline, *, ordinary=None,
-           capability_provenance=None, transport=http_choice):
+           capability_provenance=None, transport=http_choice, max_task_bytes=MAX_TASK_BYTES):
     assert_ordinary(ordinary)  # Cannot fall through missing-key or provider-error paths.
     started = time.monotonic()
     receipt = {'schema': 'CPI236TASKASSESSMENTV1', 'policy': 'direct_permitted_pair_choice_1',
@@ -366,7 +395,7 @@ def choose(task, catalog, credential, jev_model, deadline, *, ordinary=None,
         except UnicodeError:
             receipt['reason'] = 'context_invalid'
             return None, receipt
-        if receipt['task_utf8_bytes'] > MAX_TASK_BYTES:
+        if receipt['task_utf8_bytes'] > max_task_bytes:
             receipt['reason'] = 'context_oversize'
             return None, receipt
         if started >= deadline:
@@ -384,11 +413,23 @@ def choose(task, catalog, credential, jev_model, deadline, *, ordinary=None,
             receipt['reason'] = 'request_limit'
             return None, receipt
         receipt['request_sha256'] = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+        receipt.update(endpoint='https://api.typesafe.ai/v1/systemone', decision_model=jev_model)
         receipt['attempts'] = 1
         answer = transport(payload, credential, deadline)
         meta = answer.get('_transport') if isinstance(answer, dict) else None
         if isinstance(meta, dict) and isinstance(meta.get('child_pid'), int) and isinstance(meta.get('reaped'), bool):
             receipt['transport'] = {'child_pid': meta['child_pid'], 'reaped': meta['reaped']}
+        http = answer.get('_http') if isinstance(answer, dict) else None
+        if isinstance(http, dict):
+            if type(http.get('status')) is int and 100 <= http['status'] <= 599:
+                receipt['http_status'] = http['status']
+            ident = http.get('request_id')
+            if isinstance(ident, str) and re.fullmatch(r'[A-Za-z0-9._:/-]{1,128}', ident) and credential not in ident:
+                receipt['returned_request_id'] = ident
+        for field in ('request_id', 'status'):
+            value = answer.get(field) if isinstance(answer, dict) else None
+            if isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9._:/-]{1,128}', value) and credential not in value:
+                receipt['returned_' + field] = value
         # Usage is observable even when a late/malformed answer cannot select a worker.
         receipt['decision_model'] = jev_model
         returned_model = answer.get('model') if isinstance(answer, dict) else None

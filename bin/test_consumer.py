@@ -121,6 +121,14 @@ class Fixture(unittest.TestCase):
         shutil.copytree(TEMPLATE, self.fixture_factory / "template", ignore=shutil.ignore_patterns("__pycache__", "work"))
         (self.fixture_factory / "template/factory/pack.json").write_text(json.dumps(consumer.MANIFEST))
         shutil.copytree(HOME / "runtime", self.fixture_factory / "runtime", ignore=shutil.ignore_patterns("__pycache__"))
+        # This disposable copied runtime uses an offline protocol fixture, never a paid API.
+        fixture_router = self.fixture_factory / "runtime/factory/jev_router.py"
+        with fixture_router.open("a") as stream:
+            stream.write('\ndef http_choice(payload, credential, deadline):\n'
+                         '    keys = list(payload["questions"]["worker_pair"]["criteria"])\n'
+                         '    choice = next(k for k in keys if k.startswith("pair_"))\n'
+                         '    return {"answers": {"worker_pair": {"type": "choice", "choice": choice, "confidence": .7,\n'
+                         '        "probabilities": {k: .8 if k == choice else .2 / (len(keys)-1) for k in keys}}}}\n')
         self.git(self.fixture_factory, "init", "-q")
         self.git(self.fixture_factory, "config", "user.name", "Fixture")
         self.git(self.fixture_factory, "config", "user.email", "fixture@example.invalid")
@@ -128,7 +136,8 @@ class Fixture(unittest.TestCase):
         self.git(self.fixture_factory, "commit", "-qm", "factory fixture")
         self.trace = self.base / "argv.jsonl"
         self.env = patch.dict(os.environ, {"FACTORY_TEST_TRACE": str(self.trace),
-                         "FACTORY_AGENT_CMD": "provider-must-never-run", "FACTORY_AUTONOMY": "4"})
+                         "FACTORY_AGENT_CMD": "provider-must-never-run", "FACTORY_AUTONOMY": "4",
+                         "TYPESAFE_API_KEY": "offline-consumer-fixture"})
         self.env.start()
         self.addCleanup(self.env.stop)
         configure(self.app, self.settings)
@@ -148,6 +157,94 @@ class Fixture(unittest.TestCase):
 
 
 class ConsumerTests(Fixture):
+    def test_real_worker_command_refuses_source_drift_before_human_override(self):
+        connection = "46edcd0d-a394-4516-a68e-214dc61ef7a0"
+        captured = time.time()
+        request = {"schema": "CPI414PROVIDERWORKERV1", "caller_id": "archon:fixture",
+            "task_id": "worker:parser", "project_binding": consumer.project_binding(self.app),
+            "task": "Bounded parser repair with regression assertions.", "remaining_ms": 2000,
+            "ordinary": {"provider": "codex", "model": "gpt-6.1-sol", "effort": "medium"},
+            "catalog": {"same_account": True, "identity": connection, "fetched_at": captured,
+                        "models": [{"model": "gpt-6.1-sol", "supportedReasoningEfforts": ["medium"]}]},
+            "catalog_provenance": {"source": "codex_app_server_same_connection",
+                                   "connection_id": connection, "captured_at": captured},
+            "explicit_choice": {"model": "gpt-6.1-sol", "effort": "medium",
+                "source": "direct_human_instruction", "instruction_quote": "Use Sol6.1 medium.",
+                "instruction_reference": {"kind": "chat_turn", "chat_id": "human:fixture", "turn_id": "human:1"}}}
+        request["human_attribution_verification"] = {
+            "checked": True, "checked_by": "native:actual-caller", "checked_at": "2026-10-20T12:00:00-05:00"}
+        args = [sys.executable, "-B", str(self.fixture_factory / "bin/factory.py"), "route-worker",
+                "--caller-id", "archon:fixture", "--work-dir", "work/worker"]
+        result = subprocess.run(args, input=json.dumps(request), cwd=self.app,
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        prepared = json.loads(result.stdout)
+        self.assertEqual(prepared["status"], "confirmed_ordinary")
+        self.assertEqual(json.loads(Path(prepared["receipt_path"]).read_text()), prepared)
+        (self.source / "package.json").write_text("source drift")
+        result = subprocess.run(args, input=json.dumps(request), cwd=self.app,
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 1)
+        refused = json.loads(result.stdout)
+        self.assertEqual(refused["status"], "refused")
+        self.assertNotIn("model", refused)
+
+    def test_actual_native_hook_rechecks_configured_source_before_allow(self):
+        session_id = "01a15564-fd5f-7550-aadb-de6160ef7b5d"
+        caller = "native:" + session_id
+        body = "Perform the bounded parser task and verify its assertions."
+        request = {"schema": "CPI411SUBAGENTV1", "caller_id": caller, "task_id": "worker:native",
+            "project_binding": consumer.project_binding(self.app),
+            "task": "Repair the known parser defect in isolated source. Verify parser assertions.",
+            "remaining_ms": 2000,
+            "ordinary": {"provider": "codex", "model": "gpt-6.1-sol", "effort": "medium"},
+            "native_dispatch": {"task_name": "bounded_parser", "message": body},
+            "capability_provenance": {"source": "current_runtime_tool_schema",
+                "tool": "collaboration.spawn_agent", "caller_id": caller, "captured_at": time.time(),
+                "models": [{"model": "gpt-6.1-sol", "reasoning_efforts": ["medium"]}]},
+            "explicit_choice": {"model": "gpt-6.1-sol", "effort": "medium",
+                "source": "direct_human_instruction", "instruction_quote": "Use Sol6.1 medium.",
+                "instruction_reference": {"kind": "chat_turn", "chat_id": "human:fixture", "turn_id": "human:1"}}}
+        prepare_args = [sys.executable, "-B", str(self.fixture_factory / "bin/factory.py"),
+                        "route-subagent", "--caller-id", caller, "--work-dir", "work/native"]
+        hook_args = [sys.executable, "-B",
+                     str(self.fixture_factory / "bin/factory.py"), "native-hook"]
+
+        def prepare():
+            result = subprocess.run(prepare_args, input=json.dumps(request), cwd=self.app,
+                                    capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout)
+
+        def event(receipt, tool_id):
+            relative = Path(receipt["receipt_path"]).relative_to(self.app)
+            return {"hook_event_name": "PreToolUse", "cwd": str(self.app),
+                    "session_id": session_id, "turn_id": "turn:1", "tool_use_id": tool_id,
+                    "tool_name": "spawn_agent", "tool_input": {"task_name": "bounded_parser",
+                        "message": body + "\n[CPI414 preparation=" + str(relative) + "]",
+                        "model": "gpt-6-luna", "reasoning_effort": "max", "fork_turns": "all"}}
+
+        def hook(receipt, tool_id):
+            result = subprocess.run(hook_args, input=json.dumps(event(receipt, tool_id)), cwd=self.app,
+                                    capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout)["hookSpecificOutput"]
+
+        positive = prepare()
+        allowed = hook(positive, "tool:valid")
+        self.assertEqual(allowed["permissionDecision"], "allow")
+        self.assertEqual(allowed["updatedInput"]["model"], "gpt-6.1-sol")
+        self.assertEqual(allowed["updatedInput"]["fork_turns"], "none")
+
+        unused = prepare()
+        self.assertEqual(unused["source_binding"],
+                         {"revision": self.settings["revision"], "source": self.settings["source"]})
+        (self.source / "package.json").write_text("source drift")
+        refused = hook(unused, "tool:source-drift")
+        self.assertEqual(refused["permissionDecision"], "deny")
+        self.assertNotIn("updatedInput", refused)
+        self.assertFalse(Path(unused["receipt_path"]).with_suffix(".consume.json").exists())
+
     def test_factory_state_labels_default_only_for_declaring_workflows(self):
         expected = consumer.MANIFEST["default_inputs"]["archon-triage"]["state_labels"]
         for workflow in ("archon-triage", "archon-ship", "archon-lifecycle"):
@@ -1290,6 +1387,15 @@ class InstallTests(Fixture):
 
 
 class NativeAssessmentPackagingTests(unittest.TestCase):
+    def test_provider_command_example_has_real_shell_continuation(self):
+        text = (TEMPLATE / "factory/PROVIDER_WORKERS.md").read_text()
+        command = text.split("~~~sh", 1)[1].split("~~~", 1)[0].strip()
+        lines = command.splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[0].endswith(chr(92)))
+        self.assertTrue(lines[1].lstrip().startswith("--work-dir "))
+        self.assertNotIn(chr(92) + "n", command)
+
     def test_shared_question_asset_and_legacy_paths_use_maintained_policy(self):
         router = load('jev_router', TEMPLATE / 'factory/jev_router.py')
         bridge = load('jev_prepared_bridge', TEMPLATE / 'factory/jev_prepared_bridge.py')
@@ -1395,6 +1501,9 @@ class HarnessTests(unittest.TestCase):
                         {"exit_code": 0, "stdout": "[PASS]"}):
             self.assertEqual(runner.classify_runtime(invalid, "attempt-id").outcome, "INCONCLUSIVE")
 
+
+# Public admission and native interception run with the principal consumer checks.
+from test_route_subagent import RoutingTests, WorkerAdmissionTests
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
