@@ -190,6 +190,12 @@ class ConsumerTests(Fixture):
         self.assertNotIn("model", refused)
 
     def test_actual_native_hook_rechecks_configured_source_before_allow(self):
+        self.native_hook_source_boundary("spawn_agent")
+
+    def test_actual_flat_native_hook_rewrites_and_denies_wrong_locator(self):
+        self.native_hook_source_boundary("collaborationspawn_agent")
+
+    def native_hook_source_boundary(self, tool_name):
         session_id = "01a15564-fd5f-7550-aadb-de6160ef7b5d"
         caller = "native:" + session_id
         body = "Perform the bounded parser task and verify its assertions."
@@ -220,21 +226,33 @@ class ConsumerTests(Fixture):
             relative = Path(receipt["receipt_path"]).relative_to(self.app)
             return {"hook_event_name": "PreToolUse", "cwd": str(self.app),
                     "session_id": session_id, "turn_id": "turn:1", "tool_use_id": tool_id,
-                    "tool_name": "spawn_agent", "tool_input": {"task_name": "bounded_parser",
+                    "tool_name": tool_name, "tool_input": {"task_name": "bounded_parser",
                         "message": body + "\n[CPI414 preparation=" + str(relative) + "]",
                         "model": "gpt-6-luna", "reasoning_effort": "max", "fork_turns": "all"}}
 
-        def hook(receipt, tool_id):
-            result = subprocess.run(hook_args, input=json.dumps(event(receipt, tool_id)), cwd=self.app,
+        def hook(receipt, tool_id, wrong_locator=False):
+            payload = event(receipt, tool_id)
+            if wrong_locator:
+                payload["tool_input"]["message"] = payload["tool_input"]["message"].replace(
+                    Path(receipt["receipt_path"]).name, "jev-00000000000000000000000000000000.json")
+            result = subprocess.run(hook_args, input=json.dumps(payload), cwd=self.app,
                                     capture_output=True, text=True, timeout=15)
             self.assertEqual(result.returncode, 0, result.stderr)
             return json.loads(result.stdout)["hookSpecificOutput"]
 
         positive = prepare()
+        wrong = hook(positive, "tool:wrong-locator", wrong_locator=True)
+        self.assertEqual(wrong["permissionDecision"], "deny")
+        self.assertNotIn("updatedInput", wrong)
+        self.assertFalse(Path(positive["receipt_path"]).with_suffix(".consume.json").exists())
         allowed = hook(positive, "tool:valid")
         self.assertEqual(allowed["permissionDecision"], "allow")
         self.assertEqual(allowed["updatedInput"]["model"], "gpt-6.1-sol")
+        self.assertEqual(allowed["updatedInput"]["reasoning_effort"], "medium")
         self.assertEqual(allowed["updatedInput"]["fork_turns"], "none")
+        self.assertEqual(positive["receipt"]["attempts"], 1)
+        self.assertEqual(allowed["updatedInput"]["task_name"], "bounded_parser")
+        self.assertEqual(allowed["updatedInput"]["message"], event(positive, "tool:valid")["tool_input"]["message"])
 
         unused = prepare()
         self.assertEqual(unused["source_binding"],

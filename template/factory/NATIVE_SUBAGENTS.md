@@ -272,9 +272,11 @@ with a WoW event is refused. The project-local adapter command above remains
 fixed to its own exact adopter and is not a global multi-project command.
 
 Configure one synchronous PreToolUse matcher covering `spawn_agent`,
-`collaboration.spawn_agent`, `functions.spawn_agent`, `multi_agent.spawn_agent`
-and `Agent`, and the same bounded PostToolUse callback. Review the exact
-definition and runtime script bytes before adopting. Use hooks/list currentHash
+`collaboration.spawn_agent`, exact observed `collaborationspawn_agent`,
+`functions.spawn_agent`, `multi_agent.spawn_agent` and `Agent`, and the same
+bounded PostToolUse callback. Review the exact definition and runtime script bytes before adopting. The flat collaboration name
+is the observed namespace+name serialization, not permission to normalize other
+namespaces or session identities. Use hooks/list currentHash
 and supported trust/reload APIs. Installation ships this entry but does not change
 hooks, trust or global configuration. A 10-second callback deadline is appropriate
 only after validating source-check duration on that host.

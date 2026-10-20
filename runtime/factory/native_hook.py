@@ -13,8 +13,8 @@ from .jev_prepared_bridge import (read_request, private_json, persist_private,
 from .jev_router import allowed_pair, assert_actual_assessment
 
 MARKER = re.compile(r'\n\[CPI414 preparation=(work/.+/jev-[0-9a-f]{32}\.json)\]\Z')
-TOOLS = {'spawn_agent', 'collaboration.spawn_agent', 'functions.spawn_agent',
-         'multi_agent.spawn_agent', 'Agent'}
+TOOLS = {'spawn_agent', 'collaboration.spawn_agent', 'collaborationspawn_agent',
+         'functions.spawn_agent', 'multi_agent.spawn_agent', 'Agent'}
 ALLOWED_ARGS = {'task_name', 'message', 'model', 'reasoning_effort', 'fork_turns'}
 
 

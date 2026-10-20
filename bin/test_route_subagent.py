@@ -1065,9 +1065,11 @@ class WorkerAdmissionTests(unittest.TestCase):
         self.no_args(refused)
 
     def test_native_alias_is_independently_rewritten(self):
-        _, event = self.prepared_native()
-        event['tool_name'] = 'Agent'
-        self.assertEqual(self.hook(event)['hookSpecificOutput']['permissionDecision'], 'allow')
+        for tool in ['Agent', 'collaborationspawn_agent']:
+            with self.subTest(tool=tool):
+                _, event = self.prepared_native()
+                event['tool_name'] = tool
+                self.assertEqual(self.hook(event)['hookSpecificOutput']['permissionDecision'], 'allow')
 
 
 if __name__ == '__main__':
