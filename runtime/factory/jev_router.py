@@ -1,4 +1,4 @@
-"""CPI236LIMITEDV1: one opt-in Choice before a fresh native implement launch."""
+"""Bounded typed Jev selection intersected with current capabilities and owner policy."""
 from __future__ import annotations
 
 import copy
@@ -18,22 +18,22 @@ import urllib.request
 FLAG = '--jev-route'
 GENERATED_CONFIG_FLAG = '--jev-generated-config'
 MAX_BYTES = 65536
-THRESHOLD = 0.8  # Initial conservative acceptance rule; not a calibrated optimal threshold.
 class ModelPolicyError(ValueError):
     pass
 
 def allowed_pair(model, effort):
-    return isinstance(model, str) and isinstance(effort, str) and ((model == 'gpt-6-luna' and effort in NATIVE_EFFORTS) or (model == 'gpt-6.1-sol' and effort in {'low', 'medium', 'high'}))
+    return isinstance(model, str) and isinstance(effort, str) and effort in WORKER_EFFORTS.get(model, set())
 
 def assert_ordinary(ordinary):
     if not isinstance(ordinary, dict) or set(ordinary) != {'provider', 'model', 'effort'} or ordinary.get('provider') != 'codex' or not allowed_pair(ordinary.get('model'), ordinary.get('effort')):
-        raise ModelPolicyError('CPI236 worker policy refused ordinary/explicit selection; use Luna6 or Sol6.1 at low/medium/high; no silent replacement')
+        raise ModelPolicyError('CPI236 worker policy refused ordinary/explicit selection; use supported Luna6 efforts through max or Sol6.1 low/medium/high; no silent replacement')
 
-NATIVE_EFFORTS = {'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'persistent'}
-SPAWN_AGENT_EFFORTS = {
+WORKER_EFFORTS = {
     'gpt-6-luna': {'low', 'medium', 'high', 'xhigh', 'max'},
     'gpt-6.1-sol': {'low', 'medium', 'high'},
 }
+# Native collaboration currently supports this same policy intersection.
+SPAWN_AGENT_EFFORTS = WORKER_EFFORTS
 
 
 def probability(value):
@@ -150,7 +150,7 @@ def eligible(catalog, now, *, allow_empty=False):
             effort_description = effort.get('description', '') if isinstance(effort, dict) else ''
             effort_description = effort_description[:256] if isinstance(effort_description, str) else ''
             effort = effort.get('reasoningEffort') if isinstance(effort, dict) else effort
-            if effort not in NATIVE_EFFORTS or not allowed_pair(model, effort):
+            if not allowed_pair(model, effort):
                 continue
             ident = 'pair_' + hashlib.sha256(f'{model}\0{effort}'.encode()).hexdigest()[:16]
             pairs[ident] = {'model': model, 'effort': effort, 'description': str(row.get('description', ''))[:256], 'effort_description': effort_description}
@@ -159,7 +159,14 @@ def eligible(catalog, now, *, allow_empty=False):
     return pairs
 
 
-def collaboration_capability_pairs(provenance):
+def capability_description(value, credential=None):
+    """Optional tool metadata: ignore malformed text, redact before its 256-char cap."""
+    if not isinstance(value, str) or not value.strip():
+        return ''
+    return redact_task(value, credential)[:256]
+
+
+def collaboration_capability_pairs(provenance, *, credential=None):
     """Validate model options supplied from this runtime's spawn_agent tool schema."""
     # This marker describes the caller-supplied input format/source. It is not
     # cryptographic freshness, account-authentication, or catalog-success proof.
@@ -178,11 +185,16 @@ def collaboration_capability_pairs(provenance):
         efforts = row.get('reasoning_efforts')
         if not isinstance(model, str) or model not in SPAWN_AGENT_EFFORTS or not isinstance(efforts, list) or len(efforts) > 16:
             continue
+        description = capability_description(row.get('description'), credential)
+        effort_descriptions = row.get('reasoning_effort_descriptions')
+        if not isinstance(effort_descriptions, dict):
+            effort_descriptions = {}
         for effort in efforts:
             if not isinstance(effort, str) or effort not in SPAWN_AGENT_EFFORTS[model]:
                 continue
             ident = 'pair_' + hashlib.sha256(f'{model}\0{effort}'.encode()).hexdigest()[:16]
-            pairs[ident] = {'model': model, 'effort': effort, 'description': '', 'effort_description': ''}
+            pairs[ident] = {'model': model, 'effort': effort, 'description': description,
+                            'effort_description': capability_description(effort_descriptions.get(effort), credential)}
     if not pairs:
         raise ValueError('collaboration capability options unavailable')
     return pairs
@@ -275,12 +287,25 @@ def _http_child():
     sys.stdout.buffer.write(output)
 
 
-def assessments(answer):
-    """Validate every wire answer; certainty is checked only where mapping uses it."""
-    if not isinstance(answer, dict) or not isinstance(answer.get('answers'), dict) or set(answer['answers']) != set(QUESTIONS):
+def selection_questions(pairs, credential=None):
+    """Build one closed-set Choice from the actual allowed capability intersection."""
+    questions = copy.deepcopy(QUESTIONS)
+    criteria = questions['worker_pair']['criteria']
+    for key, row in sorted(pairs.items()):
+        row = {name: value.replace(credential, '[REDACTED]') if credential and isinstance(value, str) else value
+               for name, value in row.items()}
+        criteria[key] = (f"Select model {row['model']} at reasoning effort {row['effort']} "
+                         f"for this task. Model capability: {row['description']}. "
+                         f"Effort capability: {row['effort_description']}.")
+    return questions
+
+
+def assessments(answer, questions):
+    """Validate the complete typed distribution, without a suitability threshold."""
+    if not isinstance(answer, dict) or not isinstance(answer.get('answers'), dict) or set(answer['answers']) != set(questions):
         raise ValueError('assessment answer set')
     result = {}
-    for name, question in QUESTIONS.items():
+    for name, question in questions.items():
         item = answer['answers'][name]
         if not isinstance(item, dict):
             raise ValueError('assessment answer')
@@ -295,38 +320,26 @@ def assessments(answer):
     return result
 
 
-def certain(item):
-    return item['confidence'] >= THRESHOLD and item['probabilities'][item['choice']] >= THRESHOLD
-
-
-def profile(items):
-    used = ['task_kind', 'reasoning_demand']
-    if any(items[name]['choice'] == 'insufficient_information' for name in used):
-        return None, 'assessment_insufficient', used
-    if not all(certain(items[name]) for name in used):
-        return None, 'assessment_uncertain', used
-    kind = items['task_kind']['choice']
-    demand = items['reasoning_demand']['choice']
-    if demand == 'difficult_coupled':
-        return ('gpt-6.1-sol', 'high'), 'difficult_coupled', used
-    if demand == 'diagnostic_or_cross_interface' or kind == 'diagnosis_or_design':
-        return ('gpt-6.1-sol', 'medium'), 'diagnosis_or_cross_interface', used
-    verification = items['verification_difficulty']
-    if (demand == 'mechanical' and kind in {'mechanical', 'verification'}
-            and verification['choice'] == 'direct_deterministic' and certain(verification)):
-        return ('gpt-6-luna', 'low'), 'direct_mechanical', [*used, 'verification_difficulty']
-    return ('gpt-6-luna', 'medium'), 'bounded_work', used
+def selected_pair(items, pairs):
+    item = items['worker_pair']
+    selected = item['choice']
+    if selected == 'insufficient_information':
+        return None, 'assessment_insufficient'
+    if selected == 'uncertain' or sum(math.isclose(p, item['probabilities'][selected], abs_tol=1e-12, rel_tol=0)
+                                      for p in item['probabilities'].values()) != 1:
+        return None, 'assessment_uncertain'
+    return pairs[selected], 'direct_pair_selected'
 
 
 def choose(task, catalog, credential, jev_model, deadline, *, ordinary=None,
            capability_provenance=None, transport=http_choice):
     assert_ordinary(ordinary)  # Cannot fall through missing-key or provider-error paths.
     started = time.monotonic()
-    receipt = {'schema': 'CPI236TASKASSESSMENTV1', 'policy': 'initial_task_matrix_1',
+    receipt = {'schema': 'CPI236TASKASSESSMENTV1', 'policy': 'direct_permitted_pair_choice_1',
                'status': 'fallback', 'reason': 'unavailable', 'attempts': 0,
-               'context_source': 'natural_work', 'certainty_policy': 'initial_uncalibrated_0.8'}
+               'context_source': 'natural_work', 'certainty_policy': 'unique_choice_no_calibrated_suitability_threshold'}
     try:
-        pairs = (collaboration_capability_pairs(capability_provenance)
+        pairs = (collaboration_capability_pairs(capability_provenance, credential=credential)
                  if capability_provenance is not None else eligible(catalog, time.time(), allow_empty=True))
         ordinary = dict(ordinary)
         if not any(row['model'] == ordinary['model'] and row['effort'] == ordinary['effort'] for row in pairs.values()):
@@ -365,7 +378,7 @@ def choose(task, catalog, credential, jev_model, deadline, *, ordinary=None,
                            for _, row in sorted(pairs.items())]
         payload = {'model': jev_model,
                    'state': {'task': task, 'ordinary_worker': ordinary, 'allowed_catalog': allowed_catalog},
-                   'questions': copy.deepcopy(QUESTIONS)}
+                   'questions': selection_questions(pairs, credential)}
         body = json.dumps(payload, separators=(',', ':')).encode()
         if len(body) > MAX_BYTES:
             receipt['reason'] = 'request_limit'
@@ -387,27 +400,22 @@ def choose(task, catalog, credential, jev_model, deadline, *, ordinary=None,
         if time.monotonic() >= deadline:
             raise TimeoutError('routing deadline')
         try:
-            items = assessments(answer)
+            items = assessments(answer, payload['questions'])
         except ValueError:
             receipt['reason'] = 'assessment_malformed'
             return None, receipt
         receipt['assessments'] = items
-        receipt.update(verification_context=items['verification_difficulty']['choice'],
-            safeguard_context=items['material_consequence']['choice'], execution_policy='unchanged')
-        mapped, reason, used = profile(items)
-        receipt.update(assessment_reason=reason, certainty_features_used=used)
-        if mapped is None:
+        pair, reason = selected_pair(items, pairs)
+        receipt.update(assessment_reason=reason, execution_policy='unchanged')
+        if pair is None:
             receipt['reason'] = reason
             return None, receipt
-        receipt['mapped_pair'] = {'model': mapped[0], 'effort': mapped[1]}
-        pair = next((row for row in pairs.values() if (row['model'], row['effort']) == mapped), None)
-        if pair is None:
-            receipt['reason'] = 'mapped_pair_unavailable'
-            return None, receipt
-        if mapped == (ordinary['model'], ordinary['effort']):
-            receipt.update(reason='ordinary_equivalent', native_execution_selection='ordinary_no_change')
-            return None, receipt
-        receipt.update(status='selected', reason='profile_selected', prepared_pair=receipt['mapped_pair'])
+        receipt['prepared_pair'] = {'model': pair['model'], 'effort': pair['effort']}
+        if (pair['model'], pair['effort']) == (ordinary['model'], ordinary['effort']):
+            receipt.update(status='confirmed_ordinary', reason='ordinary_equivalent',
+                           native_execution_selection='assessed_ordinary_confirmation')
+            return pair, receipt
+        receipt.update(status='selected', reason='direct_pair_selected')
         return pair, receipt
     except ModelPolicyError:
         raise

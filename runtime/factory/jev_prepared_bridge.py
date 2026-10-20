@@ -10,7 +10,7 @@ import sys
 import time
 import uuid
 from .jev_router import (choose, http_choice, read_credential, ModelPolicyError,
-                        SPAWN_AGENT_EFFORTS, collaboration_capability_pairs)
+                        SPAWN_AGENT_EFFORTS, collaboration_capability_pairs, assert_ordinary)
 
 MAX_CONTEXT = 1024 * 1024
 
@@ -45,15 +45,44 @@ def compact_dispatch_receipt(args, status, receipt):
             'usage': receipt.get('usage', {})}
 
 
-def explicit_spawn_request(choice, capability_provenance):
+def human_override(choice):
+    """Validate caller attribution; the coordinator checks the actual human source."""
+    fields = {'model', 'effort', 'source', 'instruction_quote', 'instruction_reference'}
+    if not isinstance(choice, dict) or set(choice) != fields or choice.get('source') != 'direct_human_instruction':
+        raise ModelPolicyError('human override attribution required')
+    quote = choice['instruction_quote']
+    if not isinstance(quote, str) or not quote.strip() or len(quote.encode('utf8')) > 8192:
+        raise ModelPolicyError('human override exact instruction quote required')
+    reference = choice['instruction_reference']
+    if not isinstance(reference, dict):
+        raise ModelPolicyError('human override reference required')
+    if reference.get('kind') == 'chat_turn':
+        if set(reference) != {'kind', 'chat_id', 'turn_id'} or not all(_identifier(reference[k]) for k in ('chat_id', 'turn_id')):
+            raise ModelPolicyError('resolvable chat/turn reference required')
+    elif reference.get('kind') == 'governing_instruction':
+        path = reference.get('path')
+        if set(reference) != {'kind', 'path'} or not isinstance(path, str) or not Path(path).is_absolute() or not Path(path).is_file():
+            raise ModelPolicyError('resolvable governing instruction reference required')
+    else:
+        raise ModelPolicyError('human override reference kind refused')
+    return {'source': choice['source'], 'instruction_quote': quote, 'instruction_reference': dict(reference)}
+
+
+def explicit_spawn_request(choice, capability_provenance, *, ordinary):
+    attribution = human_override(choice)
     pairs = collaboration_capability_pairs(capability_provenance)
-    if not isinstance(choice, dict) or set(choice) != {'model', 'effort'}:
-        raise ModelPolicyError('explicit spawn choice schema refused')
+    # Override bypasses assessment, never validation of the supplied ordinary context.
+    assert_ordinary(ordinary)
+    if not any(row['model'] == ordinary['model'] and row['effort'] == ordinary['effort']
+               for row in pairs.values()):
+        raise ModelPolicyError('ordinary worker pair is unsupported by current tool capability')
     if not any(row['model'] == choice['model'] and row['effort'] == choice['effort']
                for row in pairs.values()):
         raise ModelPolicyError('explicit spawn choice is unsupported by current tool capability')
-    receipt = {'schema': 'CPI236SPAWNREQUESTV1', 'status': 'explicit',
-               'reason': 'explicit_choice', 'attempts': 0, 'assessment_status': 'not_requested',
+    receipt = {'schema': 'CPI236SPAWNREQUESTV1', 'status': 'human_override',
+               'reason': 'direct_human_instruction', 'attempts': 0, 'assessment_status': 'unassessed_human_override',
+               'human_override': attribution, 'ordinary_worker': dict(ordinary),
+               'prepared_pair': {'model': choice['model'], 'effort': choice['effort']},
                'capability_provenance': 'caller_supplied_tool_metadata',
                'capability_tool': capability_provenance['tool'],
                'spawn_capability_pairs': [{'model': row['model'], 'effort': row['effort']}
@@ -61,8 +90,8 @@ def explicit_spawn_request(choice, capability_provenance):
     args = spawn_agent_request(choice, receipt)
     if args is None:
         raise ModelPolicyError('explicit spawn choice failed model policy')
-    return {'status': 'explicit', 'spawn_agent': args,
-            'dispatch_receipt': compact_dispatch_receipt(args, 'explicit', receipt),
+    return {'status': 'human_override', 'spawn_agent': args,
+            'dispatch_receipt': compact_dispatch_receipt(args, 'human_override', receipt),
             'receipt': receipt}
 
 
@@ -85,7 +114,7 @@ def route(request, root, key_file=None, jev_model='jev-latest', *, transport=Non
         if request.get('explicit_choice') is not None:
             if capability is None:
                 raise ModelPolicyError('explicit spawn choice requires current tool metadata')
-            return explicit_spawn_request(request['explicit_choice'], capability)
+            return explicit_spawn_request(request['explicit_choice'], capability, ordinary=request.get('ordinary'))
         remaining, task, ordinary = request['remaining_ms'], request['task'], request['ordinary']
         if (isinstance(remaining, bool) or not isinstance(remaining, (int, float))
                 or not math.isfinite(remaining) or not 0 < remaining <= 8000
@@ -94,8 +123,7 @@ def route(request, root, key_file=None, jev_model='jev-latest', *, transport=Non
         if capability is not None and 'catalog' in request:
             raise ValueError('choose one capability provenance source')
         deadline = started + remaining / 1000
-        # Validate ordinary policy and capability intersection BEFORE optional IO.
-        # A missing/unreadable credential must retain this usable fallback.
+        # Validate ordinary policy/capability before credential IO; ordinary is context only.
         _, receipt = choose(task, request.get('catalog'), None, jev_model, deadline,
                             ordinary=ordinary, capability_provenance=capability, transport=transport)
         if 'ordinary_worker' in receipt:
@@ -113,23 +141,28 @@ def route(request, root, key_file=None, jev_model='jev-latest', *, transport=Non
     except Exception as error:
         receipt.update(status='fallback', reason='native_bridge_' + type(error).__name__)
     selected = bool(pair and receipt['status'] == 'selected')
-    confirmed = receipt.get('reason') == 'ordinary_equivalent'
+    confirmed = bool(pair and receipt.get('status') == 'confirmed_ordinary')
     receipt['assessment_status'] = ('selected' if selected else 'confirmed_ordinary' if confirmed
-        else 'uncertain' if receipt.get('reason') in {'assessment_uncertain', 'assessment_insufficient'}
+        else 'uncertain' if receipt.get('reason') == 'assessment_uncertain'
+        else 'insufficient' if receipt.get('reason') == 'assessment_insufficient'
         else 'unavailable')
     if selected:
         receipt['status'] = 'choice_proposed'
-    args = spawn_agent_request(pair if selected else receipt.get('ordinary_worker'), receipt)
-    dispatch_status = 'selected' if selected else 'ordinary_confirmed' if confirmed else 'ordinary_fallback'
+    elif not confirmed:
+        receipt['status'] = 'refused' if capability is not None else 'fallback'
+    args = spawn_agent_request(pair, receipt) if selected or confirmed else None
+    dispatch_status = 'selected' if selected else 'ordinary_confirmed'
     dispatch_receipt = compact_dispatch_receipt(args, dispatch_status, receipt)
     if dispatch_receipt is not None:
         receipt.update(spawn_agent_request=dispatch_receipt, spawn_arguments='ready_not_invoked')
     if capability is None:
         receipt['native_execution_selection'] = ('unconfirmed_pending_native_snapshot_preflight'
-                                                 if selected else 'ordinary_fallback')
+                                                 if selected else 'assessed_ordinary_confirmation' if confirmed else 'ordinary_fallback')
     receipt.update(preparation_stage='native_prepared_context_choice',
                    elapsed_ms=round((time.monotonic() - started) * 1000))
-    result = {'status': 'selected' if selected else 'fallback', 'receipt': receipt}
+    status = ('selected' if selected else 'confirmed_ordinary' if confirmed and capability is not None
+              else 'refused' if capability is not None else 'fallback')
+    result = {'status': status, 'receipt': receipt}
     if selected:
         result.update(model=pair['model'], effort=pair['effort'])
     if args is not None:
@@ -190,10 +223,6 @@ def prepare_subagent(request, root, caller_id, work_dir, *, transport=None):
         raise ValueError('invalid project router configuration')
     result = route(request, root, config.get('key_file'), config.get('jev_model', 'jev-latest'),
                    transport=transport)
-    if result['status'] == 'refused' or 'spawn_agent' not in result:
-        return {'status': 'refused', 'receipt': result['receipt'], 'dispatch': 'not_invoked'}
-    if result['receipt'].get('assessment_status') == 'confirmed_ordinary':
-        result['status'] = 'confirmed_ordinary'
     identity = 'jev-' + uuid.uuid4().hex
     path = directory / (identity + '.json')
     metadata = {'preparation_id': identity, 'caller_id': caller_id,
@@ -208,7 +237,8 @@ def prepare_subagent(request, root, caller_id, work_dir, *, transport=None):
                 'observed_model': None, 'observed_effort': None, 'worker_usage': None,
                 'before_dispatch': 'refresh caller metadata and verify project/caller identity; reconcile uncertain sends, never blind redispatch'}
     result.update(metadata)
-    result['dispatch_receipt'].update(metadata)
+    if 'dispatch_receipt' in result:
+        result['dispatch_receipt'].update(metadata)
     result['receipt'].update(metadata)
     result['persistence'] = {'status': 'persisted', 'path': str(path)}
     try:
@@ -225,26 +255,16 @@ def prepare_subagent(request, root, caller_id, work_dir, *, transport=None):
             path.unlink(missing_ok=True)
             raise
     except OSError:
-        if result['status'] != 'explicit':
-            # Persistence is optional routing IO too: retain the validated ordinary
-            # pair even if a different assessment succeeded before the write failed.
-            ordinary = result['receipt']['ordinary_worker']
-            args = spawn_agent_request(ordinary, result['receipt'])
-            result.pop('model', None)
-            result.pop('effort', None)
-            result.update(status='fallback', spawn_agent=args)
-            result['receipt'].update(status='fallback',
-                assessment_outcome_reason=result['receipt']['reason'],
-                reason='native_bridge_receipt_unavailable',
-                prepared_pair={'model': ordinary['model'], 'effort': ordinary['effort']})
-            dispatch = compact_dispatch_receipt(args, 'ordinary_fallback', result['receipt'])
-            dispatch.update(metadata)
-            result['dispatch_receipt'] = dispatch
-            result['receipt']['spawn_agent_request'] = dispatch
-        # The validated request remains usable; caller must save this full returned
-        # envelope in its own accepted evidence store BEFORE any dispatch.
+        # A chosen/overridden pair remains evidence, but unpersisted preparation
+        # never exposes launch-ready arguments, including nested copies.
+        result['receipt'].update(assessment_outcome_reason=result['receipt']['reason'],
+            reason='native_bridge_receipt_unavailable', status='refused', spawn_arguments='unavailable')
+        for key in ('model', 'effort', 'spawn_agent', 'dispatch_receipt'):
+            result.pop(key, None)
+        result['receipt'].pop('spawn_agent_request', None)
+        result['status'] = 'refused'
         result['persistence'] = {'status': 'failed', 'path': str(path),
-                                 'caller_fallback': 'save the complete returned envelope to task-owned evidence before dispatch; otherwise do not launch'}
+                                 'required_action': 'restore receipt persistence and prepare again before dispatch'}
     return result
 
 

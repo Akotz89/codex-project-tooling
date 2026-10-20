@@ -1289,6 +1289,23 @@ class InstallTests(Fixture):
         self.assertEqual(base.with_suffix(".md.1").read_bytes(), b"second custom version")
 
 
+class NativeAssessmentPackagingTests(unittest.TestCase):
+    def test_shared_question_asset_and_legacy_paths_use_maintained_policy(self):
+        router = load('jev_router', TEMPLATE / 'factory/jev_router.py')
+        bridge = load('jev_prepared_bridge', TEMPLATE / 'factory/jev_prepared_bridge.py')
+        self.assertEqual(set(router.QUESTIONS), {'worker_pair'})
+        self.assertEqual(set(router.QUESTIONS['worker_pair']['criteria']), {'insufficient_information', 'uncertain'})
+        self.assertFalse(router.allowed_pair('gpt-6-luna', 'ultra'))
+        self.assertFalse(router.allowed_pair('gpt-6.1-sol', 'xhigh'))
+        self.assertTrue(router.allowed_pair('gpt-6-luna', 'max'))
+        self.assertTrue(router.allowed_pair('gpt-6.1-sol', 'low'))
+        self.assertIs(bridge.choose, router.choose)
+        for name in ['jev_router.py', 'jev_prepared_bridge.py']:
+            adapter = (TEMPLATE / 'factory' / name).read_text()
+            self.assertIn(".development(globals(), 'factory/" + name + "'", adapter)
+            self.assertNotIn('def choose(', adapter)
+
+
 class HarnessTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=WORK, prefix="ordinary harness ")

@@ -159,263 +159,116 @@ class DispatchArgsTests(unittest.TestCase):
 
 
 class TypedAssessmentBridgeTests(unittest.TestCase):
-    def capability_provenance(self):
-        return {
-            "source": "current_runtime_tool_schema",
-            "tool": "collaboration.spawn_agent",
-            "models": [
-                {"model": "gpt-6-luna", "reasoning_efforts": ["low", "medium", "high", "xhigh", "max"]},
-                {"model": "gpt-6.1-sol", "reasoning_efforts": ["low", "medium", "high", "xhigh", "ultra"]},
-            ],
-        }
+    def capability(self):
+        return {'source': 'current_runtime_tool_schema', 'tool': 'collaboration.spawn_agent',
+                'models': [{'model': model, 'reasoning_efforts': sorted(efforts)}
+                           for model, efforts in jev_router.WORKER_EFFORTS.items()]}
 
-    def answer(self, confidence=1.0):
-        values = {
-            "task_kind": "known_pattern_implementation",
-            "reasoning_demand": "bounded_local",
-            "verification_difficulty": "integration_checks",
-            "material_consequence": "bounded_reversible",
-        }
-        return {"answers": {
-            name: {
-                "type": "choice",
-                "choice": choice,
-                "confidence": confidence,
-                "probabilities": {
-                    option: 1.0 if option == choice else 0.0
-                    for option in question["criteria"]
-                },
-            }
-            for name, choice in values.items()
-            for question in [jev_router.QUESTIONS[name]]
-        }}
+    def request(self):
+        return {'task': 'Bounded parser repair with known cause; validate caller and parser assertions in isolated source.',
+                'ordinary': {'provider': 'codex', 'model': 'gpt-6-luna', 'effort': 'low'},
+                'capability_provenance': self.capability(), 'remaining_ms': 4000}
 
-    def test_valid_typed_assessment_is_consumed_and_returns_prepared_selection(self):
-        request = {
-            "task": "bounded offline test task",
-            "ordinary": {"provider": "codex", "model": "gpt-6-luna", "effort": "low"},
-            "capability_provenance": self.capability_provenance(),
-            "remaining_ms": 4000,
-        }
-        old_reader = bridge.read_credential
-        bridge.read_credential = lambda *_: "offline-test-token"
-        try:
-            with tempfile.TemporaryDirectory(prefix="dispatch-bridge-", dir=TASK_WORK) as root:
-                seen = []
-                result = bridge.route(
-                    request,
-                    root,
-                    transport=lambda payload, _credential, _deadline: seen.append(payload) or self.answer(),
-                )
-                self.assertEqual(result["status"], "selected")
-                self.assertEqual((result["model"], result["effort"]), ("gpt-6-luna", "medium"))
-                self.assertEqual(result["receipt"]["status"], "choice_proposed")
-                self.assertEqual(result["receipt"]["schema"], "CPI236TASKASSESSMENTV1")
-                self.assertEqual(result["spawn_agent"], {
-                    "model": "gpt-6-luna", "reasoning_effort": "medium", "fork_turns": "none"
-                })
-                self.assertEqual(result["dispatch_receipt"]["status"], "selected")
-                self.assertEqual(result["dispatch_receipt"]["tool"], "collaboration.spawn_agent")
-                self.assertEqual(result["dispatch_receipt"]["dispatch"], "not_invoked")
-                self.assertEqual(result["receipt"]["capability_provenance"], "caller_supplied_tool_metadata")
-                self.assertEqual(result["receipt"]["capability_tool"], "collaboration.spawn_agent")
-                self.assertEqual({(row["model"], row["effort"]) for row in seen[0]["state"]["allowed_catalog"]}, {
-                    ("gpt-6-luna", effort) for effort in ["low", "medium", "high", "xhigh", "max"]
-                } | {
-                    ("gpt-6.1-sol", effort) for effort in ["low", "medium", "high"]
-                })
-                self.assertNotIn("same_account", seen[0]["state"])
-                self.assertNotIn("identity", seen[0]["state"])
-        finally:
-            bridge.read_credential = old_reader
+    def answer(self, payload, model='gpt-6-luna', effort='medium', outcome=None):
+        import hashlib
+        options = payload['questions']['worker_pair']['criteria']
+        choice = outcome or 'pair_' + hashlib.sha256(f'{model}\0{effort}'.encode()).hexdigest()[:16]
+        return {'answers': {'worker_pair': {'type': 'choice', 'choice': choice, 'confidence': 1,
+                'probabilities': {key: float(key == choice) for key in options}}}}
 
-    def test_uncertain_typed_assessment_returns_ordinary_fallback_receipt(self):
-        request = {
-            "task": "bounded offline test task",
-            "ordinary": {"provider": "codex", "model": "gpt-6-luna", "effort": "medium"},
-            "capability_provenance": self.capability_provenance(),
-            "remaining_ms": 4000,
-        }
-        old_reader = bridge.read_credential
-        bridge.read_credential = lambda *_: "offline-test-token"
-        try:
-            with tempfile.TemporaryDirectory(prefix="dispatch-fallback-", dir=TASK_WORK) as root:
-                result = bridge.route(
-                    request,
-                    root,
-                    transport=lambda payload, _credential, _deadline: self.answer(confidence=0.6),
-                )
-                self.assertEqual(result["status"], "fallback")
-                self.assertEqual(result["receipt"]["status"], "fallback")
-                self.assertEqual(result["receipt"]["reason"], "assessment_uncertain")
-                self.assertEqual(result["receipt"]["ordinary_worker"], request["ordinary"])
-                self.assertEqual(result["spawn_agent"], {
-                    "model": "gpt-6-luna", "reasoning_effort": "medium", "fork_turns": "none"
-                })
-                self.assertEqual(result["dispatch_receipt"]["status"], "ordinary_fallback")
-                self.assertEqual(result["dispatch_receipt"]["reason"], "assessment_uncertain")
-        finally:
-            bridge.read_credential = old_reader
+    def test_actual_typed_pair_reaches_prepared_arguments(self):
+        with patch.object(bridge, 'read_credential', return_value='offline-test-token'):
+            seen = []
+            result = bridge.route(self.request(), ROOT,
+                transport=lambda payload, *_: seen.append(payload) or self.answer(payload, effort='xhigh'))
+        self.assertEqual(result['status'], 'selected')
+        self.assertEqual(result['spawn_agent'], {'model': 'gpt-6-luna', 'reasoning_effort': 'xhigh', 'fork_turns': 'none'})
+        self.assertEqual(result['receipt']['schema'], 'CPI236TASKASSESSMENTV1')
+        self.assertEqual(result['receipt']['status'], 'choice_proposed')
+        self.assertEqual(result['dispatch_receipt']['dispatch'], 'not_invoked')
+        self.assertEqual(result['receipt']['attempts'], 1)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual({(r['model'], r['effort']) for r in seen[0]['state']['allowed_catalog']},
+                         {(m, e) for m, efforts in jev_router.WORKER_EFFORTS.items() for e in efforts})
+        self.assertNotIn('same_account', seen[0]['state'])
+        self.assertNotIn('identity', seen[0]['state'])
 
-    def test_missing_jev_credential_emits_validated_ordinary_spawn_fallback(self):
-        request = {
-            "task": "bounded offline test task",
-            "ordinary": {"provider": "codex", "model": "gpt-6-luna", "effort": "medium"},
-            "capability_provenance": self.capability_provenance(),
-            "remaining_ms": 4000,
-        }
-        old_reader = bridge.read_credential
-        bridge.read_credential = lambda *_: None
-        try:
-            with tempfile.TemporaryDirectory(prefix="dispatch-missing-credential-", dir=TASK_WORK) as root:
-                result = bridge.route(request, root, transport=lambda *_: self.fail("transport must not run"))
-            self.assertEqual(result["status"], "fallback")
-            self.assertEqual(result["receipt"]["reason"], "unavailable")
-            self.assertEqual(result["spawn_agent"], {
-                "model": "gpt-6-luna", "reasoning_effort": "medium", "fork_turns": "none"
-            })
-            self.assertEqual(result["dispatch_receipt"]["status"], "ordinary_fallback")
-        finally:
-            bridge.read_credential = old_reader
+    def test_failed_assessment_and_missing_credentials_have_no_spawn_arguments(self):
+        for outcome in ['uncertain', 'insufficient_information']:
+            with self.subTest(outcome=outcome), patch.object(bridge, 'read_credential', return_value='offline-test-token'):
+                result = bridge.route(self.request(), ROOT, transport=lambda p, *_: self.answer(p, outcome=outcome))
+            self.assertEqual(result['status'], 'refused')
+            self.assertNotIn('spawn_agent', result)
+            self.assertNotIn('spawn_agent_request', result['receipt'])
+        with patch.object(bridge, 'read_credential', return_value=None):
+            result = bridge.route(self.request(), ROOT, transport=lambda *_: self.fail('transport must not run'))
+        self.assertEqual(result['status'], 'refused')
+        self.assertNotIn('spawn_agent', result)
+        self.assertEqual(result['receipt']['reason'], 'unavailable')
 
-    def test_forbidden_ordinary_pair_is_refused_without_spawn_request(self):
-        request = {
-            "task": "bounded offline test task",
-            "ordinary": {"provider": "codex", "model": "gpt-5.6-sol", "effort": "medium"},
-            "capability_provenance": self.capability_provenance(),
-            "remaining_ms": 4000,
-        }
-        with tempfile.TemporaryDirectory(prefix="dispatch-forbidden-", dir=TASK_WORK) as root:
-            result = bridge.route(request, root, transport=lambda *_: self.answer())
-        self.assertEqual(result["status"], "refused")
-        self.assertNotIn("spawn_agent", result)
-        self.assertEqual(result["receipt"]["reason"], "worker_model_policy")
+    def test_invalid_policy_and_metadata_refuse_before_credentials(self):
+        request = self.request()
+        cases = [{**request, 'ordinary': {'provider': 'codex', 'model': 'gpt-6-luna', 'effort': 'ultra'}},
+                 {**request, 'capability_provenance': {**self.capability(), 'source': 'stale_cache'}}]
+        for request in cases:
+            with patch.object(bridge, 'read_credential', side_effect=AssertionError('credential access')):
+                result = bridge.route(request, ROOT, transport=lambda *_: self.fail('transport must not run'))
+            self.assertEqual(result['status'], 'refused')
+            self.assertNotIn('spawn_agent', result)
 
-    def test_spawn_arguments_require_actual_tool_provenance_and_model_effort_policy(self):
-        capability_pairs = [
-            {"model": "gpt-6-luna", "effort": effort}
-            for effort in ["low", "medium", "high", "xhigh", "max"]
-        ]
-        capability_pairs += [
-            {"model": "gpt-6.1-sol", "effort": effort}
-            for effort in ["low", "medium", "high"]
-        ]
-        receipt = {
-            "capability_provenance": "caller_supplied_tool_metadata",
-            "capability_tool": "collaboration.spawn_agent",
-            "spawn_capability_pairs": capability_pairs,
-        }
-        self.assertEqual(bridge.spawn_agent_request({"model": "gpt-6-luna", "effort": "xhigh"}, receipt), {
-            "model": "gpt-6-luna", "reasoning_effort": "xhigh", "fork_turns": "none"
-        })
-        self.assertEqual(bridge.spawn_agent_request({"model": "gpt-6-luna", "effort": "max"}, receipt)["reasoning_effort"], "max")
-        self.assertIsNone(bridge.spawn_agent_request({"model": "gpt-6.1-sol", "effort": "xhigh"}, receipt))
-        self.assertIsNone(bridge.spawn_agent_request({"model": "gpt-6-luna", "effort": "ultra"}, receipt))
-        self.assertIsNone(bridge.spawn_agent_request(
-            {"model": "gpt-6-luna", "effort": "medium"}, {"catalog_pairs": capability_pairs}
-        ))
+    def test_final_spawn_arguments_intersect_native_capabilities_and_owner_caps(self):
+        rows = [{'model': m, 'effort': e} for m, efforts in jev_router.WORKER_EFFORTS.items() for e in efforts]
+        receipt = {'capability_provenance': 'caller_supplied_tool_metadata',
+                   'capability_tool': 'collaboration.spawn_agent', 'spawn_capability_pairs': rows}
+        for row in rows:
+            self.assertEqual(bridge.spawn_agent_request(row, receipt),
+                             {'model': row['model'], 'reasoning_effort': row['effort'], 'fork_turns': 'none'})
+        for model, effort in [('gpt-6.1-sol', 'xhigh'), ('gpt-6-luna', 'ultra'), ('gpt-6-luna', 'persistent')]:
+            self.assertIsNone(bridge.spawn_agent_request({'model': model, 'effort': effort}, receipt))
+            self.assertFalse(jev_router.allowed_pair(model, effort))
+        self.assertIsNone(bridge.spawn_agent_request(rows[0], {'catalog_pairs': rows}))
 
-    def test_explicit_choice_bypasses_jev_but_must_match_runtime_tool_capability(self):
-        request = {
-            "explicit_choice": {"model": "gpt-6-luna", "effort": "max"},
-            "capability_provenance": self.capability_provenance(),
-        }
-        old_reader = bridge.read_credential
-        bridge.read_credential = lambda *_: self.fail("explicit choice must not read Jev credentials")
-        try:
-            with tempfile.TemporaryDirectory(prefix="dispatch-explicit-", dir=TASK_WORK) as root:
-                result = bridge.route(request, root, transport=lambda *_: self.fail("explicit choice must not call Jev"))
-        finally:
-            bridge.read_credential = old_reader
-        self.assertEqual(result["status"], "explicit")
-        self.assertEqual(result["spawn_agent"]["reasoning_effort"], "max")
-        self.assertEqual(result["dispatch_receipt"]["dispatch"], "not_invoked")
-
-        request["explicit_choice"] = {"model": "gpt-6.1-sol", "effort": "xhigh"}
-        with tempfile.TemporaryDirectory(prefix="dispatch-explicit-refused-", dir=TASK_WORK) as root:
-            refused = bridge.route(request, root)
-        self.assertEqual(refused["status"], "refused")
-        self.assertNotIn("spawn_agent", refused)
-
-    def test_wrong_tool_provenance_falls_back_without_args(self):
-        request = {
-            "task": "bounded offline test task",
-            "ordinary": {"provider": "codex", "model": "gpt-6-luna", "effort": "medium"},
-            "capability_provenance": {"tool": "not-the-runtime-tool", "models": [
-                {"model": "gpt-6-luna", "reasoning_efforts": ["medium"]}
-            ]},
-            "remaining_ms": 4000,
-        }
-        old_reader = bridge.read_credential
-        bridge.read_credential = lambda *_: "offline-test-token"
-        try:
-            with tempfile.TemporaryDirectory(prefix="dispatch-capability-fallback-", dir=TASK_WORK) as root:
-                result = bridge.route(request, root, transport=lambda *_: self.fail("invalid provenance must not invoke Jev"))
-            self.assertEqual(result["status"], "fallback")
-            self.assertNotIn("spawn_agent", result)
-        finally:
-            bridge.read_credential = old_reader
-
-    def test_legacy_native_catalog_keeps_selection_but_never_impersonates_tool_metadata(self):
+    def test_legacy_native_catalog_preserves_preflight_shape_without_tool_impersonation(self):
         import time
-        request = {
-            "task": "bounded offline native preflight task",
-            "ordinary": {"provider": "codex", "model": "gpt-6-luna", "effort": "low"},
-            "catalog": {
-                "same_account": True,
-                "identity": "offline-test-catalog",
-                "fetched_at": time.time(),
-                "models": [{"model": "gpt-6-luna", "supportedReasoningEfforts": ["low", "medium"]}],
-            },
-            "remaining_ms": 4000,
-        }
-        old_reader = bridge.read_credential
-        bridge.read_credential = lambda *_: "offline-test-token"
-        try:
-            with tempfile.TemporaryDirectory(prefix="dispatch-legacy-catalog-", dir=TASK_WORK) as root:
-                result = bridge.route(request, root, transport=lambda *_: self.answer())
-                self.assertEqual(result["status"], "selected")
-                self.assertEqual((result["model"], result["effort"]), ("gpt-6-luna", "medium"))
-                self.assertNotIn("spawn_agent", result)
+        request = self.request()
+        request.pop('capability_provenance')
+        request['catalog'] = {'same_account': True, 'identity': 'offline-catalog', 'fetched_at': time.time(),
+                             'models': [{'model': 'gpt-6-luna', 'supportedReasoningEfforts': ['low', 'medium', 'ultra', 'persistent']}]}
+        with patch.object(bridge, 'read_credential', return_value='offline-test-token'):
+            result = bridge.route(request, ROOT, transport=lambda p, *_: self.answer(p))
+        self.assertEqual(result['status'], 'selected')
+        self.assertEqual((result['model'], result['effort']), ('gpt-6-luna', 'medium'))
+        self.assertNotIn('spawn_agent', result)
+        self.assertEqual({r['effort'] for r in result['receipt']['catalog_pairs']}, {'low', 'medium'})
+        with patch.object(bridge, 'read_credential', return_value='offline-test-token'):
+            confirmed = bridge.route(request, ROOT, transport=lambda p, *_: self.answer(p, effort='low'))
+        self.assertEqual(confirmed['status'], 'fallback')  # Existing Archon wire shape.
+        self.assertEqual(confirmed['receipt']['assessment_status'], 'confirmed_ordinary')
+        self.assertNotIn('spawn_agent', confirmed)
+        for catalog in [{**request['catalog'], 'same_account': False},
+                        {**request['catalog'], 'fetched_at': time.time() - 61}]:
+            with patch.object(bridge, 'read_credential', side_effect=AssertionError('credential access')):
+                result = bridge.route({**request, 'catalog': catalog}, ROOT,
+                                      transport=lambda *_: self.fail('invalid catalog must not reach Jev'))
+            self.assertEqual(result['status'], 'fallback')
+            self.assertNotIn('spawn_agent', result)
 
-                for catalog in [
-                    {**request["catalog"], "same_account": False},
-                    {**request["catalog"], "fetched_at": time.time() - 61},
-                ]:
-                    invalid = {**request, "catalog": catalog}
-                    refused = bridge.route(invalid, root, transport=lambda *_: self.fail("invalid catalog must not reach Jev"))
-                    self.assertEqual(refused["status"], "fallback")
-                    self.assertNotIn("spawn_agent", refused)
-        finally:
-            bridge.read_credential = old_reader
-
-    def test_capability_source_must_be_current_runtime_schema_before_jev(self):
-        for source in (None, "stale_cache"):
-            with self.subTest(source=source):
-                capability = self.capability_provenance()
-                if source is None:
-                    capability.pop("source")
-                else:
-                    capability["source"] = source
-                request = {
-                    "task": "bounded offline test task",
-                    "ordinary": {"provider": "codex", "model": "gpt-6-luna", "effort": "medium"},
-                    "capability_provenance": capability,
-                    "remaining_ms": 4000,
-                }
-                old_reader = bridge.read_credential
-                bridge.read_credential = lambda *_: "offline-test-token"
-                try:
-                    with tempfile.TemporaryDirectory(prefix="dispatch-stale-capability-", dir=TASK_WORK) as root:
-                        result = bridge.route(
-                            request, root,
-                            transport=lambda *_: self.fail("non-current capability must not invoke Jev"),
-                        )
-                    self.assertEqual(result["status"], "fallback")
-                    self.assertNotIn("spawn_agent", result)
-                finally:
-                    bridge.read_credential = old_reader
+    def test_provider_payload_redacts_credential_in_task_and_catalog_descriptions(self):
+        import time
+        request = self.request()
+        request.pop('capability_provenance')
+        request['task'] += ' offline-test-token secret=value'
+        request['catalog'] = {'same_account': True, 'identity': 'offline-catalog', 'fetched_at': time.time(),
+                             'models': [{'model': 'gpt-6-luna', 'description': 'offline-test-token',
+                                         'supportedReasoningEfforts': ['low', 'medium']}]}
+        seen = []
+        with patch.object(bridge, 'read_credential', return_value='offline-test-token'):
+            result = bridge.route(request, ROOT, transport=lambda p, *_: seen.append(p) or self.answer(p))
+        self.assertEqual(result['status'], 'selected')
+        self.assertNotIn('offline-test-token', json.dumps(seen))
+        self.assertNotIn('secret=value', json.dumps(seen))
+        self.assertNotIn('offline-test-token', json.dumps(result))
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     unittest.main()
