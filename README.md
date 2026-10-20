@@ -457,3 +457,11 @@ docs/incidents.md             historical failures and lessons
 ```
 
 To upgrade an installed factory, see [`factory/MIGRATION.md`](template/factory/MIGRATION.md).
+
+## Native subagent preparation (local integration)
+
+The installed shared entry also exposes prepare-only native Jev routing through
+[project-factory route-subagent](template/factory/NATIVE_SUBAGENTS.md).
+The caller keeps dispatch, liveness and independent acceptance ownership. See the
+contract for project binding, current native capabilities, explicit choices,
+ordinary fallback, receipt persistence and uncertain-send recovery.

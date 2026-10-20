@@ -852,10 +852,25 @@ def schedule(root: Path, args: list[str]) -> int:
     raise ValueError("Usage: factory schedule install|fire|remove|status [--interval <seconds>] [--apply]")
 
 
+def route_subagent(root: Path, args: list[str]) -> int:
+    """Prepare a bound request from bounded stdin; never invoke a native worker."""
+    import argparse
+    from jev_prepared_bridge import prepare_subagent, read_request
+    parser = argparse.ArgumentParser(prog="project-factory route-subagent",
+        description="Prepare native subagent arguments only; caller owns launch, reconciliation and acceptance.")
+    parser.add_argument("--caller-id", required=True, help="Current native coordinator identity, repeated in the request")
+    parser.add_argument("--work-dir", required=True, help="Explicit project-local work/<task> receipt directory")
+    options = parser.parse_args(args)
+    result = prepare_subagent(read_request(sys.stdin.buffer), root, options.caller_id, options.work_dir)
+    print(json.dumps(result, sort_keys=True))
+    return 1 if result["status"] == "refused" else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if not args or args[0] in {"--help", "-h"}:
-        print("factory run <shared-workflow> [native arguments]\n"
+        print("project-factory route-subagent --caller-id <native-caller> --work-dir work/<task> < request.json\n"
+              "factory run <shared-workflow> [native arguments]\n"
               "factory run archon-implement --jev-route [fresh foreground native arguments]\n"
               "factory run <shared-workflow> --runtime-host <config.json> [foreground native arguments]\n"
               "Runtime host: fresh ordinary apps; detach/resume unsupported. Manual: python factory/runtime_host.py serve --help\n"
@@ -866,6 +881,8 @@ def main(argv: list[str] | None = None) -> int:
               "factory pause | unpause (stop scheduled launches; the timer keeps waking active runs)")
         return 0
     try:
+        if args[0] == "route-subagent":
+            return route_subagent(project_root(), args[1:])
         return invoke(project_root(), args[0], args[1:])
     except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
         print(f"Factory refused: {error}", file=sys.stderr)
