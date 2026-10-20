@@ -1,7 +1,9 @@
 # Upgrading the factory
 
-Upgrade an installed factory by pulling the factory repository and rerunning
-`python <factory>/bin/factory.py init` from the application repository.
+Upgrade an installed factory from a separate, reviewed successor checkout. Run
+`python <successor>/bin/factory.py init` from each adopting application repository.
+Keep the previous source checkout unchanged and available for projects that still
+bind to it and for rollback, together with their `.factory/backup/` preimages.
 
 - `init` installs the files in `template/` and the Archon source pinned in
   `factory/pack.json`, then validates that source.

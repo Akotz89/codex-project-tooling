@@ -71,8 +71,8 @@ Read the application repo first. Check its GitHub remote, existing configuration
 toolchain and authentication. Reuse working logins and ask the user to complete any
 interactive sign-in that is missing. Do not print credentials.
 
-Clone the factory outside the application repo, or update an existing clean clone
-with `git pull --ff-only`:
+Clone the factory outside the application repo. For upgrades, use a separate
+reviewed successor checkout; keep every source used by installed adapters unchanged:
 
 ```bash
 git clone https://github.com/coleam00/ai-software-factory ~/ai-software-factory
@@ -246,7 +246,9 @@ your project requires.
 
 The source revision lives in [`pack.json`](template/factory/pack.json). Once the
 workflow PRs merge upstream, updating that pin moves new installs to the merged
-version. Existing installations update by pulling this repo and rerunning `init`.
+version. Upgrade existing installations from a separate reviewed successor
+checkout by running its `init` in each adopting project. Keep the previous source
+unchanged and retain the project backups for rollback.
 Workflow improvements belong in Archon's SDLC pack.
 Neutral standalone Archon users do not need `MISSION.md`,
 `factory/WORKFLOW_POLICY.md` or any other factory file; those are guidance and
