@@ -20,12 +20,15 @@ DEFECTS = [
 ]
 
 def main():
+    work = ROOT / "work/selfcheck-mutations"
+    work.mkdir(parents=True, exist_ok=True)
     for name, anchor, replacement, test in DEFECTS:
-        with tempfile.TemporaryDirectory(prefix="consumer selfcheck ") as td:
+        with tempfile.TemporaryDirectory(dir=work, prefix="consumer selfcheck ") as td:
             root = Path(td)
-            for folder in ("bin", "template"):
-                shutil.copytree(ROOT / folder, root / folder, ignore=shutil.ignore_patterns("__pycache__"))
-            target = root / "template/factory/consumer.py"
+            for folder in ("bin", "template", "runtime"):
+                shutil.copytree(ROOT / folder, root / folder,
+                                ignore=shutil.ignore_patterns("__pycache__", "work"))
+            target = root / "runtime/factory/consumer.py"
             text = target.read_text(encoding="utf-8")
             if text.count(anchor) != 1:
                 print(f"NOT_INJECTED {name}")
@@ -33,7 +36,9 @@ def main():
             target.write_text(text.replace(anchor, replacement, 1), encoding="utf-8")
             result = subprocess.run([sys.executable, "bin/test_consumer.py", test], cwd=root,
                                     capture_output=True, text=True, timeout=120)
-            if result.returncode == 0 or "FAIL:" not in result.stderr:
+            if (result.returncode != 1
+                    or f"FAIL: {test.rsplit('.', 1)[-1]} (" not in result.stderr
+                    or "AssertionError" not in result.stderr):
                 print(f"NOT_CAUGHT {name}: {result.stdout} {result.stderr}")
                 return 1
             print(f"CAUGHT {name}")

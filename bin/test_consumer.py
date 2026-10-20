@@ -618,6 +618,10 @@ class ConsumerTests(Fixture):
             other.mkdir()
             self.git(self.base, "clone", "-q", str(self.origin), str(other))
             consumer.verify_source({**self.settings, "source": str(other), "revision": "a" * 40})
+        (other / "node_modules").mkdir()
+        with patch.dict(consumer.MANIFEST, {"integration_revision_required": "a" * 40}):
+            with self.assertRaisesRegex(ValueError, "Source SHA mismatch"):
+                consumer.verify_source({**self.settings, "source": str(other), "revision": "a" * 40})
         command = next(self.source.rglob("check.md"))
         command.write_text("modified")
         with self.assertRaisesRegex(ValueError, "changes"):
