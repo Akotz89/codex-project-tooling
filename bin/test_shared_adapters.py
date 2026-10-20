@@ -17,7 +17,7 @@ HOME = Path(__file__).resolve().parent.parent
 
 class InstalledAdapterTests(unittest.TestCase):
     def setUp(self):
-        scratch = HOME / "work/cpi410"
+        scratch = HOME / "work/cpi410-correction-1"
         scratch.mkdir(parents=True, exist_ok=True)
         temporary = tempfile.TemporaryDirectory(prefix="installed adapters ", dir=scratch)
         self.addCleanup(temporary.cleanup)
@@ -293,6 +293,128 @@ print('WORKER_AND_REVISION_OK')
         self.assertEqual(dirty.returncode, 1, dirty.stdout + dirty.stderr)
         self.assertIn("Execution dependency in data-only helper", dirty.stdout)
 
+    def test_development_ci_and_mutations_use_template_data_and_cwd(self):
+        template = self.source / "template"
+        clean = self.command(self.source, sys.executable, "-B", "template/harness/ci.py")
+        self.assertEqual(clean.returncode, 1, clean.stdout + clean.stderr)
+        self.assertIn("NO_CHECKS", clean.stdout)
+        self.assertEqual(clean.stderr, "")
+        listed = self.command(self.source, sys.executable, "-B",
+                              "template/harness/mutations/run.py", "list")
+        self.assertEqual(listed.returncode, 0, listed.stdout + listed.stderr)
+        self.assertEqual(json.loads(listed.stdout), [])
+        (template / "app.txt").write_text("template data")
+        self.config(template, {"static": [sys.executable, "-c",
+            "from pathlib import Path; assert Path('app.txt').read_text() == 'template data'"]})
+        checked = self.command(self.source, sys.executable, "-B", "template/harness/ci.py")
+        self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
+        self.assertIn("CHECKS_OK mode=ordinary", checked.stdout)
+        defect = {"id": "development", "file": "app.txt", "find": "template", "replace": "changed"}
+        (template / "harness/mutations/defects.json").write_text(json.dumps({"defects": [defect]}))
+        applied = self.command(self.source, sys.executable, "-B", "template/harness/mutations/run.py",
+                               "apply", "development", "--candidate", str(template))
+        self.assertEqual(applied.returncode, 0, applied.stdout + applied.stderr)
+        self.assertTrue(json.loads(applied.stdout)["injected"])
+        self.assertEqual((template / "app.txt").read_text(), "changed data")
+        self.assertFalse((self.source / "app.txt").exists())
+
+    def test_development_application_drivers_use_template_cwd_and_import_root(self):
+        template = self.source / "template"
+        (template / "dev_app.py").write_text("from pathlib import Path; print(Path.cwd())\n")
+        (template / "dev_http.py").write_text(
+            "import http.server, sys\nfrom pathlib import Path\n"
+            "class Handler(http.server.BaseHTTPRequestHandler):\n"
+            "    def do_GET(self):\n"
+            "        self.send_response(200); self.end_headers()\n"
+            "        self.wfile.write(str(Path.cwd()).encode())\n"
+            "http.server.HTTPServer(('127.0.0.1', int(sys.argv[1])), Handler).serve_forever()\n")
+        result = self.python(self.source, r'''
+from pathlib import Path
+import sys
+import appproc
+expected = Path.cwd() / 'template'
+with appproc.make_driver({'driver': 'cli', 'cli': {
+    'invoke': f'"{sys.executable}" -B dev_app.py', 'smoke_contains': str(expected)}}) as app:
+    rc, out, err = app.run()
+    assert rc == 0 and out.strip() == str(expected), (rc, out, err)
+with appproc.make_driver({'driver': 'library', 'library': {
+    'import_check': f'"{sys.executable}" -B dev_app.py'}}):
+    assert sys.path[0] == str(expected), sys.path[0]
+    import dev_app
+    assert Path(dev_app.__file__).parent == expected
+app = appproc.make_driver({'driver': 'http', 'http': {
+    'start': f'"{sys.executable}" -B dev_http.py {{port}}', 'health_path': '/', 'boot_timeout_s': 5}})
+try:
+    app.__enter__()
+    import urllib.request
+    with urllib.request.urlopen(app.base, timeout=5) as response:
+        assert response.read().decode() == str(expected)
+    child = app.proc
+finally:
+    app.__exit__()
+assert child.poll() is not None
+print('DEVELOPMENT_DRIVERS_OK')
+''', extra_path=template / "harness")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("DEVELOPMENT_DRIVERS_OK", result.stdout)
+
+    def test_development_usage_resolves_relative_evidence_and_default_ledger_under_template(self):
+        template = self.source / "template"
+        native = template / "native.json"
+        native.write_text(json.dumps({"thread_id": "fixture"}))
+        receipt = template / "receipt.json"
+        receipt.write_text(json.dumps({"thread_id": "fixture", "native_evidence": {
+            "path": "native.json", "sha256": hashlib.sha256(native.read_bytes()).hexdigest()}}))
+        event = template / "event.json"
+        event.write_text(json.dumps({"task_id": "development", "receipt": {
+            "path": "receipt.json", "sha256": hashlib.sha256(receipt.read_bytes()).hexdigest()}}))
+        result = self.command(template, sys.executable, "-B", "factory/usage_collector.py",
+                              "--event", "event.json")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"collected": 0})
+        self.assertTrue((template / "work/factory-usage/usage.jsonl.lock").is_file())
+        self.assertFalse((self.source / "work/factory-usage").exists())
+        parent = template / "parent.json"
+        parent.write_text(json.dumps({"worker": {"thread_id": "fixture"}}))
+        result = self.python(self.source, "import usage_collector as u; "
+            "u.verify_parent_evidence({'thread_id': 'fixture', 'parent_evidence': "
+            + repr({"path": "parent.json", "sha256": hashlib.sha256(parent.read_bytes()).hexdigest()})
+            + "}); print('PARENT_EVIDENCE_OK')", extra_path=template / "factory")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("PARENT_EVIDENCE_OK", result.stdout)
+
+    def test_development_resource_keeps_delivering_repository_root(self):
+        result = self.python(self.source, "from runtime_resource import delivery; "
+            "from pathlib import Path; root, revision = delivery(); "
+            "assert root == Path.cwd(); assert len(revision) == 40; print('SOURCE_ROOT_OK')",
+            extra_path=self.source / "template/factory")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("SOURCE_ROOT_OK", result.stdout)
+
+    def test_ordinary_audit_does_not_write_shared_bytecode(self):
+        before = self.snapshot()
+        env = dict(os.environ)
+        env.pop("PYTHONDONTWRITEBYTECODE", None)
+        env.pop("PYTHONPYCACHEPREFIX", None)
+        result = subprocess.run([sys.executable, str(self.source / "bin/audit.py")],
+            cwd=self.source, env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("CONSUMER_AUDIT errors=0", result.stdout)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_audit_refuses_preload_graph_that_omits_real_shared_import(self):
+        args = (sys.executable, "-B", "bin/audit.py")
+        clean = self.command(self.source, *args)
+        self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
+        loader = self.source / "runtime/adapter.py"
+        body = loader.read_text()
+        original = '"runtime_host": ("runtime_process", "runtime_resource"),'
+        self.assertIn(original, body)
+        loader.write_text(body.replace(original, '"runtime_host": ("runtime_process",),'))
+        drifted = self.command(self.source, *args)
+        self.assertEqual(drifted.returncode, 1, drifted.stdout + drifted.stderr)
+        self.assertIn("Shared import dependencies drifted: factory/runtime_host.py", drifted.stdout)
+
     def sentinel(self, root):
         self.config(root, {"static": [sys.executable, "-c",
             "from pathlib import Path; Path('DISPATCHED').touch()"]})
@@ -329,6 +451,26 @@ print('WORKER_AND_REVISION_OK')
         result = self.command(self.source, "git", "commit", "--allow-empty", "-qm", "different revision")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.refused(root, "Shared factory source binding drift")
+
+    def test_shared_asset_drift_refuses_before_project_command(self):
+        root = self.projects[0]
+        self.sentinel(root)
+        for name in ("pack.json", "assessment_questions.json"):
+            with self.subTest(asset=name):
+                (root / "DISPATCHED").unlink(missing_ok=True)
+                asset = self.source / "template/factory" / name
+                original = asset.read_bytes()
+                try:
+                    data = json.loads(original)
+                    data["fixture_drift"] = "post-install valid JSON"
+                    asset.write_text(json.dumps(data))
+                    self.refused(root, "Shared factory source binding drift")
+                finally:
+                    asset.write_bytes(original)
+        (root / "DISPATCHED").unlink(missing_ok=True)
+        control = self.ci(root)
+        self.assertEqual(control.returncode, 0, control.stdout + control.stderr)
+        self.assertTrue((root / "DISPATCHED").is_file())
 
     def test_symlinked_shared_body_and_installed_adapter_refuse_before_project_command(self):
         root = self.projects[0]

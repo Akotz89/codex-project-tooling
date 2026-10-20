@@ -125,7 +125,8 @@ def module(source: Path, root: Path, entry: str,
     target = types.ModuleType(canonical)
     target.__file__ = str(source / "template" / entry if development else root / entry)
     target.__package__ = package_name
-    target.PROJECT_ROOT = root
+    target.PROJECT_ROOT = (source / "template" if development and (
+        entry.startswith("harness/") or entry == "factory/usage_collector.py") else root)
     target.SHARED_SOURCE = source
     sys.modules[canonical] = target
     setattr(sys.modules[package_name], name, target)

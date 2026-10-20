@@ -6,6 +6,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+sys.dont_write_bytecode = True
+
 def audit(root):
     errors = []
     home = Path(__file__).resolve().parent.parent
@@ -13,6 +15,23 @@ def audit(root):
     adapters = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(adapters)
     implementation = home / "runtime"
+    shared_names = {Path(entry).stem for entry in adapters.ENTRIES}
+    for entry in adapters.ENTRIES:
+        dependencies = set()
+        tree = ast.parse((implementation / entry).read_bytes())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                if node.level == 1:
+                    dependencies.update([node.module.split(".")[0]] if node.module
+                                        else [alias.name for alias in node.names])
+                elif node.module == "factory":
+                    dependencies.update(alias.name for alias in node.names)
+                elif node.module and node.module.startswith("factory."):
+                    dependencies.add(node.module.split(".")[1])
+            elif isinstance(node, ast.Import):
+                dependencies.update(alias.name for alias in node.names if alias.name in shared_names)
+        if dependencies != set(adapters.DEPENDENCIES.get(Path(entry).stem, ())):
+            errors.append(f"Shared import dependencies drifted: {entry}")
     for entry in adapters.ENTRIES:
         path = root / entry
         try:
