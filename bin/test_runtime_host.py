@@ -64,7 +64,7 @@ def alive(pid):
         os.kill(pid, 0)
         status = Path(f"/proc/{pid}/stat")
         return not status.exists() or status.read_text().split()[2] != "Z"
-    except ProcessLookupError:
+    except (ProcessLookupError, FileNotFoundError):
         return False
 
 
@@ -75,9 +75,13 @@ def settled(predicate, timeout=10):
     return predicate()
 
 
+WORK = Path(__file__).resolve().parents[1] / "work/cpi410/runtime-tests"
+WORK.mkdir(parents=True, exist_ok=True)
+
+
 class RuntimeTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="runtime test ")
+        self.temp = tempfile.TemporaryDirectory(dir=WORK, prefix="runtime test ")
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
         self.root = self.base / "application"

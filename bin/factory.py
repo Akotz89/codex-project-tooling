@@ -5,6 +5,7 @@ import argparse
 import subprocess
 import sys
 from pathlib import Path
+sys.dont_write_bytecode = True
 from install import sync, install_source, configure
 import consumer
 

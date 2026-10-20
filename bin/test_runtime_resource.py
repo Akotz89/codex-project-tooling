@@ -1,6 +1,8 @@
 """Committed candidate preparation and runtime binding regressions."""
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 from pathlib import Path
 import shutil
@@ -13,6 +15,10 @@ from urllib.request import urlopen
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "template/factory"))
 from runtime_host import RuntimeHost, request
+from install import sync
+
+WORK = ROOT / "work/cpi410/resource-tests"
+WORK.mkdir(parents=True, exist_ok=True)
 
 
 APP = r'''from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -29,17 +35,21 @@ HTTPServer(('127.0.0.1', int(os.environ['FACTORY_RUNTIME_PORT'])), Handler).serv
 
 class ResourceTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="resource test ")
+        self.temp = tempfile.TemporaryDirectory(dir=WORK, prefix="resource test ")
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
         self.repo = self.base / "delivery"
         (self.repo / "factory").mkdir(parents=True)
-        for name in ("runtime_resource.py", "runtime_host.py", "runtime_process.py"):
-            shutil.copy2(ROOT / f"template/factory/{name}", self.repo / f"factory/{name}")
         (self.repo / "app.py").write_text(APP.replace("VALUE", "first"), encoding="utf-8")
         self.git("init")
         self.git("config", "user.email", "test@example.invalid")
         self.git("config", "user.name", "Runtime Test")
+        (self.repo / "_bmad/custom").mkdir(parents=True)
+        (self.repo / "_bmad/custom/ticketing-store-config.toml").write_text('[tickets]\nstore="linear"\nproject="runtime-resource-test"\n')
+        (self.repo / ".factory").mkdir()
+        (self.repo / ".factory/project-context.md").write_text("Runtime resource fixture")
+        with contextlib.redirect_stdout(io.StringIO()):
+            sync(self.repo)
         self.git("add", "app.py", "factory/runtime_resource.py", "factory/runtime_host.py",
                  "factory/runtime_process.py")
         self.git("commit", "-m", "first candidate")
@@ -121,7 +131,7 @@ class ResourceTests(unittest.TestCase):
 
     def test_only_configured_committed_application_paths_are_materialized(self):
         private = self.repo / ".factory/holdout/HOLDOUT.md"
-        private.parent.mkdir(parents=True)
+        private.parent.mkdir(parents=True, exist_ok=True)
         private.write_text("SYNTHETIC_PRIVATE_CONTROL", encoding="utf-8")
         self.git("add", ".factory/holdout/HOLDOUT.md")
         self.git("commit", "-m", "tracked synthetic evaluator control")

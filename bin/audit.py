@@ -2,12 +2,35 @@
 """Audit shipped consumer ownership. Use factory doctor for installed source readiness."""
 import argparse
 import ast
+import importlib.util
 import sys
 from pathlib import Path
 
 def audit(root):
     errors = []
-    for path in root.rglob("*.py"):
+    home = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location("audit_adapters", home / "runtime/adapter.py")
+    adapters = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(adapters)
+    implementation = home / "runtime"
+    for entry in adapters.ENTRIES:
+        path = root / entry
+        try:
+            tree = ast.parse(path.read_bytes())
+            calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                     and isinstance(node.func, ast.Attribute) and node.func.attr == "installed"]
+            if calls:
+                bound = ast.literal_eval(calls[-1].args[-1])
+                source = Path(bound["source"])
+                if (source.resolve() != home or adapters.source_digest(source) != bound["digest"]
+                        or adapters.git(source, "rev-parse", "HEAD") != bound["revision"]
+                        or path.read_bytes() != adapters.render(entry, bound)):
+                    errors.append(f"Drifted factory adapter: {entry}")
+            elif path.read_bytes() != (home / "template" / entry).read_bytes():
+                errors.append(f"Unknown factory adapter: {entry}")
+        except (OSError, SyntaxError, ValueError, KeyError, IndexError) as error:
+            errors.append(f"Invalid factory adapter {entry}: {error}")
+    for path in [*root.rglob("*.py"), *implementation.rglob("*.py")]:
         if "__pycache__" in path.parts:
             continue
         try:
@@ -20,7 +43,7 @@ def audit(root):
         if path.suffix in {".yaml", ".yml"} or path.name == "SKILL.md":
             errors.append(f"Factory must not ship workflows or prompt skills: {path}")
     for name in ("harness/mutations/run.py",):
-        text = (root / name).read_text(encoding="utf-8")
+        text = (implementation / name).read_text(encoding="utf-8")
         tree = ast.parse(text)
         for node in ast.walk(tree):
             if isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -28,7 +51,7 @@ def audit(root):
                 if any(m.split(".")[0] in {"subprocess", "consumer", "sdlc", "anthropic", "openai"} for m in modules):
                     errors.append(f"Execution dependency in data-only helper: {name}")
     for name in ("factory/runtime_host.py", "factory/runtime_process.py"):
-        tree = ast.parse((root / name).read_text(encoding="utf-8"))
+        tree = ast.parse((implementation / name).read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 modules = [a.name for a in node.names] if isinstance(node, ast.Import) else [node.module or ""]

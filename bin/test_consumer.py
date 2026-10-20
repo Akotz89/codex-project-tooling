@@ -24,7 +24,7 @@ def load(name, path):
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
-    return module
+    return sys.modules[name]
 
 
 FAKE_CLI = r'''
@@ -66,9 +66,13 @@ else:
 '''
 
 
+WORK = HOME / "work/cpi410/tests"
+WORK.mkdir(parents=True, exist_ok=True)
+
+
 class Fixture(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="factory consumer ")
+        self.temp = tempfile.TemporaryDirectory(dir=WORK, prefix="factory consumer ")
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
         self.app = self.base / "application with spaces"
@@ -116,6 +120,12 @@ class Fixture(unittest.TestCase):
         shutil.copytree(HOME / "bin", self.fixture_factory / "bin", ignore=shutil.ignore_patterns("__pycache__"))
         shutil.copytree(TEMPLATE, self.fixture_factory / "template", ignore=shutil.ignore_patterns("__pycache__", "work"))
         (self.fixture_factory / "template/factory/pack.json").write_text(json.dumps(consumer.MANIFEST))
+        shutil.copytree(HOME / "runtime", self.fixture_factory / "runtime", ignore=shutil.ignore_patterns("__pycache__"))
+        self.git(self.fixture_factory, "init", "-q")
+        self.git(self.fixture_factory, "config", "user.name", "Fixture")
+        self.git(self.fixture_factory, "config", "user.email", "fixture@example.invalid")
+        self.git(self.fixture_factory, "add", "bin", "template", "runtime")
+        self.git(self.fixture_factory, "commit", "-qm", "factory fixture")
         self.trace = self.base / "argv.jsonl"
         self.env = patch.dict(os.environ, {"FACTORY_TEST_TRACE": str(self.trace),
                          "FACTORY_AGENT_CMD": "provider-must-never-run", "FACTORY_AUTONOMY": "4"})
@@ -685,7 +695,7 @@ class LaunchGateTests(unittest.TestCase):
     """The launch gate decides from the board and the run list; nothing here launches."""
 
     def setUp(self):
-        temp = tempfile.TemporaryDirectory(prefix="factory gate ")
+        temp = tempfile.TemporaryDirectory(dir=WORK, prefix="factory gate ")
         self.addCleanup(temp.cleanup)
         self.base = Path(temp.name)
         self.app = self.base / "app"
@@ -1066,10 +1076,16 @@ class InstallTests(Fixture):
 
 class HarnessTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="ordinary harness ")
+        self.temp = tempfile.TemporaryDirectory(dir=WORK, prefix="ordinary harness ")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        shutil.copytree(TEMPLATE / "harness", self.root / "harness", ignore=shutil.ignore_patterns("__pycache__"))
+        consumer.checked(["git", "init", "-q"], self.root)
+        (self.root / "_bmad/custom").mkdir(parents=True)
+        (self.root / "_bmad/custom/ticketing-store-config.toml").write_text('[tickets]\nstore="linear"\nproject="harness-test"\n')
+        (self.root / ".factory").mkdir()
+        (self.root / ".factory/project-context.md").write_text("Harness test context")
+        with contextlib.redirect_stdout(io.StringIO()):
+            sync(self.root)
         self.config = self.root / "harness/harness.config.json"
 
     def run_checks(self, cfg):

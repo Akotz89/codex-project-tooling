@@ -443,10 +443,25 @@ where the workflow needs the extra reasoning.
 
 ## Layout
 
+The maintained Python implementation lives once in `runtime/`. Installation
+generates twelve compatibility adapters at the existing `factory/` and `harness/`
+paths, including test discovery paths. Adapters bind the exact factory checkout,
+Git revision, runtime and asset digest, and the project's root, Linear address
+and context digest. Missing or drifted bindings refuse before running checks or
+dispatching work. There is no environment or `PYTHONPATH` source fallback.
+
+Imports use the same module objects as legacy bare and `factory.*` imports, so
+patches and writable globals remain effective. Harness configuration, mutation
+data, runtime inputs, receipts and personal project documents stay local; shared
+pack and assessment assets are read explicitly from the bound source. Keep that
+source checkout available and immutable. Update through a reviewed successor
+checkout and rerun the installer for each adopting project, preserving backups.
+
 ```text
 bin/factory.py                install and CLI entry point
-template/                    what init copies into your repo
-  factory/consumer.py        invokes shared Archon workflows and shows their state
+runtime/                     maintained Python implementation and adapter loader
+template/                    project scaffolding and development entry adapters
+  factory/consumer.py        compatibility path for the shared consumer
   factory/pack.json          shared source revision and required workflows
   factory/WORKFLOW_POLICY.md factory requirements read through engineering.md
   factory/RUNTIME_HOST.md    app startup and runtime scenario configuration

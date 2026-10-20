@@ -1,6 +1,7 @@
 """Install the factory into an application and preserve the user's own files."""
 from __future__ import annotations
 import json
+import importlib.util
 import os
 import shutil
 import sys
@@ -11,6 +12,11 @@ HOME = Path(__file__).resolve().parent.parent
 TEMPLATE = HOME / "template"
 sys.path.insert(0, str(TEMPLATE / "factory"))
 import consumer
+
+_adapter_spec = importlib.util.spec_from_file_location(
+    "factory_install_adapters", HOME / "runtime/adapter.py")
+adapters = importlib.util.module_from_spec(_adapter_spec)
+_adapter_spec.loader.exec_module(adapters)
 
 # Files the user writes for their project. Installed once, never overwritten.
 PERSONAL = {"harness/harness.config.json", "harness/runtime.inputs.json",
@@ -72,6 +78,11 @@ def install_policy_pointer(root: Path, dry: bool) -> None:
 
 def sync(root: Path, dry: bool = False) -> None:
     root = root.resolve()
+    try:
+        project = consumer.project_binding(root)
+    except (OSError, ValueError, KeyError):
+        project = None
+    bound = adapters.binding(HOME, project)
     # An installed file the user changed is backed up before the new version
     # replaces it; personal files are never overwritten.
     for src in sorted(TEMPLATE.rglob("*")):
@@ -81,14 +92,16 @@ def sync(root: Path, dry: bool = False) -> None:
         if rel == "gitignore-additions.txt":
             continue
         dest = within(root, root / rel)
+        content = adapters.render(rel, bound) if rel in adapters.ENTRIES else src.read_bytes()
         if dest.exists():
-            if rel in PERSONAL or dest.read_bytes() == src.read_bytes():
+            if rel in PERSONAL or dest.read_bytes() == content:
                 continue
             backup(root, dest, dry)
         print(f"install {rel}")
         if not dry:
             dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dest)
+            dest.write_bytes(content)
+            shutil.copystat(src, dest)
     install_policy_pointer(root, dry)
     ignore = within(root, root / ".gitignore")
     previous = ignore.read_text(encoding="utf-8") if ignore.exists() else ""

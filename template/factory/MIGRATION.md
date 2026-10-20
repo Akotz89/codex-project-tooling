@@ -25,3 +25,24 @@ What the factory owns, and what Archon owns:
 
 If you scheduled the factory, rerun `python factory/consumer.py schedule install`
 after an upgrade, so the trigger binding picks up any new inputs.
+
+## Shared Python adapters
+
+New installations retain the existing script and import paths as generated
+adapters. The factory source checkout is required at runtime: its exact Git
+revision and Python/asset digest are bound at installation. Root, local Linear
+address and project context must match too. Configure those project artifacts
+before installation; scaffolding without them cannot run the adapters.
+
+Upgrade from a reviewed, independently pinned successor source, then rerun its
+official installer in each adopting project. Changed managed files are backed
+up under `.factory/backup`; personal files and native configuration are preserved.
+Keep the previous source and backups for rollback. Do not edit generated adapters
+or repoint an existing immutable source checkout. Frozen installations continue
+using their original implementation until explicitly adopted.
+
+CI, application helpers, mutation defaults and usage collection use the verified
+adopting root. Child runtime and routing processes relaunch the local adapter.
+The local pack and assessment JSON files are compatibility provenance; the bound
+source owns the assets used by shared code. Source-tree adapters under `template/`
+are development entry points, not portable installed files.
