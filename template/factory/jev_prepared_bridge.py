@@ -144,11 +144,14 @@ def _identifier(value):
 def _task_workdir(root, work_dir):
     path = Path(work_dir)
     path = path if path.is_absolute() else root / path
+    # Check the supplied spelling before resolve() hides even in-work redirects.
+    if any(part.is_symlink() for part in (path, *path.parents)):
+        raise ValueError('receipt directory path must not contain symlinks')
     path = path.resolve()
     work = root / 'work'
     if work.is_symlink() or not path.is_relative_to(work) or path == work:
         raise ValueError('an explicit project-local work/<task> receipt directory is required')
-    # resolve() prevents existing parent symlinks from escaping the project.
+    # The resolved path must also remain inside this project task work tree.
     return path
 
 

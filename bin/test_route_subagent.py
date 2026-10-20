@@ -196,6 +196,29 @@ class RoutingTests(unittest.TestCase):
         settings_path.write_text(json.dumps(settings))
         self.assertEqual(self.command()[0], 1)
 
+    def test_in_project_task_symlink_refused_by_real_outer_command(self):
+        work = self.a / 'work'
+        target = work / 'other-task'
+        target.mkdir(parents=True)
+        link = work / 'task-link'
+        link.symlink_to(target, target_is_directory=True)
+        request = copy.deepcopy(self.request)
+        request['explicit_choice'] = {'model': 'gpt-6-luna', 'effort': 'low'}
+        env = {key: value for key, value in os.environ.items() if key != 'TYPESAFE_API_KEY'}
+        env['PYTHONDONTWRITEBYTECODE'] = '1'
+        for supplied in ['work/task-link', 'work/task-link/receipt', str(link),
+                         str(link / 'receipt'), 'work/task-link/../unrelated']:
+            with self.subTest(work_dir=supplied):
+                process = subprocess.run([
+                    sys.executable, '-B', str(BASE / 'bin/factory.py'), 'route-subagent',
+                    '--caller-id', 'native:fixture', '--work-dir', supplied],
+                    input=json.dumps(request), text=True, capture_output=True, cwd=self.a, env=env)
+                self.assertEqual(process.returncode, 1, process.stdout)
+                self.assertEqual(process.stdout, '')
+                self.assertIn('must not contain symlinks', process.stderr)
+        self.assertEqual(list(target.iterdir()), [])
+        self.assertFalse((work / 'unrelated').exists())
+
     def test_real_subprocess_command_two_bindings_and_unreadable_key(self):
         env = {key: value for key, value in os.environ.items() if key != 'TYPESAFE_API_KEY'}
         env['PYTHONDONTWRITEBYTECODE'] = '1'
