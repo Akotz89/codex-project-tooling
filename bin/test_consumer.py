@@ -892,16 +892,17 @@ class SourceConformanceTests(unittest.TestCase):
             self.assertEqual(labels, {label.casefold() for label in mapping.values()})
             self.assertEqual(blocked_label, mapping["BLOCKED"].casefold())
 
+        report = {"type": "archon_artifact", "run_id": "factory-conformance-non-live", "path": "triage.md"}
         env = {key: value for key, value in os.environ.items() if not key.startswith("INPUTS_")}
         env.update({
-            "INPUTS_CONTRACT": "READY", "INPUTS_ROUTE": "implement",
+            "INPUTS_CONTRACT": "READY", "INPUTS_ROUTE": "deliver",
             "INPUTS_COMPLEXITY": "small", "INPUTS_DESIGN_FIRST": "false",
             "INPUTS_PUBLISH": "false", "INPUTS_STATE_LABELS": json.dumps(mappings[0]),
             "INPUTS_SUMMARY": "Factory state-label conformance",
             "INPUTS_BLOCKED_REASON": "", "INPUTS_AREA_LABELS": "[]",
             "INPUTS_ITEM": json.dumps({"repo": {"host": "", "path": ""}, "number": 0}),
             "INPUTS_PROPOSED_EDITS": json.dumps({"title": "", "body": ""}),
-            "INPUTS_BLOCKED_BY": "[]", "INPUTS_REPORT": "null",
+            "INPUTS_BLOCKED_BY": "[]", "INPUTS_REPORT": json.dumps(report),
         })
 
         def verdict(**inputs):
@@ -932,11 +933,12 @@ class SourceConformanceTests(unittest.TestCase):
                     output = json.loads(result.stdout)
                     self.assertEqual(output["labels"], [mapping[state]])
                     self.assertEqual(output["contract"], inputs.get("CONTRACT", "READY"))
-                    self.assertEqual(output["route"], inputs.get("ROUTE", "implement"))
+                    self.assertEqual(output["route"], inputs.get("ROUTE", "deliver"))
                     self.assertEqual(output["design_first"], state == "DESIGN_FIRST")
                     self.assertEqual(output["ready"], state in {"READY", "DESIGN_FIRST"})
                     self.assertIs(output["published"], False)
                     self.assertEqual(output["skipped_labels"], [])
+                    self.assertEqual(output["report"], report)
 
         refusals = (
             ({"STATE_LABELS": "{"}, "state_labels must be a JSON object"),
