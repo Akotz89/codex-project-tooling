@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import importlib.util
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -114,7 +115,6 @@ def sync(root: Path, dry: bool = False) -> None:
 
 
 def install_source(repository: str, revision: str, cache: Path, bun: str) -> dict:
-    import re
     if not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise ValueError("--revision must be a full lowercase commit SHA")
     cache = cache.resolve()
@@ -138,11 +138,38 @@ def install_source(repository: str, revision: str, cache: Path, bun: str) -> dic
     return settings
 
 
+def validate_router_options(settings: dict) -> None:
+    if "jev_router" not in settings:
+        return
+    router = settings["jev_router"]
+    if not isinstance(router, dict) or router.keys() - {"key_file", "jev_model"}:
+        raise ValueError("Invalid jev_router settings: expected key_file and/or jev_model options")
+    key_file = router.get("key_file")
+    if key_file is not None and (not isinstance(key_file, str) or "\0" in key_file):
+        raise ValueError("Invalid jev_router.key_file: expected a file reference")
+    if "jev_model" in router and (not isinstance(router["jev_model"], str)
+            or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", router["jev_model"])):
+        raise ValueError("Invalid jev_router.jev_model: expected a supported model identifier")
+
+
 def configure(root: Path, settings: dict) -> None:
     settings = dict(settings)
     if consumer.MANIFEST.get("project_binding_required"):
         settings["project_binding"] = consumer.project_binding(root)
     path = within(consumer.shared_root(root), consumer.shared_root(root) / consumer.SETTINGS)
+    if path.exists():
+        previous = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(previous, dict):
+            raise ValueError(f"Invalid consumer settings: {path}")
+        validate_router_options(previous)
+        binding = settings.get("project_binding")
+        prior_binding = previous.get("project_binding")
+        if (isinstance(binding, dict) and isinstance(prior_binding, dict)
+                and all(prior_binding.get(key) == binding[key]
+                        for key in ("root", "tracker", "project"))
+                and "jev_router" not in settings and "jev_router" in previous):
+            settings["jev_router"] = previous["jev_router"]
+    validate_router_options(settings)
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(".tmp")
     temp.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")

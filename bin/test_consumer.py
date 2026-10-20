@@ -983,7 +983,145 @@ class SourceConformanceTests(unittest.TestCase):
         consumer.verify_source(settings)
 
 
+class ConfigureTests(unittest.TestCase):
+    def setUp(self):
+        scratch = HOME / "work/cpi410-correction-3"
+        scratch.mkdir(parents=True, exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(dir=scratch, prefix="configure ")
+        self.addCleanup(self.temp.cleanup)
+        self.app = Path(self.temp.name) / "project with spaces"
+        self.app.mkdir()
+        consumer.checked(["git", "init", "-q"], self.app)
+        store = self.app / "_bmad/custom/ticketing-store-config.toml"
+        store.parent.mkdir(parents=True)
+        store.write_text('[tickets]\nstore="linear"\nproject="configure-project"\n')
+        (self.app / ".factory").mkdir()
+        (self.app / ".factory/project-context.md").write_text("Configure context\n")
+        self.path = self.app / consumer.SETTINGS
+        self.settings = {"source": "new source", "revision": "a" * 40, "bun": "new bun"}
+        self.router = {"key_file": "private/key reference", "jev_model": "jev-latest"}
+        self.previous = {"source": "old source", "revision": "b" * 40, "bun": "old bun",
+                         "project_binding": consumer.project_binding(self.app),
+                         "jev_router": self.router, "unmanaged": "must not carry over"}
+
+    def write_previous(self):
+        self.path.write_text(json.dumps(self.previous))
+
+    def test_configure_preserves_only_project_router_options_and_refreshes_binding(self):
+        self.write_previous()
+        (self.app / ".factory/project-context.md").write_text("Updated context\n")
+        original = dict(self.settings)
+        for _ in range(2):
+            configure(self.app, self.settings)
+            self.assertEqual(consumer.read_settings(self.app), {
+                **self.settings, "project_binding": consumer.project_binding(self.app),
+                "jev_router": self.router})
+        self.assertEqual(self.settings, original)
+
+    def test_explicit_router_settings_replace_prior_options_including_empty_options(self):
+        for router in ({"key_file": "new reference", "jev_model": "new-model"},
+                       {"jev_model": "new-model"}, {}):
+            with self.subTest(router=router):
+                self.write_previous()
+                settings = {**self.settings, "jev_router": router,
+                            "project_binding": {"root": "stale caller binding"}}
+                configure(self.app, settings)
+                self.assertEqual(consumer.read_settings(self.app), {
+                    **self.settings, "jev_router": router,
+                    "project_binding": consumer.project_binding(self.app)})
+                self.assertEqual(settings["project_binding"], {"root": "stale caller binding"})
+
+    def test_fresh_configuration_and_configuration_without_router_options(self):
+        for previous in (None, {"project_binding": consumer.project_binding(self.app)}):
+            with self.subTest(previous=previous):
+                self.path.unlink(missing_ok=True)
+                if previous is not None:
+                    self.path.write_text(json.dumps(previous))
+                configure(self.app, self.settings)
+                self.assertEqual(consumer.read_settings(self.app), {
+                    **self.settings, "project_binding": consumer.project_binding(self.app)})
+
+    def test_configure_does_not_borrow_foreign_or_unbound_router_options(self):
+        binding = consumer.project_binding(self.app)
+        for field in ("root", "tracker", "project"):
+            with self.subTest(field=field):
+                self.previous["project_binding"] = {**binding, field: "another identity"}
+                self.write_previous()
+                configure(self.app, self.settings)
+                self.assertEqual(consumer.read_settings(self.app), {
+                    **self.settings, "project_binding": binding})
+        for unbound in (None, {}, "not a binding"):
+            with self.subTest(binding=unbound):
+                self.previous["project_binding"] = unbound
+                self.write_previous()
+                configure(self.app, self.settings)
+                self.assertNotIn("jev_router", consumer.read_settings(self.app))
+
+    def test_copied_project_settings_cannot_supply_router_options(self):
+        other = Path(self.temp.name) / "other project"
+        other.mkdir()
+        consumer.checked(["git", "init", "-q"], other)
+        shutil.copytree(self.app / "_bmad", other / "_bmad")
+        shutil.copytree(self.app / ".factory", other / ".factory")
+        configure(other, {**self.settings, "jev_router": self.router})
+        self.path.write_bytes((other / consumer.SETTINGS).read_bytes())
+        configure(self.app, self.settings)
+        self.assertEqual(consumer.read_settings(self.app), {
+            **self.settings, "project_binding": consumer.project_binding(self.app)})
+        self.assertEqual(consumer.read_settings(other)["jev_router"], self.router)
+
+    def test_linked_worktree_preserves_canonical_project_options(self):
+        self.write_previous()
+        consumer.checked(["git", "-c", "user.name=Fixture", "-c",
+                          "user.email=fixture@example.invalid", "commit", "--allow-empty",
+                          "-qm", "fixture"], self.app)
+        worktree = Path(self.temp.name) / "linked worktree"
+        consumer.checked(["git", "worktree", "add", "-q", "-b", "linked", str(worktree)], self.app)
+        configure(worktree, self.settings)
+        self.assertEqual(consumer.read_settings(worktree), {
+            **self.settings, "project_binding": consumer.project_binding(self.app),
+            "jev_router": self.router})
+        self.assertFalse((worktree / consumer.SETTINGS).exists())
+
+    def test_configure_refuses_malformed_existing_settings_without_overwriting(self):
+        for raw in ("{broken", "[]", "null", *(
+                json.dumps({**self.previous, "jev_router": value})
+                for value in (None, [], "invalid", {"key_file": 42}, {"jev_model": []},
+                              {"jev_model": "invalid model"}, {"unsupported": "option"}))):
+            with self.subTest(raw=raw):
+                self.path.write_text(raw)
+                with self.assertRaises(ValueError):
+                    configure(self.app, self.settings)
+                self.assertEqual(self.path.read_text(), raw)
+                self.assertFalse(self.path.with_suffix(".tmp").exists())
+
+    def test_configure_refuses_malformed_explicit_options_without_overwriting(self):
+        self.write_previous()
+        before = self.path.read_bytes()
+        for router in (None, [], "invalid", {"key_file": False}, {"jev_model": None}):
+            with self.subTest(router=router):
+                with self.assertRaises(ValueError):
+                    configure(self.app, {**self.settings, "jev_router": router})
+                self.assertEqual(self.path.read_bytes(), before)
+                self.assertFalse(self.path.with_suffix(".tmp").exists())
+
+
 class InstallTests(Fixture):
+    def test_repeated_init_preserves_project_router_options(self):
+        factory = load("factory_router_init_test", HOME / "bin/factory.py")
+        router = {"key_file": "private/missing-reference", "jev_model": "jev-latest"}
+        (self.app / consumer.SETTINGS).unlink()
+        with patch.object(sys, "argv", ["factory.py", "init"]), \
+             patch.object(factory.consumer, "project_root", return_value=self.app), \
+             patch.object(factory, "install_source", return_value=self.settings), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(factory.main(), 0)
+            self.assertEqual(consumer.read_settings(self.app), self.settings)
+            configure(self.app, {**self.settings, "jev_router": router})
+            for _ in range(2):
+                self.assertEqual(factory.main(), 0)
+                self.assertEqual(consumer.read_settings(self.app)["jev_router"], router)
+
     def test_policy_pointer_preserves_existing_bytes_and_is_idempotent(self):
         agents = self.app / "engineering.md"
         original = b"# Existing guidance\r\n\r\nKeep this byte-for-byte."
