@@ -864,8 +864,17 @@ class SourceConformanceTests(unittest.TestCase):
             self.skipTest("set FACTORY_ARCHON_CONFORMANCE_SOURCE to a complete pinned checkout")
         source = Path(supplied).resolve()
         revision = consumer.MANIFEST["integration_revision_required"]
+        settings = {"source": str(source), "revision": revision}
         self.assertEqual(consumer.checked(["git", "rev-parse", "HEAD"], source).strip(), revision)
-        consumer.verify_source({"source": str(source), "revision": revision})
+        consumer.verify_source(settings)
+        self.addCleanup(consumer.verify_source, settings)
+
+        bun = Path(os.environ.get("FACTORY_ARCHON_CONFORMANCE_BUN", ""))
+        self.assertTrue(bun.is_absolute() and bun.is_file(),
+                        "set FACTORY_ARCHON_CONFORMANCE_BUN to the configured exact Bun executable")
+        version = subprocess.run([str(bun), "--version"], capture_output=True, text=True,
+                                 timeout=10, check=True)
+        self.assertEqual(version.stdout.strip(), "1.4.2")
 
         defaults = consumer.MANIFEST["default_inputs"]
         workflows = ("archon-triage", "archon-ship", "archon-lifecycle")
@@ -873,20 +882,82 @@ class SourceConformanceTests(unittest.TestCase):
         mappings = [json.loads(defaults[name]["state_labels"]) for name in workflows]
         self.assertTrue(all(mapping == mappings[0] for mapping in mappings))
 
-        triage = load("pinned_validate_contract", source / consumer.MANIFEST["source_directory"] /
-                       "triage/scripts/validate-contract.py")
-        lifecycle = load("pinned_select_target", source / consumer.MANIFEST["source_directory"] /
-                          "lifecycle/scripts/select-target.py")
-        self.assertEqual(set(mappings[0]), set(triage.STATE_LABEL_METADATA))
+        directory = source / consumer.MANIFEST["source_directory"]
+        lifecycle = load("pinned_select_target", directory / "lifecycle/scripts/select-target.py")
         self.assertEqual(set(mappings[0]), lifecycle.STATES)
         for mapping in mappings:
-            self.assertEqual(triage.parse_state_labels(json.dumps(mapping)), mapping)
             with patch.dict(os.environ, {"INPUTS_STATE_LABELS": json.dumps(mapping)}):
-                labels, complete = lifecycle.state_labels()
+                labels, blocked_label, complete = lifecycle.state_labels()
             self.assertTrue(complete)
             self.assertEqual(labels, {label.casefold() for label in mapping.values()})
+            self.assertEqual(blocked_label, mapping["BLOCKED"].casefold())
 
-        directory = source / consumer.MANIFEST["source_directory"]
+        env = {key: value for key, value in os.environ.items() if not key.startswith("INPUTS_")}
+        env.update({
+            "INPUTS_CONTRACT": "READY", "INPUTS_ROUTE": "implement",
+            "INPUTS_COMPLEXITY": "small", "INPUTS_DESIGN_FIRST": "false",
+            "INPUTS_PUBLISH": "false", "INPUTS_STATE_LABELS": json.dumps(mappings[0]),
+            "INPUTS_SUMMARY": "Factory state-label conformance",
+            "INPUTS_BLOCKED_REASON": "", "INPUTS_AREA_LABELS": "[]",
+            "INPUTS_ITEM": json.dumps({"repo": {"host": "", "path": ""}, "number": 0}),
+            "INPUTS_PROPOSED_EDITS": json.dumps({"title": "", "body": ""}),
+            "INPUTS_BLOCKED_BY": "[]", "INPUTS_REPORT": "null",
+        })
+
+        def verdict(**inputs):
+            return subprocess.run(
+                [str(bun), str(directory / "triage/scripts/verdict.ts")], cwd=HOME,
+                env={**env, **{"INPUTS_" + key: value for key, value in inputs.items()}},
+                capture_output=True, text=True, timeout=30)
+
+        cases = {
+            "READY": {},
+            "DESIGN_FIRST": {"ROUTE": "plan", "DESIGN_FIRST": "true"},
+            "NEEDS_CONTRACT_WORK": {
+                "CONTRACT": "NEEDS_CONTRACT_WORK", "ROUTE": "no_action",
+                "PROPOSED_EDITS": json.dumps({"title": "Complete contract", "body": "Acceptance"})},
+            "BLOCKED": {"CONTRACT": "BLOCKED", "ROUTE": "no_action",
+                        "BLOCKED_REASON": "External decision",
+                        "BLOCKED_BY": json.dumps(["https://example.invalid/decisions/1"])},
+            "NO_ACTION": {"CONTRACT": "NO_ACTION", "ROUTE": "no_action"},
+        }
+        self.assertEqual(set(cases), set(mappings[0]))
+        custom_mapping = {state: "factory-" + state.lower() for state in mappings[0]}
+        for mapping in (mappings[0], custom_mapping):
+            for state, inputs in cases.items():
+                with self.subTest(state=state, mapping=mapping):
+                    result = verdict(STATE_LABELS=json.dumps(mapping), **inputs)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stderr, "")
+                    output = json.loads(result.stdout)
+                    self.assertEqual(output["labels"], [mapping[state]])
+                    self.assertEqual(output["contract"], inputs.get("CONTRACT", "READY"))
+                    self.assertEqual(output["route"], inputs.get("ROUTE", "implement"))
+                    self.assertEqual(output["design_first"], state == "DESIGN_FIRST")
+                    self.assertEqual(output["ready"], state in {"READY", "DESIGN_FIRST"})
+                    self.assertIs(output["published"], False)
+                    self.assertEqual(output["skipped_labels"], [])
+
+        refusals = (
+            ({"STATE_LABELS": "{"}, "state_labels must be a JSON object"),
+            ({"STATE_LABELS": "[]"}, "state_labels must be a JSON object"),
+            ({"STATE_LABELS": '{"UNKNOWN":"unknown"}'}, "unsupported state: UNKNOWN"),
+            ({"STATE_LABELS": '{"READY":"same","BLOCKED":"SAME"}'},
+             "must not map multiple states to the same label"),
+            ({"AREA_LABELS": '["area","AREA"]'}, "area_labels must not contain duplicates"),
+            ({"AREA_LABELS": json.dumps([mappings[0]["BLOCKED"].upper()])},
+             "area_labels may not name a pack label or a caller-owned state label"),
+            ({"STATE_LABELS": json.dumps(custom_mapping),
+              "AREA_LABELS": json.dumps([custom_mapping["BLOCKED"].upper()])},
+             "area_labels may not name a pack label or a caller-owned state label"),
+        )
+        for inputs, message in refusals:
+            with self.subTest(refusal=inputs):
+                result = verdict(**inputs)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                self.assertIn(message, result.stderr)
+
         for name, folder in (("archon-triage", "triage"), ("archon-ship", "ship"),
                              ("archon-lifecycle", "lifecycle")):
             lines = (directory / folder / f"{name}.yaml").read_text(encoding="utf-8").splitlines()
@@ -903,7 +974,7 @@ class SourceConformanceTests(unittest.TestCase):
                 state, label = [cell.strip().strip("`") for cell in line.strip("|").split("|")]
                 policy_labels[state] = label
         self.assertEqual(policy_labels, mappings[0])
-        consumer.verify_source({"source": str(source), "revision": revision})
+        consumer.verify_source(settings)
 
 
 class InstallTests(Fixture):
