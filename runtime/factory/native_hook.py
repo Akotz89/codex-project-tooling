@@ -19,7 +19,7 @@ TOOLS = {'spawn_agent', 'collaboration.spawn_agent', 'collaborationspawn_agent',
 ALLOWED_ARGS = {'task_name', 'message', 'model', 'reasoning_effort', 'fork_turns'}
 
 
-REFUSAL_REASONS = ['native_actual_assessment_refused', 'native_arguments_invalid', 'native_caller_mismatch', 'native_caller_provenance_invalid', 'native_capability_expired', 'native_carrier_invalid', 'native_carrier_locator_invalid', 'native_event_identity_invalid', 'native_event_kind_invalid', 'native_packet_pair_mismatch', 'native_plaintext_marker_required', 'native_post_pair_mismatch', 'native_post_reservation_mismatch', 'native_preparation_binding_mismatch', 'native_prepared_pair_refused', 'native_project_root_mismatch', 'native_session_uuid_invalid', 'native_tool_identity_invalid', 'native_transport_binding_mismatch', 'native_transport_mode_mismatch']
+REFUSAL_REASONS = ['native_actual_assessment_refused', 'native_arguments_invalid', 'native_caller_mismatch', 'native_caller_provenance_invalid', 'native_capability_expired', 'native_carrier_invalid', 'native_carrier_locator_invalid', 'native_event_identity_invalid', 'native_event_kind_invalid', 'native_packet_pair_mismatch', 'native_plaintext_marker_required', 'native_post_pair_mismatch', 'native_post_reservation_mismatch', 'native_preparation_binding_mismatch', 'native_prepared_pair_refused', 'native_project_policy_invalid', 'native_project_policy_binding_mismatch', 'native_project_root_mismatch', 'native_session_uuid_invalid', 'native_tool_identity_invalid', 'native_transport_binding_mismatch', 'native_transport_mode_mismatch']
 
 
 def refusal_reason(error):
@@ -107,6 +107,7 @@ def native_caller_mapping(prepared, session_id):
 
 def validate(event, root, *, fresh=True):
     from .consumer import shared_root, read_settings, project_binding, verify_source
+    from .jev_router import validate_allowed_models
     root = shared_root(Path(root).resolve())
     if (not isinstance(event, dict) or not isinstance(event.get('cwd'), str)
             or shared_root(Path(event['cwd']).resolve()) != root):
@@ -114,6 +115,11 @@ def validate(event, root, *, fresh=True):
     identity = event_identity(event)
     settings = read_settings(root)
     verify_source(settings)
+    config = settings.get('jev_router', {})
+    if not isinstance(config, dict):
+        raise ValueError('native_project_policy_invalid')
+    current_models = validate_allowed_models(config['allowed_models']) if 'allowed_models' in config else None
+    current_policy = {'allowed_models': current_models}
     arguments, locator, native = dispatch_input(event)
     path, prepared = private_json(root, locator)
     if native is not None and any(key in prepared for key in ('native_transport', 'native_task_name', 'native_request')):
@@ -137,11 +143,15 @@ def validate(event, root, *, fresh=True):
         raise ValueError('native_capability_expired')
     receipt = prepared.get('receipt', {})
     pair = prepared.get('spawn_agent', {})
+    if ('project_model_policy' in prepared or 'allowed_models' in config):
+        if prepared.get('project_model_policy') != current_policy or receipt.get('project_model_policy') != current_policy:
+            raise ValueError('native_project_policy_binding_mismatch')
     if (receipt.get('capability_provenance') != 'caller_supplied_tool_metadata'
             or receipt.get('capability_tool') != 'collaboration.spawn_agent'
             or not isinstance(pair, dict) or set(pair) != {'model', 'reasoning_effort', 'fork_turns'}
             or pair.get('fork_turns') != 'none'
             or not allowed_pair(pair.get('model'), pair.get('reasoning_effort'))
+            or current_models is not None and pair.get('model') not in current_models
             or not any(isinstance(row, dict) and
                        (row.get('model'), row.get('effort')) ==
                        (pair['model'], pair['reasoning_effort'])

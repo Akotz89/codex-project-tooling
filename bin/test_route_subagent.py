@@ -647,8 +647,12 @@ class WorkerAdmissionTests(unittest.TestCase):
                 code = entry.main()
         return code, json.loads(output.getvalue())
 
-    def prepared_native(self, caller_prefix='native:', work='work/native', carrier=False):
+    def prepared_native(self, caller_prefix='native:', work='work/native', carrier=False, project_policy=None):
         request = copy.deepcopy(self.request)
+        if project_policy is not None:
+            settings = json.loads((self.a / consumer.SETTINGS).read_text())
+            settings['jev_router']['allowed_models'] = project_policy
+            (self.a / consumer.SETTINGS).write_text(json.dumps(settings))
         session_id = '01a15564-fd5f-7550-aadb-de6160ef7b5d'
         caller_id = caller_prefix + session_id
         request['caller_id'] = caller_id
@@ -680,6 +684,76 @@ class WorkerAdmissionTests(unittest.TestCase):
         if carrier:
             event['tool_input'] = {**prepared['native_request'], 'message': 'opaque:v1:8ab09f'}
         return prepared, event
+
+    def test_project_allowed_models_limits_actual_choice_and_preserves_luna_effort(self):
+        settings = json.loads((self.a / consumer.SETTINGS).read_text())
+        settings['jev_router']['allowed_models'] = ['gpt-6-luna']
+        (self.a / consumer.SETTINGS).write_text(json.dumps(settings))
+        for effort in ['low', 'medium', 'high', 'xhigh', 'max']:
+            with self.subTest(effort=effort):
+                request = copy.deepcopy(self.request)
+                request['capability_provenance']['models'][0]['reasoning_efforts'] = [effort]
+                seen = []
+                code, result, _ = RoutingTests.command(
+                    self, request, transport=lambda payload, *_: seen.append(payload) or self.answer(
+                        payload, model='gpt-6-luna', effort=effort), work='work/policy-' + effort)
+                self.assertEqual(code, 0)
+                self.assertEqual(result['spawn_agent']['model'], 'gpt-6-luna')
+                self.assertEqual(result['spawn_agent']['reasoning_effort'], effort)
+                options = seen[0]['questions']['worker_pair']['criteria']
+                self.assertEqual(len(options), 3)  # one pair plus the two refusal outcomes
+                self.assertEqual(result['receipt']['assessment_capability_pairs'],
+                                 [{'model': 'gpt-6-luna', 'effort': effort}])
+                self.assertIn({'model': 'gpt-6.1-sol', 'effort': 'medium'},
+                              result['receipt']['spawn_capability_pairs'])
+                self.assertEqual(result['project_model_policy'], {'allowed_models': ['gpt-6-luna']})
+
+    def test_project_policy_is_rechecked_at_launch_and_absent_policy_keeps_shared_choices(self):
+        prepared, event = self.prepared_native(project_policy=['gpt-6-luna'])
+        pair = prepared['spawn_agent']
+        self.assertEqual(pair['model'], 'gpt-6-luna')
+        observed = prepared['receipt']['spawn_capability_pairs']
+        self.assertTrue(all({'model': 'gpt-6-luna', 'effort': effort} in observed
+                            for effort in ['low', 'medium', 'high', 'xhigh', 'max']))
+        self.assertIn({'model': 'gpt-6.1-sol', 'effort': 'high'}, observed)
+        self.assertEqual(self.hook(event)['hookSpecificOutput']['permissionDecision'], 'allow')
+
+        prepared, event = self.prepared_native(project_policy=['gpt-6-luna'], work='work/policy-tamper')
+        settings = json.loads((self.a / consumer.SETTINGS).read_text())
+        settings['jev_router']['allowed_models'] = ['gpt-6.1-sol']
+        (self.a / consumer.SETTINGS).write_text(json.dumps(settings))
+        self.assert_denied(self.hook(event))
+
+        prepared, event = self.prepared_native(project_policy=['gpt-6-luna'], work='work/policy-pair-tamper')
+        path = Path(prepared['receipt_path'])
+        altered = copy.deepcopy(prepared)
+        altered['spawn_agent']['model'] = 'gpt-6.1-sol'
+        altered['spawn_agent']['reasoning_effort'] = 'medium'
+        path.write_text(json.dumps(altered))
+        self.assert_denied(self.hook(event))
+
+        settings = json.loads((self.a / consumer.SETTINGS).read_text())
+        settings['jev_router'].pop('allowed_models', None)
+        (self.a / consumer.SETTINGS).write_text(json.dumps(settings))
+        request = copy.deepcopy(self.request)
+        seen = []
+        code, result, _ = RoutingTests.command(
+            self, request, transport=lambda payload, *_: seen.append(payload) or self.answer(
+                payload, model='gpt-6.1-sol', effort='medium'), work='work/no-policy')
+        self.assertEqual(code, 0)
+        self.assertTrue(any('gpt-6.1-sol' in row for row in
+                            [question for question in seen[0]['questions']['worker_pair']['criteria'].values()]))
+
+    def test_malformed_project_model_policy_fails_before_credential_or_assessment(self):
+        for invalid in [[], ['gpt-6-luna', 'gpt-6-luna'], ['gpt-5.6-sol'], 'gpt-6-luna', [None]]:
+            with self.subTest(invalid=invalid):
+                settings = json.loads((self.a / consumer.SETTINGS).read_text())
+                settings['jev_router']['allowed_models'] = invalid
+                (self.a / consumer.SETTINGS).write_text(json.dumps(settings))
+                with patch.object(bridge, 'read_credential', side_effect=AssertionError('credential accessed')):
+                    with self.assertRaises((ValueError, jev_router.ModelPolicyError)):
+                        bridge.prepare_subagent(self.request, self.a, 'native:fixture', 'work/bad-policy',
+                                                transport=lambda *_: self.fail('assessment called'))
 
     def hook(self, event):
         with patch.object(consumer, 'verify_source', return_value=self.a):

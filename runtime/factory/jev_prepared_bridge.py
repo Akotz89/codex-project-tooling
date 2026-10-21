@@ -14,7 +14,7 @@ import uuid
 import unicodedata
 from .jev_router import (choose, http_choice, read_credential, ModelPolicyError,
                         SPAWN_AGENT_EFFORTS, collaboration_capability_pairs, assert_ordinary, eligible,
-                        assert_actual_assessment)
+                        assert_actual_assessment, validate_allowed_models)
 
 MAX_CONTEXT = 1024 * 1024
 
@@ -113,7 +113,7 @@ def human_override(choice):
 
 
 
-def route(request, root, key_file=None, jev_model='jev-latest', *, transport=None, max_task_bytes=8192):
+def route(request, root, key_file=None, jev_model='jev-latest', *, allowed_models=None, transport=None, max_task_bytes=8192):
     """Pure preparation core, compatible with Archon's separate native preflight.
 
     This library does not attest a project or persist evidence. Public commands
@@ -129,12 +129,15 @@ def route(request, root, key_file=None, jev_model='jev-latest', *, transport=Non
         if not isinstance(request, dict):
             raise ValueError('native context')
         capability = request.get('capability_provenance')
+        if allowed_models is not None:
+            allowed_models = validate_allowed_models(allowed_models)
         choice = request.get('explicit_choice')
         attribution = human_override(choice) if choice is not None else None
         if choice is not None and not any(
                 (row['model'], row['effort']) == (choice.get('model'), choice.get('effort'))
                 for row in (collaboration_capability_pairs(capability) if capability is not None
-                            else eligible(request.get('catalog'), time.time())).values()):
+                            else eligible(request.get('catalog'), time.time())).values()
+                if allowed_models is None or row['model'] in allowed_models):
             raise ModelPolicyError('human pair unavailable or forbidden')
         remaining, task, ordinary = request['remaining_ms'], request['task'], request['ordinary']
         if (isinstance(remaining, bool) or not isinstance(remaining, (int, float))
@@ -148,7 +151,7 @@ def route(request, root, key_file=None, jev_model='jev-latest', *, transport=Non
             task += '\nHuman pair constraint: ' + json.dumps(choice, sort_keys=True)
         # Validate ordinary policy/capability before credential IO; ordinary is context only.
         _, receipt = choose(task, request.get('catalog'), None, jev_model, deadline,
-                            ordinary=ordinary, capability_provenance=capability, transport=transport,
+                            ordinary=ordinary, capability_provenance=capability, allowed_models=allowed_models, transport=transport,
                             max_task_bytes=max_task_bytes)
         if 'ordinary_worker' in receipt:
             try:
@@ -162,7 +165,7 @@ def route(request, root, key_file=None, jev_model='jev-latest', *, transport=Non
                     credential_source = receipt['credential_source']
                     pair, receipt = choose(task, request.get('catalog'), key, jev_model, deadline,
                                            ordinary=ordinary, capability_provenance=capability,
-                                           transport=transport, max_task_bytes=max_task_bytes)
+                                           allowed_models=allowed_models, transport=transport, max_task_bytes=max_task_bytes)
                     receipt['credential_source'] = credential_source
     except ModelPolicyError:
         return {'status': 'refused', 'receipt': {'status': 'refused', 'reason': 'worker_model_policy'}}
@@ -287,6 +290,7 @@ def prepare_subagent(request, root, caller_id, work_dir, *, transport=None):
     config = settings.get('jev_router', {})
     if not isinstance(config, dict):
         raise ValueError('invalid project router configuration')
+    allowed_models = validate_allowed_models(config['allowed_models']) if 'allowed_models' in config else None
     packet = request.get('native_dispatch')
     native = native_dispatch_binding(packet) if packet is not None else None
     routed = dict(request)
@@ -295,7 +299,7 @@ def prepare_subagent(request, root, caller_id, work_dir, *, transport=None):
         if len(routed['task'].encode('utf8')) > 8192:
             raise ValueError('native dispatch task packet exceeds assessment bound')
     result = route(routed, root, config.get('key_file'), config.get('jev_model', 'jev-latest'),
-                   transport=transport)
+                   allowed_models=allowed_models, transport=transport)
     if native is not None:
         result['native_dispatch'] = native
     identity = 'jev-' + uuid.uuid4().hex
@@ -312,6 +316,9 @@ def prepare_subagent(request, root, caller_id, work_dir, *, transport=None):
                 'dispatch': 'not_invoked', 'result': 'not_observed', 'acceptance': 'not_performed',
                 'observed_model': None, 'observed_effort': None, 'worker_usage': None,
                 'before_dispatch': 'refresh caller metadata and verify project/caller identity; reconcile uncertain sends, never blind redispatch'}
+    policy = {'allowed_models': allowed_models}
+    metadata['project_model_policy'] = policy
+    result['receipt']['project_model_policy'] = policy
     if native is not None and result.get('status') in SUCCESS and 'spawn_agent' in result:
         locator = path.relative_to(root).as_posix()
         metadata['native_transport'] = native_transport_binding(locator, native)

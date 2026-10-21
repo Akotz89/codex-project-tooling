@@ -20,6 +20,14 @@ refuse a forbidden pair. Optional Jev assessment failure permits only an already
 validated ordinary pair. Current coordinator settings remain unchanged. Usage
 collection is explicit and project-local; no collector daemon is installed.
 
+For new project-bound native subagent preparations, `.factory/consumer.json` may
+set `jev_router.allowed_models` to a nonempty unique list from the shared worker
+policy, for example `"allowed_models": ["gpt-6-luna"]`. The receipt retains the
+capability identity and complete shared-policy pair set; Jev's Choice includes
+only currently supported pairs whose model is allowed. The hook rechecks the
+prepared policy against the current project setting before launch. With the setting absent, the shared model
+policy applies unchanged. Existing workers and coordinator settings are unaffected.
+
 ## Scope and backlog bootstrap
 
 Read `MISSION.md` in full. Its product scope, exclusions, hard invariants, and

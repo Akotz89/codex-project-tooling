@@ -28,6 +28,13 @@ def assert_ordinary(ordinary):
     if not isinstance(ordinary, dict) or set(ordinary) != {'provider', 'model', 'effort'} or ordinary.get('provider') != 'codex' or not allowed_pair(ordinary.get('model'), ordinary.get('effort')):
         raise ModelPolicyError('CPI236 worker policy refused ordinary/explicit selection; use supported Luna6 efforts through max or Sol6.1 low/medium/high; no silent replacement')
 
+def validate_allowed_models(models):
+    if (not isinstance(models, list) or not models
+            or any(not isinstance(model, str) or model not in WORKER_EFFORTS for model in models)
+            or len(models) != len(set(models))):
+        raise ModelPolicyError('project allowed_models must be a nonempty unique list within shared worker policy')
+    return list(models)
+
 WORKER_EFFORTS = {
     'gpt-6-luna': {'low', 'medium', 'high', 'xhigh', 'max'},
     'gpt-6.1-sol': {'low', 'medium', 'high'},
@@ -319,7 +326,6 @@ def collaboration_capability_pairs(provenance, *, credential=None):
         raise ValueError('collaboration capability options unavailable')
     return pairs
 
-
 def _http_once(payload, credential, deadline):
     """One bounded stdlib HTTP request. No transport retries or worker launches."""
     remaining = deadline - time.monotonic()
@@ -464,7 +470,7 @@ def assert_actual_assessment(receipt, model, effort):
             or not re.fullmatch(r'[0-9a-f]{64}', str(receipt.get('request_sha256', '')))
             or receipt.get('prepared_pair') != {'model': model, 'effort': effort}):
         raise ModelPolicyError('actual persisted Jev assessment required')
-    rows = receipt.get('spawn_capability_pairs', receipt.get('catalog_pairs'))
+    rows = receipt.get('assessment_capability_pairs', receipt.get('spawn_capability_pairs', receipt.get('catalog_pairs')))
     if not isinstance(rows, list) or not rows:
         raise ModelPolicyError('assessed capability set missing')
     pairs = {}
@@ -481,21 +487,30 @@ def assert_actual_assessment(receipt, model, effort):
 
 
 def choose(task, catalog, credential, jev_model, deadline, *, ordinary=None,
-           capability_provenance=None, transport=http_choice, max_task_bytes=MAX_TASK_BYTES):
+           capability_provenance=None, allowed_models=None, transport=http_choice, max_task_bytes=MAX_TASK_BYTES):
     assert_ordinary(ordinary)  # Cannot fall through missing-key or provider-error paths.
     started = time.monotonic()
     receipt = {'schema': 'CPI236TASKASSESSMENTV1', 'policy': 'direct_permitted_pair_choice_1',
                'status': 'fallback', 'reason': 'unavailable', 'attempts': 0,
                'context_source': 'natural_work', 'certainty_policy': 'unique_choice_no_calibrated_suitability_threshold'}
     try:
-        pairs = (collaboration_capability_pairs(capability_provenance, credential=credential)
-                 if capability_provenance is not None else eligible(catalog, time.time(), allow_empty=True))
+        observed_pairs = (collaboration_capability_pairs(capability_provenance, credential=credential)
+                          if capability_provenance is not None else eligible(catalog, time.time(), allow_empty=True))
+        permitted_models = validate_allowed_models(allowed_models) if allowed_models is not None else None
+        pairs = ({key: row for key, row in observed_pairs.items()
+                  if row['model'] in permitted_models} if permitted_models is not None else observed_pairs)
         ordinary = dict(ordinary)
-        if not any(row['model'] == ordinary['model'] and row['effort'] == ordinary['effort'] for row in pairs.values()):
+        if not any(row['model'] == ordinary['model'] and row['effort'] == ordinary['effort'] for row in observed_pairs.values()):
             raise ModelPolicyError('CPI236 ordinary worker pair is unavailable in the supported options; no fallback launch')
         pair_field = 'spawn_capability_pairs' if capability_provenance is not None else 'catalog_pairs'
-        receipt.update(**{pair_field: [{'model': row['model'], 'effort': row['effort']} for _, row in sorted(pairs.items())]},
+        receipt.update(**{pair_field: [{'model': row['model'], 'effort': row['effort']} for _, row in sorted(observed_pairs.items())]},
                        ordinary_worker=ordinary)
+        if permitted_models is not None:
+            receipt.update(assessment_capability_pairs=[{'model': row['model'], 'effort': row['effort']}
+                                                        for _, row in sorted(pairs.items())],
+                           project_allowed_models=permitted_models)
+            if not pairs:
+                raise ModelPolicyError('project policy leaves no currently supported worker pair')
         if capability_provenance is None:
             receipt.update(catalog_identity=hashlib.sha256(catalog['identity'].encode()).hexdigest(),
                            catalog_fetched_at=catalog['fetched_at'])
