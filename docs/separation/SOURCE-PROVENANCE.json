@@ -1,7 +1,7 @@
 {
   "schema": "tooling-repository-separation-candidate-v1",
   "candidate": {
-    "path": "work/core4-tooling-repository-separation-20261021/implementation/candidate/repository",
+    "path": "isolated prepublication source candidate (task-owned; ledger retained locally)",
     "base_commit": "0dfad908c84183d10efa8cbb0d7463648e5baa7b",
     "base_tree": "3c85bd2ffcb9623c5fc2b6f8c78ad8e503106b3d",
     "factory_history_reachable_commit_count": 277,
@@ -143,9 +143,21 @@
     "original_blob_sha256": "dee343eb326cf00bd87930ca6064d0130ebe577f2d64d2a85519a7d3bb7c71f1",
     "original_size_bytes": 3250,
     "original_line_count": 20,
-    "publication_action": "remove this path from the new tooling-repository export history; preserve the unchanged full source candidate locally",
+    "publication_action": "removed only .factory/ledger.jsonl from the fresh export; source candidate remains unchanged",
     "source_candidate_rewritten": false,
-    "commit_map_evidence": "work/core4-tooling-repository-separation-20261021/implementation/source-history/publication-commit-map.tsv"
+    "commit_map_evidence": "retained with task verification artifacts; not part of the published repository",
+    "tool": "git-filter-repo 31ebad4c8fb3",
+    "tool_source_commit": "d7b75aca907380f608892cc289e616f195427b99",
+    "source_candidate_head": "7f83d8d5a3124bd83eea6b507c9c46c51e779db4",
+    "filtered_head_before_publication_notes": "abd24008e64c02aca8a77280f6858ceeb868aa48",
+    "source_candidate_commits": 285,
+    "filtered_export_commits": 285,
+    "filtered_export_current_files": 94,
+    "filtered_export_reachable_blobs": 1034,
+    "tree_identical_except_excluded_path": true,
+    "excluded_path_reachable_after_filter": false,
+    "commit_map_sha256": "8fb1b9a386be9e08c26419fed40caf88e4eca7bbc16742e28789121b744777a0",
+    "commit_map_rows": 285
   },
   "local_verification": {
     "route_subagent": {
@@ -172,11 +184,15 @@
       "command": "uv run --locked --project tools/project-coordinator pytest -q tools/project-coordinator/tests --basetemp <task-work>/verification/final-20261021/project-coordinator-pytest"
     },
     "security_scan": {
-      "reachable_commits": 284,
-      "reachable_blobs": 1023,
-      "current_publication_files": 101,
-      "high_confidence_credential_matches": 0,
-      "scan_sha256": "7f93821ec9baa2cb1cdef1ba36636dbebe4aa79a4619e9368fd31b71a735ee46"
+      "scanner": "gitleaks 8.30.1",
+      "mode": "git history scan with built-in default rules and redacted reporting",
+      "scan_head": "abd24008e64c02aca8a77280f6858ceeb868aa48",
+      "reachable_commits": 285,
+      "reachable_blobs": 1034,
+      "current_publication_files": 94,
+      "finding_count": 0,
+      "report_sha256": "145e14b3c134f3a1a56974c1129967e0f4065a8c3e3de0ecd870fb571a07ceb7",
+      "task_evidence": "verification/final-20261021/gitleaks-filtered-summary.json"
     }
   }
 }
