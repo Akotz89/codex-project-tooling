@@ -221,6 +221,13 @@ def native_inputs(run, bundle, directory, root, role, field):
     return obj(receipt["inputs"]), "Root-pinned launch receipt (integrity only)"
 
 
+def bind_task_allocation(run, bundle, directory, root, role, allocation):
+    inputs, _ = native_inputs(run, bundle, directory, root, role, "task_id")
+    for key in ("task_id", "dispatch_id", "worker", "worker_thread_id"):
+        require(inputs.get(key) == allocation[key],
+                f"{role}: native execution is not bound to the accepted task allocation")
+
+
 def frozen_contract(bundle, directory, run, root):
     contract = obj(bundle["runtime_contract"])
     pin = obj(contract["manifest"])
@@ -385,6 +392,7 @@ def accept(bundle, directory, policy, failures=None):
     require(set(pins) == set(PURPOSES), "exactly four native records required")
     require(len({text(obj(pin)["run_id"]) for pin in pins.values()}) == 4, "native run IDs must be distinct")
     implementation, result = native_record("implementation", pins["implementation"], directory, root, policy)
+    bind_task_allocation(implementation, bundle, directory, root, "implementation", allocation)
     boolean_fields(result, ("done", "green"), "implementation")
     require(result["red_cause"] in IMPLEMENTATION_RED_CAUSES, "implementation: invalid red cause")
     if (implementation["outcome"] != "succeeded" or result["done"] is not True
@@ -392,6 +400,7 @@ def accept(bundle, directory, policy, failures=None):
         failures.append({"record": "implementation", "reason": "builder did not author a completed green result",
                          "red_cause": result["red_cause"], "summary": str(result.get("summary", ""))[:2000]})
     review, result = native_record("review", pins["review"], directory, root, policy)
+    bind_task_allocation(review, bundle, directory, root, "review", allocation)
     baseline = obj(review["checkout_baseline"])
     require(baseline["kind"] == "git" and baseline["commit"] == head
             and obj(baseline["worktree"])["status"] == "clean", "review: dirty, unknown or stale checkout baseline")
@@ -403,8 +412,10 @@ def accept(bundle, directory, policy, failures=None):
                          "findings_summary": str(result.get("findings_summary", ""))[:2000],
                          "report": bundle["review_report"]})
     suite, result = native_record("runtime_suite", pins["runtime_suite"], directory, root, policy)
+    bind_task_allocation(suite, bundle, directory, root, "runtime_suite", allocation)
     runtime_files, suite_input = runtime_suite(suite, result, bundle, directory, root, failures)
     wrong, result = native_record("wrong_identity", pins["wrong_identity"], directory, root, policy)
+    bind_task_allocation(wrong, bundle, directory, root, "wrong_identity", allocation)
     requested, input_evidence = requested_identity(wrong, bundle, directory, root)
     require(requested == controls["wrong_requested_identity"] and requested != executable,
             "wrong_identity: run did not request frozen wrong identity")

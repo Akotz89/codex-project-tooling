@@ -223,18 +223,15 @@ class ConsumerTests(Fixture):
             return json.loads(result.stdout)
 
         def event(receipt, tool_id):
-            relative = Path(receipt["receipt_path"]).relative_to(self.app)
             return {"hook_event_name": "PreToolUse", "cwd": str(self.app),
                     "session_id": session_id, "turn_id": "turn:1", "tool_use_id": tool_id,
-                    "tool_name": tool_name, "tool_input": {"task_name": "bounded_parser",
-                        "message": body + "\n[CPI414 preparation=" + str(relative) + "]",
-                        "model": "gpt-6-luna", "reasoning_effort": "max", "fork_turns": "all"}}
+                    "tool_name": tool_name, "tool_input": dict(receipt["native_request"])}
 
         def hook(receipt, tool_id, wrong_locator=False):
             payload = event(receipt, tool_id)
             if wrong_locator:
-                payload["tool_input"]["message"] = payload["tool_input"]["message"].replace(
-                    Path(receipt["receipt_path"]).name, "jev-00000000000000000000000000000000.json")
+                locator = "work/native/jev-00000000000000000000000000000000.json"
+                payload["tool_input"]["task_name"] = "cpi414_" + locator.encode().hex()
             result = subprocess.run(hook_args, input=json.dumps(payload), cwd=self.app,
                                     capture_output=True, text=True, timeout=15)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -251,8 +248,8 @@ class ConsumerTests(Fixture):
         self.assertEqual(allowed["updatedInput"]["reasoning_effort"], "medium")
         self.assertEqual(allowed["updatedInput"]["fork_turns"], "none")
         self.assertEqual(positive["receipt"]["attempts"], 1)
-        self.assertEqual(allowed["updatedInput"]["task_name"], "bounded_parser")
-        self.assertEqual(allowed["updatedInput"]["message"], event(positive, "tool:valid")["tool_input"]["message"])
+        self.assertEqual(allowed["updatedInput"]["task_name"], positive["native_task_name"])
+        self.assertEqual(allowed["updatedInput"]["message"], body)
 
         unused = prepare()
         self.assertEqual(unused["source_binding"],
@@ -1522,6 +1519,7 @@ class HarnessTests(unittest.TestCase):
 
 # Public admission and native interception run with the principal consumer checks.
 from test_route_subagent import RoutingTests, WorkerAdmissionTests
+from test_project_model_policy import ProjectModelPolicyTests
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

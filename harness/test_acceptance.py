@@ -53,6 +53,8 @@ class AcceptanceTests(unittest.TestCase):
                          "wrong_requested_identity": self.wrong},
             "records": {},
         }
+        allocation_inputs = {key: self.bundle["allocation"][key]
+                             for key in ("task_id", "dispatch_id", "worker", "worker_thread_id")}
         self.make_contract()
         self.values = {
             "implementation": {"done": True, "green": True, "red_cause": "", "summary": "Fixture"},
@@ -88,7 +90,11 @@ class AcceptanceTests(unittest.TestCase):
                                                 "value": self.values[role]},
                                     "artifacts": {"root": str(artifact_root), "files": [], "limitations": []}},
             }
-        self.documents["runtime_suite"]["metadata"] = {"inputs_values": {"manifest": str(self.manifest)}}
+        self.documents["implementation"]["metadata"] = {"inputs_values": allocation_inputs.copy()}
+        self.documents["review"]["metadata"] = {"inputs_values": allocation_inputs.copy()}
+        self.documents["wrong_identity"]["metadata"]["inputs"].update(allocation_inputs)
+        self.documents["runtime_suite"]["metadata"] = {
+            "inputs_values": {"manifest": str(self.manifest), **allocation_inputs}}
         self.report = (self.directory / "fixture-output/artifacts/runs/fixture-review/review/report.md")
         self.report.parent.mkdir()
         self.report.write_text(f"**Reviewed head SHA:** {self.head}\n\nExplicit parser fixture: no findings.\n")
@@ -173,11 +179,11 @@ class AcceptanceTests(unittest.TestCase):
             path.write_text(json.dumps(document))
             self.bundle["records"][role] = self.pin(path, document["id"])
 
-    def run_cli(self, expected):
+    def run_cli(self, expected, policy=POLICY):
         path = self.directory / "bundle.fixture.json"
         path.write_text(json.dumps(self.bundle))
         policy_path = self.directory / "policy.fixture.json"
-        policy_path.write_text(json.dumps(POLICY))
+        policy_path.write_text(json.dumps(policy))
         process = subprocess.run([sys.executable, str(CLI), str(path), "--policy", str(policy_path)],
                                  capture_output=True, text=True, timeout=10)
         self.assertEqual(process.returncode, expected, process.stdout + process.stderr)
@@ -194,7 +200,7 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(result["candidate"], self.bundle["candidate"])
 
     def test_allocation_and_each_workflow_are_bound_to_caller_policy(self):
-        for field in ("project_id", "issue", "worker"):
+        for field in ("project_id", "issue", "worker", "task_id", "dispatch_id", "worker_thread_id"):
             original = self.bundle["allocation"][field]
             self.bundle["allocation"][field] = "foreign"
             self.run_cli(2)
@@ -209,6 +215,18 @@ class AcceptanceTests(unittest.TestCase):
                 target[field] = original
         self.save_records()
         self.run_cli(0)
+
+    def test_alternate_caller_workflow_and_node_identities_are_supported(self):
+        policy = copy.deepcopy(POLICY)
+        for purpose, record in self.documents.items():
+            workflow = "caller-" + purpose.replace("_", "-")
+            node = "caller-node-" + purpose.replace("_", "-")
+            policy["workflows"][purpose] = {"workflow": workflow, "node": node}
+            record["workflow_name"] = workflow
+            record["terminal_record"]["returns"]["node_id"] = node
+            record["terminal_record"]["nodes"][0]["node_id"] = node
+        self.save_records()
+        self.run_cli(0, policy)
 
     def test_identity_is_executable_sha_without_bundle(self):
         process = subprocess.run([sys.executable, str(CLI), "--identity"],
@@ -298,7 +316,10 @@ class AcceptanceTests(unittest.TestCase):
         self.run_cli(2)
 
     def test_typed_native_input_takes_precedence(self):
-        self.documents["wrong_identity"]["metadata"]["inputs_values"] = {"candidate": self.baseline}
+        inputs = {key: self.bundle["allocation"][key]
+                  for key in ("task_id", "dispatch_id", "worker", "worker_thread_id")}
+        self.documents["wrong_identity"]["metadata"]["inputs_values"] = {
+            "candidate": self.baseline, **inputs}
         self.save_records()
         self.run_cli(2)
 
@@ -307,9 +328,12 @@ class AcceptanceTests(unittest.TestCase):
         self.save_records()
         self.run_cli(2)
         receipt = self.directory / "launch.fixture.json"
+        allocation_inputs = {key: self.bundle["allocation"][key]
+                             for key in ("task_id", "dispatch_id", "worker", "worker_thread_id")}
         receipt.write_text(json.dumps({"run_id": "fixture-wrong-identity",
                                       "workflow_name": POLICY["workflows"]["wrong_identity"]["workflow"],
-                                      "working_path": str(self.root), "inputs": {"candidate": self.wrong}}))
+                                      "working_path": str(self.root),
+                                      "inputs": {"candidate": self.wrong, **allocation_inputs}}))
         self.bundle["wrong_identity_launch_receipt"] = self.pin(receipt, "fixture-wrong-identity")
         self.run_cli(0)
 
@@ -621,11 +645,19 @@ class AcceptanceTests(unittest.TestCase):
         self.save_records()
         self.run_cli(2)
         receipt = self.directory / "suite-launch.fixture.json"
+        allocation_inputs = {key: self.bundle["allocation"][key]
+                             for key in ("task_id", "dispatch_id", "worker", "worker_thread_id")}
         data = {"run_id": "fixture-runtime-suite", "workflow_name": POLICY["workflows"]["runtime_suite"]["workflow"],
-                "working_path": str(self.root), "inputs": {"manifest": str(self.manifest)}}
+                "working_path": str(self.root),
+                "inputs": {"manifest": str(self.manifest), **allocation_inputs}}
         receipt.write_text(json.dumps(data))
         self.bundle["runtime_suite_launch_receipt"] = self.pin(receipt, data["run_id"])
         self.run_cli(0)
+        data["inputs"]["worker_thread_id"] = "another-thread"
+        receipt.write_text(json.dumps(data))
+        self.bundle["runtime_suite_launch_receipt"] = self.pin(receipt, data["run_id"])
+        self.run_cli(2)
+        data["inputs"]["worker_thread_id"] = allocation_inputs["worker_thread_id"]
         data["run_id"] = "another-run"
         receipt.write_text(json.dumps(data))
         self.bundle["runtime_suite_launch_receipt"] = self.pin(receipt, data["run_id"])

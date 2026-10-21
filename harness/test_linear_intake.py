@@ -31,8 +31,10 @@ class IntakeTests(unittest.TestCase):
                      "linear_ref": self.release["linear_ref"]}
         self.summary = {"action": "OK", "checkpoint_id": "checkpoint", "project": {
             "project_id": "sample-project", "root": str(self.root), "workers": {"builder": "actual-thread"}},
+            "recovery_required": False, "pending_checkpoint": False,
+            "uncertain_held_dispatches": 0,
             "tasks": [self.task, {"id": "prior", "status": "COMPLETE"}],
-            "pending_checkpoint": False, "bounds": {"truncated_fields": [], "offset": 0,
+            "bounds": {"truncated_fields": [], "offset": 0,
                 "next_offset": None, "total_tasks": 2}}
 
     def test_allocated_work_becomes_upstream_input_without_side_effects(self):
@@ -79,6 +81,23 @@ class IntakeTests(unittest.TestCase):
                            ("bounds", {"truncated_fields": ["tasks.0.dependencies"]})]:
             with self.assertRaises(ValueError):
                 intake(self.release, dict(self.summary, **{key: value}), POLICY)
+
+    def test_recovery_and_uncertain_ownership_hold_admission(self):
+        self.summary["recovery_required"] = True
+        self.summary["uncertain_held_dispatches"] = 1
+        result = intake(self.release, self.summary, POLICY)
+        self.assertFalse(result["ready"])
+        self.assertIn("reconciliation", result["reason"])
+        self.summary["recovery_required"] = False
+        with self.assertRaises(ValueError):
+            intake(self.release, self.summary, POLICY)
+
+    def test_read_only_task_with_empty_writer_scope_is_supported(self):
+        self.release["writer_paths"] = []
+        self.task["writer_paths"] = []
+        result = intake(self.release, self.summary, POLICY)
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["writer_paths"], [])
 
     def test_duplicate_task_identity_refused(self):
         self.summary["tasks"].append(dict(self.task))
@@ -140,6 +159,13 @@ class IntakeTests(unittest.TestCase):
         path.write_bytes(b" " * (1024 * 1024 + 1))
         with self.assertRaises(ValueError):
             read_json(path)
+
+    def test_duplicate_json_keys_and_nonstandard_constants_are_refused(self):
+        path = self.root / "malformed.json"
+        for raw in (b'{"task_id":"one","task_id":"two"}', b'{"owner":NaN}'):
+            path.write_bytes(raw)
+            with self.assertRaises(ValueError):
+                read_json(path)
 
 
 if __name__ == "__main__":

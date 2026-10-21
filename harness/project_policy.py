@@ -42,13 +42,13 @@ def unique_object(pairs):
     result = {}
     for key, value in pairs:
         if key in result:
-            raise ValueError(f"policy: duplicate JSON key: {key}")
+            raise ValueError(f"duplicate JSON key: {key}")
         result[key] = value
     return result
 
 
 def invalid_constant(value):
-    raise ValueError(f"policy: invalid JSON constant: {value}")
+    raise ValueError(f"invalid JSON constant: {value}")
 
 
 def load_policy(path):

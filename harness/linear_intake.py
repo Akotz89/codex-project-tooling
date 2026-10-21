@@ -7,7 +7,8 @@ from pathlib import Path
 import sys
 from urllib.parse import urlparse
 
-from project_policy import load_policy, validate_policy
+from project_policy import (invalid_constant, load_policy, unique_object,
+                            validate_policy)
 
 
 def read_json(path):
@@ -16,7 +17,8 @@ def read_json(path):
         data = stream.read(1024 * 1024 + 1)
     if len(data) > 1024 * 1024:
         raise ValueError("input exceeds 1 MiB")
-    value = json.loads(data)
+    value = json.loads(data, object_pairs_hook=unique_object,
+                       parse_constant=invalid_constant)
     if not isinstance(value, dict):
         raise ValueError("input must be an object")
     return value
@@ -60,6 +62,15 @@ def intake(release, summary, policy):
             or bounds["next_offset"] is not None
             or bounds["total_tasks"] != len(summary["tasks"])):
         raise ValueError("coordination snapshot is incomplete")
+    uncertain = summary.get("uncertain_held_dispatches")
+    recovery_required = summary.get("recovery_required")
+    pending = summary.get("pending_checkpoint")
+    if (type(pending) is not bool or type(recovery_required) is not bool
+            or isinstance(uncertain, bool) or not isinstance(uncertain, int) or uncertain < 0
+            or recovery_required != (pending or uncertain > 0)):
+        raise ValueError("coordination recovery state is incomplete or inconsistent")
+    if recovery_required:
+        return {"ready": False, "reason": "coordination recovery or dispatch reconciliation is required"}
     tasks = {task["id"]: task for task in summary["tasks"]}
     if len(tasks) != len(summary["tasks"]):
         raise ValueError("duplicate tasks in coordination snapshot")
@@ -72,8 +83,10 @@ def intake(release, summary, policy):
             or task.get("dispatch_thread_id") != release["worker_thread_id"]
             or summary["project"]["workers"].get(release["worker"]) != release["worker_thread_id"]):
         return {"ready": False, "reason": "task has no acknowledged matching ownership"}
+    if not isinstance(release["writer_paths"], list) or not isinstance(task["writer_paths"], list):
+        raise ValueError("writer scope must be a list")
     claims = sorted(str((root / path).resolve()) for path in release["writer_paths"])
-    if (not claims or claims != sorted(task["writer_paths"])
+    if (claims != sorted(task["writer_paths"])
             or any(not Path(path).is_relative_to(root) or Path(path) == root for path in claims)):
         raise ValueError("writer scope does not match allocated task")
     if task["linear_ref"].rstrip("/") != release["linear_ref"]:

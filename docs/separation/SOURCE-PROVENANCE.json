@@ -1,0 +1,182 @@
+{
+  "schema": "tooling-repository-separation-candidate-v1",
+  "candidate": {
+    "path": "work/core4-tooling-repository-separation-20261021/implementation/candidate/repository",
+    "base_commit": "0dfad908c84183d10efa8cbb0d7463648e5baa7b",
+    "base_tree": "3c85bd2ffcb9623c5fc2b6f8c78ad8e503106b3d",
+    "factory_history_reachable_commit_count": 277,
+    "working_tree_origin": "native/project-factory/factory/0dfad908c84183d10efa8cbb0d7463648e5baa7b"
+  },
+  "setup_factory_source": {
+    "owner": "WSL Setup",
+    "path": "native/project-factory/factory/0dfad908c84183d10efa8cbb0d7463648e5baa7b",
+    "commit": "0dfad908c84183d10efa8cbb0d7463648e5baa7b",
+    "tree": "3c85bd2ffcb9623c5fc2b6f8c78ad8e503106b3d",
+    "reachable_commits": 277,
+    "source_clean": true,
+    "source_origin_is_canonical_remote": false,
+    "history_action": "cloned full source history without rewriting its commit graph or source remote"
+  },
+  "core5_frozen_delta": {
+    "source_candidate": "work/core5-luna-effort-only-20261021/factory-source/candidate",
+    "baseline_commit": "0dfad908c84183d10efa8cbb0d7463648e5baa7b",
+    "review_diff": "work/core5-luna-effort-only-20261021/factory-source/review.diff",
+    "review_diff_sha256": "e57fb10932e5963a2a7d27e2c56c2e0b31d522ec7e60572000f3cd21be0a07b0",
+    "applied_diff_sha256": "e57fb10932e5963a2a7d27e2c56c2e0b31d522ec7e60572000f3cd21be0a07b0",
+    "changed_paths": [
+      {
+        "path": "bin/test_route_subagent.py",
+        "sha256": "9be1c954ff3f4bcbf32c494208248acdeeff5acc746a123ce204af39bb6341d7"
+      },
+      {
+        "path": "runtime/factory/jev_prepared_bridge.py",
+        "sha256": "ccd47c4310c0cfd129c10e63a43f9a85ca21c2560784755e55f9741011972433"
+      },
+      {
+        "path": "runtime/factory/jev_router.py",
+        "sha256": "f60486643d3155dc7f035adabad1db24791fc3bba6584c7dfb3d8236bd1def01"
+      },
+      {
+        "path": "runtime/factory/native_hook.py",
+        "sha256": "28dfbfde95a2a481b09e96c479b75ba726f5a5fef9c04724fbc67d4ae0286a2b"
+      },
+      {
+        "path": "template/factory/WORKFLOW_POLICY.md",
+        "sha256": "f8aa40e1955c4b334c817a31d350a52896e8bed1bba63c8a8a7d5d3deb6b4d77"
+      }
+    ],
+    "scope": "new project-bound native-worker model choices; capability inventory remains complete; no source-policy installation or downstream useful-task claim"
+  },
+  "wow_source_boundary": {
+    "repository": "Akotz89/wow-private-server",
+    "remote": "https://github.com/Akotz89/wow-private-server.git",
+    "accepted_source_commit": "99731a8375afca4572f590d6b547724444e7d2df",
+    "tree": "5aed8b12c47f87c2fa26ea4b3c2463daf076ca84",
+    "github_readback": "commit exists at the recorded private repository URL",
+    "candidate_import_commit": "a80be8da582c49b6c8cf7ed1a662eab0e0de0afa",
+    "candidate_import_commit_tree": "9b6b1a3348ac5413f0734b212b365b47f40c8e37",
+    "accepted_source_commit_is_candidate_ancestor": false,
+    "source_history_method": "filtered snapshot import; original WoW commit graph is not included",
+    "generalization_commits": [
+      "40b19719becc2dc9becb40268d4e7befb6572941",
+      "3b287fd171cc2d2b97b9945a1ea605f437b32aac",
+      "5a213d30441461632b0bb8a9d529355fba3c42d7",
+      "810060d91a1f29c0f7bb4bd651d04941a9bc0a1d"
+    ],
+    "genericized_candidate_paths": [
+      "tools/project-coordinator/**",
+      "scripts/project-coordinator",
+      "harness/README.md",
+      "harness/acceptance.py",
+      "harness/candidate_identity.py",
+      "harness/linear_intake.py",
+      "harness/post_builder.py",
+      "harness/prepare_runtime.py",
+      "harness/project_policy.py",
+      "harness/test_*.py"
+    ],
+    "excluded_product_and_setup_paths": [
+      "harness/appproc.py",
+      "harness/ci.py",
+      "harness/harness.config.json",
+      "harness/runtime.inputs.json",
+      "harness/END-TO-END.md",
+      ".factory/**",
+      "factory/consumer.py in the live Setup checkout",
+      "factory/WORKFLOW_POLICY.md in the live Setup checkout",
+      "factory/pack.json in the live Setup checkout",
+      "guidance/** in the live Setup checkout"
+    ],
+    "local_only_paths_not_copied": [
+      ".factory/project-context.md",
+      "factory/NATIVE_SUBAGENTS.md",
+      "factory/jev_prepared_bridge.py",
+      "factory/jev_router.py",
+      "factory/tests/test_dispatch_shape.py",
+      "factory/tests/test_usage_collector.py",
+      "factory/usage_collector.py"
+    ],
+    "local_worktree_variant": {
+      "branch": "codex/github-source",
+      "commit": "2a633144b2300af2a0d36be2611cd055c4d8161d",
+      "path": "scripts/project-coordinator",
+      "accepted_published_blob": "5cb4ea111c30cee390bb60d3b832171d656ea8ca",
+      "local_branch_blob": "a5f2f80bee3e5bd4f216e6758210fd9565779e6e",
+      "behavior": "adds the local factory/usage_collector.py fallback after successful result events",
+      "disposition": "not copied into the generic candidate; the original local branch remains untouched for writer-coordinated caller migration"
+    },
+    "disposition": "generic coordinator and retained-evidence harness logic is included behind caller-owned project/workflow policy; product adapters and live Setup paths remain in their owning repositories, and no caller migration is claimed"
+  },
+  "archon": {
+    "upstream_repository": "https://github.com/coleam00/Archon",
+    "accepted_local_source_commit": "b0b17e8fc54f3f7569f2053b10231bc6fdf55bfa",
+    "accepted_local_parent": "8fea8c74f4e57c1c7bb0fd6e48a07ddb0342b75a",
+    "upstream_readback": "GitHub API returned 422 No commit found for SHA b0b17e8fc54f3f7569f2053b10231bc6fdf55bfa",
+    "source_readme_upstream_pin": "9d8aaf56143b6a7ea8af90f1e6c472ae26653f85",
+    "readme_pin_remote_readback": "verified in coleam00/Archon",
+    "license_evidence_pin": "9155ff15d1d557c1fee4e5e1627e14d0beafcf73",
+    "license": "MIT",
+    "license_blob_git_sha1": "a4b5a58a90fc59c9877b6f9933cb3e3b1cf362a3",
+    "license_blob_sha256": "be39e59fb1d5f09c831ab6d8d38cba6d07812afb27eed300520dc493580cc7f6",
+    "code_in_candidate": false,
+    "disposition": "preserve upstream identity and license evidence; do not vendor third-party implementation; Root must resolve accepted-local-pin versus upstream-pin before adoption"
+  },
+  "destination_remote": {
+    "repository": "Akotz89/codex-project-tooling",
+    "owner": "Akotz89",
+    "visibility": "private",
+    "default_branch": null,
+    "size": 0,
+    "remote_commit_readback": "empty repository; no candidate commit/tree/bytes have been pushed or read back"
+  },
+  "license_boundary": {
+    "coordinator_package_license": "not declared at source commit; no license claim added",
+    "ai_software_factory_upstream_pin": "ce369bcc397646690c0825e8e3494515065e6302",
+    "license_status": "no LICENSE found at accepted pin; no license claim added",
+    "destination_visibility": "private"
+  },
+  "publication_history_filter": {
+    "excluded_path": ".factory/ledger.jsonl",
+    "classification": "task-run metadata; no references from tools, tests, or callers",
+    "original_history_occurrences": 1,
+    "original_blob_git_sha1": "eab56861b00bcf2493e223f801d478b7ee70f6bd",
+    "original_blob_sha256": "dee343eb326cf00bd87930ca6064d0130ebe577f2d64d2a85519a7d3bb7c71f1",
+    "original_size_bytes": 3250,
+    "original_line_count": 20,
+    "publication_action": "remove this path from the new tooling-repository export history; preserve the unchanged full source candidate locally",
+    "source_candidate_rewritten": false,
+    "commit_map_evidence": "work/core4-tooling-repository-separation-20261021/implementation/source-history/publication-commit-map.tsv"
+  },
+  "local_verification": {
+    "route_subagent": {
+      "passed": 63,
+      "command": "python3 -B bin/test_route_subagent.py"
+    },
+    "consumer": {
+      "passed": 130,
+      "skipped": 3,
+      "skip_reason": "Windows-only",
+      "command": "python3 -B bin/test_consumer.py"
+    },
+    "project_model_policy": {
+      "passed": 4,
+      "command": "python3 -B bin/test_project_model_policy.py"
+    },
+    "harness": {
+      "passed": 101,
+      "command": "python3 -B -m unittest discover -v -s harness",
+      "archon_source": "b0b17e8fc54f3f7569f2053b10231bc6fdf55bfa"
+    },
+    "project_coordinator": {
+      "passed": 90,
+      "command": "uv run --locked --project tools/project-coordinator pytest -q tools/project-coordinator/tests --basetemp <task-work>/verification/final-20261021/project-coordinator-pytest"
+    },
+    "security_scan": {
+      "reachable_commits": 284,
+      "reachable_blobs": 1023,
+      "current_publication_files": 101,
+      "high_confidence_credential_matches": 0,
+      "scan_sha256": "7f93821ec9baa2cb1cdef1ba36636dbebe4aa79a4619e9368fd31b71a735ee46"
+    }
+  }
+}
