@@ -193,6 +193,16 @@
       "finding_count": 0,
       "report_sha256": "145e14b3c134f3a1a56974c1129967e0f4065a8c3e3de0ecd870fb571a07ceb7",
       "task_evidence": "verification/final-20261021/gitleaks-filtered-summary.json"
+    },
+    "remote_history_scan": {
+      "scanner": "gitleaks 8.30.1",
+      "scan_head": "b44091f6934bafa5dda5776ce3a870e078ddd034",
+      "finding_count": 1,
+      "rule": "generic-api-key",
+      "file": "docs/separation/SOURCE-PROVENANCE.json",
+      "line": 209,
+      "classification": "false positive: the value was a 40-character Git commit ID equal to the independently read-back first-push commit; no credential was present",
+      "disposition": "renamed the misleading evidence key; published history is preserved and not rewritten"
     }
   },
   "destination": {
@@ -206,12 +216,12 @@
     "immutable_tooling_source_pin": "a13929cde7e2720a57373e7d4fe24bdb896a5411",
     "push_was_forced": false,
     "remote_readback": {
-      "github_api_commit": "a13929cde7e2720a57373e7d4fe24bdb896a5411",
       "git_ls_remote_commit": "a13929cde7e2720a57373e7d4fe24bdb896a5411",
       "fetched_commit": "a13929cde7e2720a57373e7d4fe24bdb896a5411",
       "fetched_tree": "3836b206cbf4c6b6adee8c4d0d8aa27e8aaf3929",
       "tree_matches_local": true,
-      "task_evidence": "verification/final-20261021/initial-remote-readback.json"
+      "task_evidence": "verification/final-20261021/initial-remote-readback.json",
+      "remote_commit_sha": "a13929cde7e2720a57373e7d4fe24bdb896a5411"
     }
   }
 }
