@@ -167,7 +167,9 @@ The caller must then:
 1. Recheck actual task authority, caller/project identity, live capabilities,
    native worker policy and writer ownership. If metadata expired, prepare again.
 2. Invoke `collaboration.spawn_agent` with the exact returned model,
-   `reasoning_effort` and `fork_turns:none`, adding the bounded task name/message.
+   `reasoning_effort` and `fork_turns:none`. For hook-covered launches consume the
+   complete persisted `native_request` verbatim, including its carrier task name
+   and original message; do not append a preparation marker.
    Record the actual tool arguments and returned worker identity in a separate
    caller-owned consumption record tied to `preparation_id` and receipt identity.
 3. If sending or observing launch is uncertain, record uncertainty and reconcile
@@ -191,9 +193,9 @@ project binding; its pure `route` library performs no persistence or dispatch.
 New collaboration consumers use the bound shared command rather than treating
 the lower-level library as a project attestation.
 
-## Message-bound native hook
+## Versioned native task carrier
 
-For hook-covered launches add native_dispatch to the preparation request:
+For hook-covered launches add the exact declared task to the preparation request:
 
 ~~~json
 "native_dispatch": {
@@ -202,24 +204,53 @@ For hook-covered launches add native_dispatch to the preparation request:
 }
 ~~~
 
-The combined assessment context plus dispatch packet is bounded to 8192 UTF-8
-bytes. Jev sees the actual packet. The receipt stores its SHA-256 and task name,
-not the raw message. Append exactly one final line to the same message:
+The combined assessment context plus declared packet remains bounded to8192
+UTF-8 bytes. Jev assesses that exact declared task; it does not assess ciphertext.
+After successful private persistence the envelope returns a complete
+`native_request` containing task_name, message, model, reasoning_effort and
+fork_turns:none. Its message is the original supplied plaintext, with no appended
+marker. Its `native_task_name` is `cpi414_` followed by the lowercase hex encoding
+of the UTF-8 project-relative `work/<task>/.../jev-<id>.json` locator. Consume the
+entire exact packet; do not hand-assemble or shorten the carrier. Failed
+assessment/persistence withholds every callable packet/carrier copy.
+
+The private mode0600 receipt now retains that complete caller packet, including
+its declared plaintext. Keep it private; never publish it as generic evidence.
+`native_dispatch` separately records declared task_name and message_sha256.
+`native_transport` binds them to schema CPI414NATIVETRANSPORTV1, carrier
+`task_name_hex_locator`, the exact relative locator and the exact carrier name.
+The carrier reserves the cpi414_ prefix. It preserves Unicode filename spelling
+without normalization, URL encoding or a registry. Hex permits only the native
+schema's lowercase letters/digits/underscores. No advertised task_name length
+limit is exposed by the pinned schema, so this contract invents none. Actual
+long-name/handle acceptance remains UNPROVED until the original useful caller's
+separately authorized dispatch; source tests cannot establish it.
+
+The hook decodes only task_name. The platform may encrypt message; the hook
+neither decrypts it nor searches a carrier-mode message for a plaintext marker.
+It leaves observed opaque message bytes unchanged and requires the exact
+persisted carrier, declared binding and assessed pair/fork packet. This surface
+has no supported plaintext attestation: the declared plaintext hash is NOT an
+observed opaque-message hash. Pre/Post receipts keep those hashes separate,
+record plaintext_attestation:unavailable for carrier mode and require original
+caller useful-result acceptance for task semantics. A matching opaque hash only
+proves the same observable bytes reached these callbacks.
+
+Historical receipts without native_transport/native_request/native_task_name
+remain usable ONLY with their exact old task name and actually observable
+plaintext body followed by the exact final legacy marker line:
 
 ~~~text
 [CPI414 preparation=work/actual-task/jev-32lowercasehexcharacters.json]
 ~~~
 
-Use the actual project-relative receipt_path returned by preparation, preserving
-its exact Unicode spelling without normalization or URL encoding. Preparation
-and marker parsing accept legitimate Unicode, plus, parentheses and spaces in
-task directories. Both reject control characters (C0/C1, including tab, CR, LF
-and NEL), Unicode line/paragraph separators and surrogate scalars. Preparation
-refuses those paths before credential access, assessment or receipt persistence;
-the hook refuses them before reading a receipt. The marker ends at the final
-closing bracket with no trailing line break. Directory traversal components (..)
-refuse even when they resolve within the work tree. Existing root, symlink, private-file,
-task binding and single-consumption checks still apply.
+That body must hash to the original declared message. An opaque old-marker call
+cannot be reinterpreted as the new protocol; new versioned receipts cannot
+silently downgrade to a marker call. Old failed/expired/consumed attempts remain
+failures and are never replayed. Legacy marker spelling and final-line rules
+remain unchanged. Both forms retain control-character, traversal, symlink,
+private-file, task/project/caller/source and single-consumption checks. No
+surrogate/control/line separators or noncanonical carrier encodings are accepted.
 
 Do not add
 a preparation field to spawn arguments. The hook accepts only a private, owned,
@@ -281,15 +312,20 @@ and supported trust/reload APIs. Installation ships this entry but does not chan
 hooks, trust or global configuration. A 10-second callback deadline is appropriate
 only after validating source-check duration on that host.
 
-PreToolUse requires matching cwd/project, caller/session, exact task name and
-marker-excluded message, current capability snapshot (at most 60 seconds),
+PreToolUse requires matching cwd/project, caller/session and exact versioned
+declared-task/carrier binding (or exact historical plaintext marker body),
+current capability snapshot (at most60seconds),
 successful private receipt persistence and a permitted assessed pair. It reserves
 jev-<id>.consume.json exclusively before returning supported allow plus whole
 updatedInput with exact assessed model/effort and fork_turns:none, preserving
 task name/message. An existing reservation refuses another launch, including
 replay of the same session/turn/tool-use id. Missing preparation, unsupported
 arguments and caught failures return supported explicit deny with a nonempty
-sanitized reason. Receipt preparation alone never proves launch.
+stable sanitized reason such as native_carrier_invalid,
+native_transport_binding_mismatch, native_packet_pair_mismatch,
+native_capability_expired or native_dispatch_already_reserved. No raw task,
+opaque message, credential or arbitrary exception body is emitted. Receipt
+preparation alone never proves launch.
 
 PostToolUse requires the exact supplied model, reasoning_effort and fork_turns to
 match the prepared pair. It hashes the supplied whole argument object without
@@ -297,7 +333,10 @@ rewriting conflicting values, then checks that hash and the same
 session/turn/tool-use id against the original reservation before writing
 jev-<id>.result.json with an actually reported agent_id/agentId or
 explicit unknown result. A post callback may arrive after capability expiry;
-reserved identity must still agree. It never invents effective model/effort/usage
+reserved identity, declared-task/transport binding and exact applied opaque
+arguments must still agree. Carrier-mode PRE already requires the supplied pair
+and fork policy to match the complete packet; it does not substitute conflicting
+caller settings. Historical plaintext mode keeps its assessed-pair rewrite. It never invents effective model/effort/usage
 or caller acceptance. Malformed/missing post evidence requires reconciliation.
 Conflicting or missing applied settings produce reconciliation context without a
 handle receipt; the original pending reservation remains unchanged. Uncertain

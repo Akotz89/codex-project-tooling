@@ -242,7 +242,8 @@ def withhold_launch_arguments(result):
 
     def strip(value):
         if isinstance(value, dict):
-            for name in ('spawn_agent', 'dispatch_receipt', 'spawn_agent_request'):
+            for name in ('spawn_agent', 'dispatch_receipt', 'spawn_agent_request',
+                         'native_request', 'native_task_name', 'native_transport'):
                 value.pop(name, None)
             for nested in value.values():
                 strip(nested)
@@ -311,6 +312,12 @@ def prepare_subagent(request, root, caller_id, work_dir, *, transport=None):
                 'dispatch': 'not_invoked', 'result': 'not_observed', 'acceptance': 'not_performed',
                 'observed_model': None, 'observed_effort': None, 'worker_usage': None,
                 'before_dispatch': 'refresh caller metadata and verify project/caller identity; reconcile uncertain sends, never blind redispatch'}
+    if native is not None and result.get('status') in SUCCESS and 'spawn_agent' in result:
+        locator = path.relative_to(root).as_posix()
+        metadata['native_transport'] = native_transport_binding(locator, native)
+        metadata['native_task_name'] = metadata['native_transport']['task_name']
+        result['native_request'] = {'task_name': metadata['native_task_name'],
+                                    'message': packet['message'], **result['spawn_agent']}
     result.update(metadata)
     if 'dispatch_receipt' in result:
         result['dispatch_receipt'].update(metadata)
@@ -357,13 +364,45 @@ def sync_directory(directory):
 def native_dispatch_binding(packet):
     if (not isinstance(packet, dict) or set(packet) != {'task_name', 'message'}
             or not isinstance(packet['task_name'], str)
-            or not re.fullmatch(r'[a-z0-9_]{1,64}', packet['task_name'])
+            or not re.fullmatch(r'[a-z0-9_]+', packet['task_name'])
             or not isinstance(packet['message'], str) or not packet['message'].strip()
             or len(packet['message'].encode('utf8')) > 8192
             or '[CPI414 preparation=' in packet['message']):
         raise ValueError('exact native dispatch task name/message required')
     return {'task_name': packet['task_name'],
             'message_sha256': hashlib.sha256(packet['message'].encode('utf8')).hexdigest()}
+
+
+# The platform exposes task_name as an unencrypted lowercase/digit/underscore
+# string, with no declared length cap. Actual long-name acceptance is unproved.
+NATIVE_CARRIER_PREFIX = 'cpi414_'
+
+
+def native_carrier(locator):
+    locator = _receipt_path_text(locator)
+    path = Path(locator)
+    if (path.is_absolute() or '..' in path.parts or path.as_posix() != locator
+            or not re.fullmatch(r'work/.+/jev-[0-9a-f]{32}\.json', locator)):
+        raise ValueError('native_carrier_locator_invalid')
+    return NATIVE_CARRIER_PREFIX + locator.encode('utf8').hex()
+
+
+def native_carrier_locator(task_name):
+    if not isinstance(task_name, str) or not re.fullmatch(r'cpi414_[0-9a-f]+', task_name):
+        raise ValueError('native_carrier_invalid')
+    try:
+        locator = bytes.fromhex(task_name[len(NATIVE_CARRIER_PREFIX):]).decode('utf8')
+        if native_carrier(locator) != task_name:
+            raise ValueError('noncanonical carrier')
+    except (ValueError, UnicodeError):
+        raise ValueError('native_carrier_invalid') from None
+    return locator
+
+
+def native_transport_binding(locator, declared):
+    return {'schema': 'CPI414NATIVETRANSPORTV1', 'carrier': 'task_name_hex_locator',
+            'receipt_locator': locator, 'task_name': native_carrier(locator),
+            'declared_task': declared}
 
 
 def private_json(root, locator):

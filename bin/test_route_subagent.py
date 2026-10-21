@@ -565,7 +565,7 @@ class WorkerAdmissionTests(unittest.TestCase):
                 code = entry.main()
         return code, json.loads(output.getvalue())
 
-    def prepared_native(self, caller_prefix='native:', work='work/native'):
+    def prepared_native(self, caller_prefix='native:', work='work/native', carrier=False):
         request = copy.deepcopy(self.request)
         session_id = '01a15564-fd5f-7550-aadb-de6160ef7b5d'
         caller_id = caller_prefix + session_id
@@ -575,6 +575,19 @@ class WorkerAdmissionTests(unittest.TestCase):
                                      'message': 'Repair the bounded parser and run its regression checks.'}
         code, prepared, _ = RoutingTests.command(self, request, work=work, caller_id=caller_id)
         self.assertEqual(code, 0)
+        if not carrier:
+            # Historical plaintext fixture only; a new receipt cannot downgrade.
+            def historical(value):
+                if isinstance(value, dict):
+                    for key in ('native_request', 'native_task_name', 'native_transport'):
+                        value.pop(key, None)
+                    for child in value.values():
+                        historical(child)
+                elif isinstance(value, list):
+                    for child in value:
+                        historical(child)
+            historical(prepared)
+            Path(prepared['receipt_path']).write_text(json.dumps(prepared))
         message = request['native_dispatch']['message'] + '\n[CPI414 preparation=' + str(
             Path(prepared['receipt_path']).relative_to(self.a)) + ']'
         event = {'hook_event_name': 'PreToolUse', 'cwd': str(self.a),
@@ -582,6 +595,8 @@ class WorkerAdmissionTests(unittest.TestCase):
                  'tool_name': 'spawn_agent', 'tool_input': {'task_name': 'parser_fix',
                  'message': message, 'model': 'gpt-6.1-sol', 'reasoning_effort': 'high',
                  'fork_turns': 'all'}}
+        if carrier:
+            event['tool_input'] = {**prepared['native_request'], 'message': 'opaque:v1:8ab09f'}
         return prepared, event
 
     def hook(self, event):
@@ -1071,6 +1086,163 @@ class WorkerAdmissionTests(unittest.TestCase):
                 event['tool_name'] = tool
                 self.assertEqual(self.hook(event)['hookSpecificOutput']['permissionDecision'], 'allow')
 
+
+class EncryptedNativePreparationTests(unittest.TestCase):
+    setUp = RoutingTests.setUp
+    project = RoutingTests.project
+    bound_request = RoutingTests.bound_request
+    answer = RoutingTests.answer
+    prepared_native = WorkerAdmissionTests.prepared_native
+    hook = WorkerAdmissionTests.hook
+    assert_denied = WorkerAdmissionTests.assert_denied
+
+    def test_complete_packet_persisted_and_opaque_pre_post_hashes_are_distinct(self):
+        prepared, event = self.prepared_native(carrier=True, work='work/修復 + (review)')
+        packet=prepared['native_request'];path=Path(prepared['receipt_path'])
+        self.assertEqual(packet, {'task_name':prepared['native_task_name'],
+            'message':'Repair the bounded parser and run its regression checks.', **prepared['spawn_agent']})
+        self.assertRegex(packet['task_name'], r'^cpi414_[a-f0-9]+$')
+        self.assertGreater(len(packet['task_name']),64) # source only; actual native acceptance remains unknown
+        self.assertEqual(bridge.native_carrier_locator(packet['task_name']),path.relative_to(self.a).as_posix())
+        self.assertEqual(json.loads(path.read_text()),prepared)
+        self.assertEqual(path.stat().st_mode&0o777,0o600)
+        event['tool_input']['message']+='[CPI414 preparation=not_a_plaintext_locator]'
+        applied=self.hook(event)['hookSpecificOutput']['updatedInput'];self.assertEqual(applied,event['tool_input'])
+        record=json.loads(path.with_suffix('.consume.json').read_text())
+        hash_text=lambda v:__import__('hashlib').sha256(v.encode()).hexdigest()
+        self.assertEqual(record['declared_message_sha256'],hash_text(packet['message']))
+        self.assertEqual(record['observed_message_sha256'],hash_text(applied['message']))
+        self.assertNotEqual(record['declared_message_sha256'],record['observed_message_sha256'])
+        self.assertEqual(record['plaintext_attestation'],'unavailable')
+        self.assertNotIn(applied['message'],json.dumps(record))
+        post={**event,'hook_event_name':'PostToolUse','tool_input':applied,'tool_response':{'agent_id':'worker:offline-observed'}}
+        self.assertEqual(self.hook(post),{})
+        result=json.loads(path.with_suffix('.result.json').read_text())
+        self.assertEqual(result['native_handle'],'worker:offline-observed')
+        self.assertEqual(result['observed_post_arguments_sha256'],record['applied_arguments_sha256'])
+        self.assertEqual(result['observed_post_message_sha256'],record['observed_message_sha256'])
+        self.assertEqual(result['plaintext_attestation'],'unavailable')
+        self.assertIsNone(result['observed_effort']);self.assertEqual(result['acceptance'],'not_performed')
+
+    def test_carrier_grammar_paths_symlinks_and_private_files_refuse(self):
+        prepared,event=self.prepared_native(carrier=True);path=Path(prepared['receipt_path']);locator=path.relative_to(self.a).as_posix()
+        bad=['cpi414_','cpi414_AA','cpi414_0','cpi414_zz','cpi414_ff','cpi414_'+locator.encode().hex().upper()]
+        for value in [str(path),'work/../'+locator,'work//native/'+path.name,'work/../../b/'+locator,
+                      'other/native/'+path.name,'work/native/jev-'+'0'*32+'.json',
+                      'work/native/../native/'+path.name,'work/native/jev-'+'1'*32+'.json\n']:
+            bad.append('cpi414_'+value.encode().hex())
+        link=self.a/'work/link';link.symlink_to(path.parent,target_is_directory=True)
+        bad.append('cpi414_'+('work/link/'+path.name).encode().hex())
+        for name in bad:
+            invalid=copy.deepcopy(event);invalid['tool_input']['task_name']=name;self.assert_denied(self.hook(invalid))
+        hardlink=path.with_suffix('.hardlink');os.link(path,hardlink)
+        self.assert_denied(self.hook(event));hardlink.unlink()
+        path.chmod(0o644);self.assert_denied(self.hook(event));path.chmod(0o600)
+        original=path.with_suffix('.original');path.rename(original);path.symlink_to(original)
+        self.assert_denied(self.hook(event));path.unlink();original.rename(path)
+        self.assertFalse(path.with_suffix('.consume.json').exists())
+
+    def test_declared_task_transport_and_complete_packet_tampering_refuse(self):
+        prepared,event=self.prepared_native(carrier=True);path=Path(prepared['receipt_path'])
+        for mutate in [lambda r:r['native_dispatch'].update(task_name='another_task'),
+                       lambda r:r['native_dispatch'].update(message_sha256='0'*64),
+                       lambda r:r['native_transport'].update(schema='UNKNOWN'),
+                       lambda r:r['native_transport'].update(receipt_locator='work/foreign/receipt.json'),
+                       lambda r:r.update(native_task_name='another_task'),
+                       lambda r:r['native_request'].update(message='Different plaintext task'),
+                       lambda r:r['native_request'].update(model='gpt-6.1-sol'),
+                       lambda r:r['native_request'].update(extra='unsupported')]:
+            modified=copy.deepcopy(prepared);mutate(modified);path.write_text(json.dumps(modified));self.assert_denied(self.hook(event))
+        self.assertFalse(path.with_suffix('.consume.json').exists())
+
+    def test_caller_project_context_source_expiry_assessment_guards_remain(self):
+        prepared,event=self.prepared_native(carrier=True);path=Path(prepared['receipt_path'])
+        for mutate in [lambda e:e.update(session_id='foreign'),lambda e:e.update(cwd=str(self.b)),
+                       lambda e:e.pop('tool_use_id'),lambda e:e['tool_input'].update(extra='unsupported'),
+                       lambda e:e['tool_input'].update(message='')]:
+            invalid=copy.deepcopy(event);mutate(invalid);self.assert_denied(self.hook(invalid))
+        for mutate in [lambda r:r.update(caller_id='native:foreign'),lambda r:r.update(task_id=''),
+                       lambda r:r.update(project_binding=consumer.project_binding(self.b)),lambda r:r.update(source_binding={}),
+                       lambda r:r.update(capability_captured_at=time.time()-70),
+                       lambda r:r.update(status='refused'),lambda r:r.update(persistence={'status':'failed'}),
+                       lambda r:r['receipt'].update(attempts=0),lambda r:r['receipt'].update(assessments={}),
+                       lambda r:r['spawn_agent'].update(reasoning_effort='ultra')]:
+            modified=copy.deepcopy(prepared);mutate(modified);path.write_text(json.dumps(modified));self.assert_denied(self.hook(event))
+        path.write_text(json.dumps(prepared));(self.a/'.factory/project-context.md').write_text('Changed actual context')
+        self.assert_denied(self.hook(event));self.assertFalse(path.with_suffix('.consume.json').exists())
+
+    def test_exact_carrier_pair_fork_packet_and_single_reservation(self):
+        prepared,event=self.prepared_native(carrier=True);path=Path(prepared['receipt_path'])
+        for key,value in [('model','gpt-6.1-sol'),('reasoning_effort','ultra'),('fork_turns','all')]:
+            invalid=copy.deepcopy(event);invalid['tool_input'][key]=value;result=self.hook(invalid);self.assert_denied(result)
+            self.assertIn('native_packet_pair_mismatch',json.dumps(result))
+        self.assertEqual(self.hook(event)['hookSpecificOutput']['updatedInput'],event['tool_input'])
+        result=self.hook(event);self.assert_denied(result);self.assertIn('native_dispatch_already_reserved',json.dumps(result))
+        self.assertTrue(path.with_suffix('.consume.json').exists())
+
+    def test_failed_persistence_withholds_every_callable_packet_copy(self):
+        caller='native:01a15564-fd5f-7550-aadb-de6160ef7b5d';request=copy.deepcopy(self.request)
+        request['caller_id']=caller;request['capability_provenance']['caller_id']=caller
+        request['native_dispatch']={'task_name':'parser_fix','message':'Run the exact bounded parser repair.'}
+        with patch.object(bridge.os,'fsync',side_effect=OSError('secret must not escape')):
+            code,result,errors=RoutingTests.command(self,request,caller_id=caller)
+        self.assertEqual(code,1);self.assertEqual(result['status'],'refused');self.assertEqual(result['persistence']['status'],'failed')
+        for box in [result,result['receipt']]:
+            for key in ['spawn_agent','native_request','native_task_name','native_transport','dispatch_receipt','spawn_agent_request']:
+                self.assertNotIn(key,box)
+        self.assertNotIn('secret must not escape',json.dumps(result)+errors)
+
+    def test_post_opaque_identity_pair_refuse_but_exact_post_expiry_accepts(self):
+        prepared,event=self.prepared_native(carrier=True);path=Path(prepared['receipt_path'])
+        applied=self.hook(event)['hookSpecificOutput']['updatedInput']
+        post={**event,'hook_event_name':'PostToolUse','tool_input':applied,'tool_response':{'agent_id':'worker:observed'}}
+        reserved=path.with_suffix('.consume.json').read_bytes()
+        for mutate in [lambda e:e['tool_input'].update(message='changed opaque ciphertext'),
+                       lambda e:e['tool_input'].update(model='gpt-6.1-sol'),
+                       lambda e:e['tool_input'].update(fork_turns='all'),lambda e:e.update(turn_id='turn:foreign')]:
+            invalid=copy.deepcopy(post);mutate(invalid);result=self.hook(invalid)
+            self.assertIn('requires reconciliation',result['hookSpecificOutput']['additionalContext'])
+            self.assertFalse(path.with_suffix('.result.json').exists());self.assertEqual(path.with_suffix('.consume.json').read_bytes(),reserved)
+        with patch.object(native_hook.time,'time',return_value=prepared['capability_expires_at']+10):
+            self.assert_denied(self.hook(event));self.assertEqual(self.hook(post),{})
+        self.assertEqual(json.loads(path.with_suffix('.result.json').read_text())['native_handle'],'worker:observed')
+
+    def test_unknown_handle_and_safe_stable_refusal_diagnostics(self):
+        prepared,event=self.prepared_native(carrier=True);path=Path(prepared['receipt_path'])
+        applied=self.hook(event)['hookSpecificOutput']['updatedInput']
+        post={**event,'hook_event_name':'PostToolUse','tool_input':applied,'tool_response':{'task_name':'/root/unknown-native-handle'}}
+        self.assertEqual(self.hook(post),{});result=json.loads(path.with_suffix('.result.json').read_text())
+        self.assertEqual(result['status'],'unknown_native_result');self.assertIsNone(result['native_handle'])
+        self.assertIn('native_dispatch_already_reserved',json.dumps(self.hook(post)))
+        prepared,event=self.prepared_native(carrier=True)
+        with patch.object(native_hook,'persist_private',side_effect=OSError('private credential-like value')):result=self.hook(event)
+        self.assert_denied(result);self.assertIn('native_private_io_refused',json.dumps(result));self.assertNotIn('private credential-like value',json.dumps(result))
+
+    def test_legacy_plaintext_only_and_new_transport_never_downgrades(self):
+        prepared,event=self.prepared_native();opaque=copy.deepcopy(event);opaque['tool_input']['message']='opaque:v1:ciphertext'
+        self.assert_denied(self.hook(opaque));self.assertEqual(self.hook(event)['hookSpecificOutput']['permissionDecision'],'allow')
+        prepared,event=self.prepared_native(carrier=True);event['tool_input']['task_name']=prepared['native_dispatch']['task_name']
+        event['tool_input']['message']=prepared['native_request']['message']+'\n[CPI414 preparation='+str(Path(prepared['receipt_path']).relative_to(self.a))+']'
+        result=self.hook(event);self.assert_denied(result);self.assertIn('native_transport_mode_mismatch',json.dumps(result))
+
+    def test_copied_generated_adapters_reach_same_successor_without_launch(self):
+        import shutil
+        source=self.base/'copied-successor';shutil.copytree(BASE,source,ignore=shutil.ignore_patterns('.git','work','__pycache__'))
+        for args in [['init','-q'],['config','user.name','Offline fixture'],['config','user.email','fixture@example.invalid'],['add','runtime','template'],['commit','-qm','offline adapter fixture']]:
+            subprocess.run(['git',*args],cwd=source,check=True,capture_output=True)
+        spec=importlib.util.spec_from_file_location('offline_adapter_smoke',source/'runtime/adapter.py')
+        adapters=importlib.util.module_from_spec(spec);spec.loader.exec_module(adapters)
+        bound=adapters.binding(source,consumer.project_binding(self.a))
+        for name in ['jev_prepared_bridge','native_hook']:
+            path=self.a/'factory'/(name+'.py');path.parent.mkdir(exist_ok=True)
+            path.write_bytes(adapters.render('factory/'+name+'.py',bound))
+            module_spec=importlib.util.spec_from_file_location('offline_installed_'+name,path)
+            module=importlib.util.module_from_spec(module_spec);sys.modules[module_spec.name]=module;module_spec.loader.exec_module(module)
+            target=sys.modules[module_spec.name];self.assertEqual(target.SHARED_SOURCE,source)
+            if name=='jev_prepared_bridge':
+                locator='work/task/jev-'+'1'*32+'.json';self.assertEqual(target.native_carrier_locator(target.native_carrier(locator)),locator)
+            else:self.assertIn('native_transport_binding_mismatch',target.REFUSAL_REASONS)
+        self.assertEqual(adapters.source_digest(source),bound['digest'])
 
 if __name__ == '__main__':
     unittest.main()

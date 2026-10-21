@@ -1,4 +1,4 @@
-"""Development adapter for the maintained assessment-first runtime; installed adapters bind exact source/project."""
+"""Development adapter for the versioned native carrier runtime; installed adapters bind exact source/project."""
 import importlib.util as _util
 from pathlib import Path as _Path
 import sys as _sys
