@@ -16,10 +16,12 @@
         "ack",
         "result",
         "reconcile",
+        "retire",
         "recover",
         "status",
         "rebind",
-        "summary"
+        "summary",
+        "register"
       ]
     },
     "event_id": {
@@ -56,7 +58,10 @@
       "type": "string"
     },
     "worker": {
-      "$ref": "#/$defs/worker_role"
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9_-]*$"
     },
     "state": {
       "enum": [
@@ -87,6 +92,9 @@
       "type": "integer",
       "minimum": 1,
       "maximum": 100
+    },
+    "expected_workers": {
+      "$ref": "#/$defs/project/properties/workers"
     }
   },
   "$defs": {
@@ -124,13 +132,13 @@
         "workers": {
           "type": "object",
           "minProperties": 1,
-          "propertyNames": {
-            "$ref": "#/$defs/worker_role"
+          "patternProperties": {
+            "^[a-z][a-z0-9_-]{0,63}$": {
+              "type": "string",
+              "minLength": 1
+            }
           },
-          "additionalProperties": {
-            "type": "string",
-            "minLength": 1
-          }
+          "additionalProperties": false
         }
       }
     },
@@ -161,7 +169,10 @@
           "minLength": 1
         },
         "worker": {
-          "$ref": "#/$defs/worker_role"
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-z][a-z0-9_-]*$"
         },
         "prompt": {
           "type": "string",
@@ -212,10 +223,73 @@
         }
       }
     },
-    "worker_role": {
-      "type": "string",
-      "pattern": "^[a-z][a-z0-9_-]{0,63}(?![\\s\\S])",
-      "maxLength": 64
+    "projectPolicy": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "project_id",
+        "root",
+        "worker_registrations",
+        "legacy_leaseless_beads"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "project_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "root": {
+          "type": "string",
+          "minLength": 1
+        },
+        "worker_registrations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "worker",
+              "thread_id"
+            ],
+            "properties": {
+              "worker": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": "^[a-z][a-z0-9_-]*$"
+              },
+              "thread_id": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "legacy_leaseless_beads": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "beads_id",
+              "assignee"
+            ],
+            "properties": {
+              "beads_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+              },
+              "assignee": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
     }
   },
   "allOf": [
@@ -369,6 +443,49 @@
       "if": {
         "properties": {
           "op": {
+            "const": "retire"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "event_id",
+          "task_id",
+          "source_digest",
+          "scope_digest",
+          "quiescent",
+          "evidence",
+          "project_id",
+          "root"
+        ],
+        "properties": {
+          "task_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "source_digest": {
+            "type": "string",
+            "minLength": 1
+          },
+          "scope_digest": {
+            "type": "string",
+            "minLength": 1
+          },
+          "quiescent": {
+            "const": true
+          },
+          "evidence": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "op": {
             "const": "status"
           }
         }
@@ -428,6 +545,49 @@
           "project_id",
           "root"
         ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "op": {
+            "const": "register"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "event_id",
+          "project_id",
+          "root",
+          "worker",
+          "new_thread_id",
+          "expected_workers",
+          "evidence"
+        ],
+        "properties": {
+          "evidence": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          },
+          "new_thread_id": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "propertyNames": {
+          "enum": [
+            "op",
+            "event_id",
+            "project_id",
+            "root",
+            "worker",
+            "new_thread_id",
+            "expected_workers",
+            "evidence"
+          ]
+        }
       }
     }
   ]

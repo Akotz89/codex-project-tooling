@@ -20,6 +20,7 @@ class State(TypedDict, total=False):
     model: dict
     event: dict
     response: dict
+    project_policy: dict
 
 
 class InvalidEvent(ValueError):
@@ -39,10 +40,57 @@ def worker_role(value):
     return isinstance(value, str) and re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", value) is not None
 
 
+def native_thread_id(value):
+    return string(value) and value == value.strip() and "\0" not in value
+
+
+def validate_project_policy(policy, binding):
+    fields = {"schema_version", "project_id", "root", "worker_registrations", "legacy_leaseless_beads"}
+    require(isinstance(policy, dict) and set(policy) == fields,
+            "project policy requires exactly the documented fields")
+    require(type(policy["schema_version"]) is int and policy["schema_version"] == 1,
+            "unsupported project policy schema")
+    require(string(policy["project_id"]) and policy["project_id"] == binding["project_id"],
+            "project policy identity mismatch")
+    require(string(policy["root"]) and Path(policy["root"]).is_absolute(),
+            "project policy root must be absolute")
+    try:
+        require(Path(policy["root"]).resolve(strict=True) == Path(binding["root"]).resolve(strict=True),
+                "project policy root mismatch")
+    except (OSError, RuntimeError) as exc:
+        raise InvalidEvent("project policy root is unavailable") from exc
+    registrations = policy["worker_registrations"]
+    require(isinstance(registrations, list), "worker_registrations must be a list")
+    roles, thread_ids = set(), set()
+    for item in registrations:
+        require(isinstance(item, dict) and set(item) == {"worker", "thread_id"},
+                "worker registration policy requires worker and thread_id")
+        role, thread_id = item["worker"], item["thread_id"]
+        require(worker_role(role) and native_thread_id(thread_id),
+                "invalid worker registration policy")
+        require(role not in roles and thread_id not in thread_ids, "duplicate worker registration policy")
+        roles.add(role)
+        thread_ids.add(thread_id)
+    legacy = policy["legacy_leaseless_beads"]
+    require(isinstance(legacy, list), "legacy_leaseless_beads must be a list")
+    pairs = set()
+    for item in legacy:
+        require(isinstance(item, dict) and set(item) == {"beads_id", "assignee"},
+                "legacy Beads policy requires beads_id and assignee")
+        bead_id, assignee = item["beads_id"], item["assignee"]
+        require(isinstance(bead_id, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", bead_id),
+                "invalid legacy Beads ID")
+        require(native_thread_id(assignee),
+                "invalid legacy Beads assignee")
+        require((bead_id, assignee) not in pairs, "duplicate legacy Beads policy")
+        pairs.add((bead_id, assignee))
+    return policy
+
+
 def validate_event(event):
     require(isinstance(event, dict), "event must be an object")
     op = event.get("op")
-    require(isinstance(op, str) and op in {"init", "add", "observe", "prepare", "issue", "ack", "result", "reconcile", "status", "recover", "rebind", "summary"}, "invalid event op")
+    require(isinstance(op, str) and op in {"init", "add", "observe", "prepare", "issue", "ack", "result", "reconcile", "retire", "status", "recover", "rebind", "register", "summary"}, "invalid event op")
     if op not in {"status", "recover", "summary"}:
         require(string(event.get("event_id")), "event_id required")
     if op == "init":
@@ -51,8 +99,9 @@ def validate_event(event):
         for field in ("root", "project_id", "linear_ref", "beads_ref", "coordinator_thread_id"):
             require(string(project.get(field)), f"project.{field} required")
         workers = project.get("workers")
-        require(isinstance(workers, dict) and bool(workers) and all(worker_role(role) for role in workers), "workers must bind nonempty safe role names")
-        require(all(string(value) for value in workers.values()), "worker thread IDs must be strings")
+        require(isinstance(workers, dict) and bool(workers) and all(worker_role(role) for role in workers),
+                "workers must bind nonempty safe role names")
+        require(all(native_thread_id(value) for value in workers.values()), "worker thread IDs must be nonempty exact strings")
     else:
         require(string(event.get("project_id")) and string(event.get("root")), "project_id and root required")
     if op == "add":
@@ -65,20 +114,33 @@ def validate_event(event):
         require(worker_role(task["worker"]), "invalid worker role")
         for field in ("dependencies", "writer_paths"):
             require(isinstance(task[field], list) and all(string(value) for value in task[field]), f"task.{field} must be a list of nonempty strings")
-    if op in {"observe", "rebind"}:
-        require(worker_role(event.get("worker")), "invalid worker role")
     if op == "summary":
         require(type(event.get("offset", 0)) is int and event.get("offset", 0) >= 0, "invalid status offset")
         require(type(event.get("limit", 50)) is int and 1 <= event.get("limit", 50) <= 100, "invalid status limit")
+    if op == "register":
+        require(set(event) == {"op", "event_id", "project_id", "root", "worker", "new_thread_id", "expected_workers", "evidence"}, "register requires exactly the documented fields")
+        require(worker_role(event.get("worker")), "register requires a valid worker role")
+        require(native_thread_id(event.get("new_thread_id")),
+                "register requires a worker thread ID")
+        workers = event.get("expected_workers")
+        require(isinstance(workers, dict) and bool(workers) and all(worker_role(role) for role in workers)
+                and all(native_thread_id(value) for value in workers.values()), "expected_workers must bind safe worker roles")
+        require(string(event.get("evidence")) and event["evidence"].strip(), "registration evidence reference required")
     if op == "rebind":
+        require(worker_role(event.get("worker")), "invalid worker role")
         for field in ("worker", "expected_old_thread_id", "new_thread_id", "evidence"):
             require(string(event.get(field)), f"{field} required")
     if op == "observe":
-        require(string(event.get("worker")), "worker required")
+        require(worker_role(event.get("worker")), "invalid worker role")
         require(event.get("state") in ("IDLE", "BUSY", "UNKNOWN"), "invalid worker state")
         require(string(event.get("evidence")), "observation evidence reference required")
     if op in {"prepare", "issue", "ack", "result", "reconcile"}:
         require(string(event.get("task_id")), "task_id required")
+    if op == "retire":
+        require(string(event.get("task_id")), "task_id required")
+        require(string(event.get("source_digest")) and string(event.get("scope_digest")), "source_digest and scope_digest required")
+        require(event.get("quiescent") is True, "retire requires explicit quiescence confirmation")
+        require(string(event.get("evidence")) and event["evidence"].strip(), "retirement evidence reference required")
     if op in {"issue", "ack", "result", "reconcile"}:
         require(string(event.get("dispatch_id")), "dispatch_id required")
     if op == "prepare":
@@ -244,6 +306,7 @@ def transition(state):
     validate_event(event)
     op = event["op"]
     response = {"action": "OK"}
+    project_policy = state.get("project_policy")
     if op not in {"status", "recover", "summary"}:
         require(isinstance(event.get("event_id"), str) and event["event_id"], "event_id required")
         event_hash = hashlib.sha256(json.dumps(event, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -256,8 +319,12 @@ def transition(state):
         project["root"] = str(Path(project["root"]).resolve(strict=True))
         for field in ("project_id", "linear_ref", "beads_ref", "coordinator_thread_id"):
             require(isinstance(project.get(field), str) and project[field], f"project.{field} required")
+        require(isinstance(project["workers"], dict) and bool(project["workers"])
+                and all(worker_role(role) for role in project["workers"]),
+                "workers must bind nonempty safe role names")
         ids = list(project["workers"].values()) + [project["coordinator_thread_id"]]
-        require(len(set(ids)) == len(ids), "distinct native thread IDs required")
+        require(all(native_thread_id(value) for value in ids) and len(set(ids)) == len(ids),
+                "worker and coordinator thread IDs must be nonempty and distinct")
         if model:
             require(model["project"] == project, "database already bound to a different project")
         else:
@@ -268,7 +335,7 @@ def transition(state):
         require(str(Path(event.get("root", "")).resolve()) == model["project"]["root"], "root binding mismatch")
         # An earlier ISSUING transition may have exposed a tool request. Never repeat it.
         for task in model["tasks"].values():
-            if op != "rebind" and task["status"] == "ISSUING":
+            if op not in {"rebind", "register"} and task["status"] == "ISSUING":
                 task["status"] = "UNKNOWN"
                 task["reason"] = "native send uncertain; reconcile retained receipts"
         if op == "add":
@@ -286,6 +353,31 @@ def transition(state):
             task.update(status="WAIT", lease=False)
             model["tasks"][task["id"]] = task
             reject_cycles(model["tasks"])
+        elif op == "register":
+            policy = validate_project_policy(project_policy, event)
+            require(any(item["worker"] == event["worker"] and item["thread_id"] == event["new_thread_id"]
+                        for item in policy["worker_registrations"]),
+                    "registration is not authorized by project policy")
+            bindings = model["project"]["workers"]
+            require(event["worker"] not in bindings and event["worker"] not in model["workers"],
+                    "worker already bound or observed")
+            require(bindings == event["expected_workers"], "expected worker bindings mismatch")
+            require(event["new_thread_id"] not in [*bindings.values(), model["project"]["coordinator_thread_id"]], "registered thread must be distinct")
+            before = json.dumps(model, sort_keys=True, separators=(",", ":")).encode()
+            bindings[event["worker"]] = event["new_thread_id"]
+            model["workers"][event["worker"]] = {"state": "UNKNOWN", "evidence": event["evidence"]}
+            protected = copy.deepcopy(model)
+            del protected["project"]["workers"][event["worker"]]
+            del protected["workers"][event["worker"]]
+            after = json.dumps(protected, sort_keys=True, separators=(",", ":")).encode()
+            require(before == after, "registration changed protected coordinator state")
+            response = {"action": "REGISTERED", "worker": event["worker"], "new_thread_id": event["new_thread_id"],
+                        "preservation": {"before_sha256": hashlib.sha256(before).hexdigest(),
+                                         "after_sha256": hashlib.sha256(after).hexdigest(),
+                                         "task_count": len(protected["tasks"]),
+                                         "worker_binding_count": len(protected["project"]["workers"]),
+                                         "worker_observation_count": len(protected["workers"]),
+                                         "event_count": len(protected["events"])}}
         elif op == "rebind":
             worker = event["worker"]
             bindings = model["project"]["workers"]
@@ -308,9 +400,22 @@ def transition(state):
             require(event["state"] in {"IDLE", "BUSY", "UNKNOWN"}, "invalid worker state")
             require(isinstance(event.get("evidence"), str) and event["evidence"], "observation evidence reference required")
             model["workers"][worker] = {"state": event["state"], "evidence": event["evidence"]}
+        elif op == "retire":
+            require(event.get("task_id") in model["tasks"], "unknown task_id")
+            task = model["tasks"][event["task_id"]]
+            require(event["source_digest"] == task["source_digest"] and event["scope_digest"] == task["scope_digest"], "source/scope identity mismatch")
+            require(task["status"] in {"WAIT", "READY"} and task.get("dispatch_id") is None
+                    and task.get("dispatch_thread_id") is None and task.get("lease") is False,
+                    "retire requires a never-dispatched WAIT/READY task without a lease")
+            task.update(status="RETIRED", lease=False, retirement={
+                "event_id": event["event_id"], "source_digest": event["source_digest"],
+                "scope_digest": event["scope_digest"], "quiescent": True, "evidence": event["evidence"]})
+            response = {"action": "RETIRED", "task_id": task["id"], "status": task["status"], "lease": False}
         elif op in {"prepare", "issue", "ack", "result", "reconcile"}:
             require(event.get("task_id") in model["tasks"], "unknown task_id")
             task = model["tasks"][event["task_id"]]
+            if op in {"prepare", "issue"}:
+                require(task["status"] != "RETIRED", "retired task cannot be prepared or issued; use a new task identity")
             if op == "prepare":
                 require(event.get("source_digest") == task["source_digest"] and event.get("scope_digest") == task["scope_digest"], "source/scope identity mismatch; no reuse or dispatch")
                 if task["status"] == "COMPLETE":
@@ -385,6 +490,8 @@ def transition(state):
 
 def compute_readiness(state):
     model = copy.deepcopy(state["model"])
+    if state.get("event", {}).get("op") == "register":
+        return {"model": model}
     for task in model["tasks"].values():
         if task["status"] in {"WAIT", "READY"}:
             task["reasons"] = readiness(model, task)
@@ -402,13 +509,24 @@ def build_graph(saver):
     return builder.compile(checkpointer=saver)
 
 
-def apply_event(db, event):
+def apply_event(db, event, *, guard_context=None, project_policy=None):
     """Commit all checkpoints synchronously before returning any native intent.
 
     Safe to kill the caller after this returns: subsequent calls never return the
-    same native request. No promise of exactly-once delivery across MCP transport.
+    same native request. New reservations/issue intents require native Beads
+    guard_context; historical replay/reuse/reconciliation does not. No promise
+    of exactly-once delivery across MCP transport.
     """
     validate_event(event)
+    if project_policy is not None:
+        binding = event["project"] if event["op"] == "init" else event
+        validate_project_policy(project_policy, binding)
+    if event["op"] == "register":
+        validate_project_policy(project_policy, event)
+    if guard_context is not None:
+        require(event["op"] in {"prepare", "issue"}, "Beads guard supports prepare and issue only")
+        require(isinstance(guard_context, dict) and set(guard_context) == {"beads_dir", "assignee", "executable"},
+                "Beads guard context requires exactly beads_dir, assignee and executable")
     db = Path(db).resolve()
     if event["op"] == "summary":
         return read_status(db, event)
@@ -422,16 +540,38 @@ def apply_event(db, event):
             config = {"configurable": {"thread_id": "project-coordinator-v1"}}
             snapshot = graph.get_state(config)
             resumed = bool(snapshot.next)
-            require(not (resumed and event["op"] == "rebind"), "pending checkpoint; recover and reconcile before rebind")
+            require(not (resumed and event["op"] in {"rebind", "register", "prepare", "issue"}), "pending checkpoint; recover and reconcile before prepare/issue/rebind/register")
             if resumed:
                 graph.invoke(None, config, durability="sync")
             # Validate before recording input: an invalid event cannot poison recovery.
             before = graph.get_state(config).values
-            candidate = transition({"model": before.get("model", {}), "event": event})
-            compute_readiness(candidate)
-            state = graph.invoke({"event": event}, config, durability="sync")
+            candidate = transition({"model": before.get("model", {}), "event": event,
+                                    "project_policy": project_policy})
+            compute_readiness({**candidate, "event": event})
+            guard = None
+            inputs = {"event": event}
+            if event["op"] == "register":
+                inputs["project_policy"] = project_policy
+            if event["op"] in {"prepare", "issue"} and candidate["response"]["action"] != "REPLAY":
+                task = before["model"]["tasks"][event["task_id"]]
+                # Readiness may change externally between preview and commit; gate the stable dispatch state.
+                if (event["op"] == "prepare" and not task.get("dispatch_id")) or (event["op"] == "issue" and task["status"] == "PREPARED"):
+                    require(guard_context is not None, "new prepare/issue requires explicit Beads guard context")
+                    from .beads import check_beads
+                    guard = check_beads(db, event, project_policy=project_policy, **guard_context)
+                    claim = {field: guard[field] for field in ("beads_id", "assignee", "linear_ref")}
+                    if event["op"] == "issue":
+                        require(task.get("beads_claim") == claim,
+                                "prepared Beads claim missing or changed; explicit Root reconciliation required")
+                    else:
+                        # The input checkpoint must retain the pin even if preparation is interrupted.
+                        inputs["model"] = copy.deepcopy(before["model"])
+                        inputs["model"]["tasks"][event["task_id"]]["beads_claim"] = claim
+            state = graph.invoke(inputs, config, durability="sync")
             conn.commit()
             response = copy.deepcopy(state["response"])
+            if guard is not None:
+                response["beads_preflight"] = guard
             response["checkpoint_id"] = graph.get_state(config).config["configurable"]["checkpoint_id"]
             if event["op"] == "issue" and response["action"] == "ISSUING":
                 task = state["model"]["tasks"][event["task_id"]]
@@ -484,7 +624,8 @@ def compact_status(state, event, checkpoint_id=None, pending=()):
     uncertain = sum(bool(t.get("lease")) and t["status"] in {"ISSUING", "UNKNOWN", "FAILED"} for t in tasks)
     return {"action": "OK", "checkpoint_id": checkpoint_id,
             "project": bounded(project, "project"),
-            "workers": bounded({k: {"state": model["workers"][k]["state"]} for k in sorted(roles) if k in model["workers"]}, "workers"),
+            "workers": bounded({k: {"state": model["workers"][k]["state"]}
+                                 for k in sorted(roles) if k in model["workers"]}, "workers"),
             "tasks": page, "resumed_checkpoint": False, "recovery_required": bool(pending) or bool(uncertain),
             "pending_checkpoint": bool(pending), "uncertain_held_dispatches": uncertain,
             "bounds": {"offset": offset, "limit": limit, "total_tasks": len(tasks),
@@ -500,6 +641,8 @@ def read_status(db, event):
         conn.execute("PRAGMA query_only=ON")
         conn.execute("BEGIN")
         saver = SqliteSaver(conn)
+        # Setup normally detects this legacy schema, but a summary must never migrate it.
+        saver._has_task_path = any(row[1] == "task_path" for row in conn.execute("PRAGMA table_info(writes)"))
         saver.is_setup = True
         graph = build_graph(saver)
         snapshot = graph.get_state({"configurable": {"thread_id": "project-coordinator-v1"}})

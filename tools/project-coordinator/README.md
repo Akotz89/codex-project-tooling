@@ -2,15 +2,15 @@
 
 Local LangGraph StateGraph (`transition → readiness`) with synchronous SqliteSaver checkpoints and one exclusive flock per database. Linear owns plan/scope/dependencies; these inputs are observations from the coordinator. Beads references are mandatory. No daemon, native app endpoint, LLM, or provider calls.
 
-Run `uv sync --locked --project tools/project-coordinator` then `scripts/project-coordinator --db work/<run>/state/coordinator.sqlite COMMAND --input EVENT.json`. Every command outputs compact JSON; errors exit 2. Import `project_coordinator.apply_event(db,event)` with the same contract plus `op`.
+Run `uv sync --locked` then `project-coordinator --db work/<run>/state/coordinator.sqlite COMMAND --input EVENT.json`. Every command outputs compact JSON; errors exit 2. Import `project_coordinator.apply_event(db,event, *, guard_context=None, project_policy=None)` with the same contract plus `op`; new prepare/issue transitions require the explicit guard context below.
 
 ## Exact event contract
 
 Every mutating command requires a unique `event_id` string. Identical event IDs and canonical payloads return REPLAY; altered payloads with the same ID are rejected. A replay never exposes native arguments again. Status/summary/recover need no event ID.
 
-`init`: `{ "event_id":"init-1", "project": { "project_id": "example-project", "root": "/absolute/canonical/project", "linear_ref": "https://linear.app/...", "beads_ref": "global:execution-id", "coordinator_thread_id": "actual-root-thread", "workers": {"implementer":"implementation-thread", "reviewer":"review-thread"} } }`
+`init`: `{ "event_id":"init-1", "project": { "project_id": "P-example", "root": "/absolute/canonical/project", "linear_ref": "https://linear.app/...", "beads_ref": "global:execution-id", "coordinator_thread_id": "actual-root-thread", "workers": {"implementer":"implementation-thread", "reviewer":"review-thread"} } }`. The nonempty worker map is project supplied; every key must match the safe role-name pattern and every thread ID must be distinct.
 
-All other commands require common binding `{ "project_id":"example-project", "root":"/absolute/canonical/project" }` plus:
+All other commands require common binding `{ "project_id":"P-example", "root":"/absolute/canonical/project" }` plus:
 
 | Command | Additional fields |
 | --- | --- |
@@ -21,11 +21,73 @@ All other commands require common binding `{ "project_id":"example-project", "ro
 | ack | `task_id`, `dispatch_id`, `receipt:{path,sha256}` pointing at actual native MCP acknowledgement JSON |
 | result | `task_id`, `dispatch_id`, `receipt:{path,sha256}` pointing at normalized result below |
 | reconcile | `task_id`, `dispatch_id`, `quiescent:true`, `evidence:"observed stopped/no pending send reference"`; abandons PREPARED/UNKNOWN/ACKNOWLEDGED/FAILED work as FAILED and releases lease; late results for a released dispatch are rejected |
+| retire | `task_id`, exact `source_digest` and `scope_digest`, `quiescent:true`, `evidence`; only a never-dispatched WAIT/READY task with no dispatch binding or lease can become terminal RETIRED |
+| register | `worker`, `new_thread_id`, the complete `expected_workers` map, and `evidence`; additive compare-and-swap registration requires an explicit project policy |
 | rebind | `worker`, `expected_old_thread_id`, `new_thread_id`, `evidence`; compare-and-swap replacement, requiring no held/uncertain dispatch and no observed BUSY worker |
 | summary | common binding; optional `offset` (default0), `limit` (default50, max100) |
 | status / recover | common binding only; existing full response/recovery semantics |
 
 Every input is a JSON object, not a JSON string. CLI command supplies `op`. Inputs and receipts must contain no credentials or full logs.
+
+`retire` preserves the task and its original source/scope identity, records the event and evidence reference, and leaves dependents blocked because only COMPLETE satisfies a dependency. It rejects any task outside WAIT/READY or with a dispatch ID, pinned dispatch thread, or lease. The event must match the bound project/root and exact task digests, and explicitly set `quiescent:true`; the caller must ensure its evidence reference supports that claim. Retired IDs cannot be prepared or issued again, and `add` cannot replace them; replacement work uses a distinct task ID.
+
+Canonical retirement is Root-controlled. Construct the input from the current authoritative queued state and run it only against the existing canonical coordinator database:
+
+```text
+project-coordinator --db work/<run>/state/coordinator.sqlite retire --input work/<run>/retire.json
+```
+
+The input contains the existing `project_id` and canonical `root`, the queued `task_id`, its exact `source_digest` and `scope_digest`, `quiescent:true`, a unique `event_id`, and a nonempty `evidence` reference. For example:
+
+```json
+{
+  "event_id": "retire-<unique-id>",
+  "project_id": "<bound-project-id>",
+  "root": "<canonical-project-root>",
+  "task_id": "<queued-task-id>",
+  "source_digest": "<current-task-source-digest>",
+  "scope_digest": "<current-task-scope-digest>",
+  "quiescent": true,
+  "evidence": "work/<run>/retirement-evidence.json"
+}
+```
+
+The candidate tests use isolated temporary databases; they do not apply retirement to the canonical graph.
+
+## Mandatory live Beads ownership and lease guard
+
+For new work, use the guarded `prepare` and `issue` path with the same three explicit flags on **both** commands:
+
+```text
+scripts/project-coordinator --db work/<run>/state/coordinator.sqlite prepare --input PREPARE.json --beads-dir /absolute/global/.beads --beads-assignee 'codex:<coordinator-thread>:<task>' --bd-executable /absolute/path/to/bd
+scripts/project-coordinator --db work/<run>/state/coordinator.sqlite issue --input ISSUE.json --beads-dir /absolute/global/.beads --beads-assignee 'codex:<coordinator-thread>:<task>' --bd-executable /absolute/path/to/bd
+```
+
+The linked execution record must already have been claimed through the supported Beads operation and read back. Its exact `assignee` is the execution actor; the Beads `owner` field is not an executor claim. The task's `beads_ref` accepts `global:<exact-id>` or a canonical `global-...` ID. No search, prefix lookup or automatic record creation is used.
+
+At the public `apply_event` mutation boundary, a prepare attempt without an existing dispatch or an issue attempt on a PREPARED task requires guard context, except for event replay. This also applies when readiness currently reports WAIT: external readiness can change between the preview and graph commit, so the guard checks stable dispatch state under the lock. CLI forwards its three flags; Python callers supply the same explicit mapping:
+
+```python
+apply_event(db, event, guard_context={
+    "beads_dir": "/absolute/global/.beads",
+    "assignee": "codex:<coordinator-thread>:<task>",
+    "executable": "/absolute/path/to/bd",
+})
+```
+
+Under the existing exclusive database lock and before checkpointing the event, the guard reads the task binding through query-only summary and executes `bd --readonly --global show <exact-id> --json` twice, setting `BEADS_DIR` to the supplied directory and `BEADS_DOLT_SHARED_SERVER=1`. Both observations must have exactly one matching ID, exact task `linear_ref`, `in_progress` status and exact supplied assignee. Identity, ownership, status, Linear binding, revision (when returned), heartbeat and expiry must agree between observations. The final observation must have timezone-aware parseable `heartbeat_at` and `lease_expires_at` satisfying `heartbeat_at <= current time < lease_expires_at` and `heartbeat_at < lease_expires_at`. No arbitrary lease lifetime or heartbeat age limit is added.
+
+Legacy records without heartbeat and expiry qualify for `LEGACY_LEASELESS` only when the exact Beads ID and assignee pair appears in the explicitly supplied project policy. The policy must match both the bound `project_id` and canonical `root`; there are no generic legacy-ID or actor defaults. Any partial, malformed or expired lease refuses dispatch, including an otherwise authorized legacy pair.
+
+Missing guard context, unclaimed/transferred/closed records, malformed output, expired/future/invalid lease evidence, backend errors and ambiguous/truncated bindings stop a new reservation/request before checkpointing. Pending coordinator checkpoints require explicit `recover` before `prepare` or `issue`; those commands never implicitly resume pending input. All three CLI flags are required together and accepted only for `prepare` and `issue`. Python guard context requires exactly the three documented keys. REPLAY, REUSE and RECONCILE outcomes for existing work require no new guard and never expose a new native envelope. Ack/result/recover/retire and normal status/summary preserve their existing history and leases without Beads lookup.
+
+A new guarded prepare pins the verified Beads ID, exact assignee and Linear reference as internal `beads_claim` evidence through the existing model input channel, using a copy of the pre-transition model. The external event and its replay hash remain unchanged. The input checkpoint contains the pin before preparation runs; interruption recovery retains it rather than returning an unbound reservation as safely issuable. A WAIT attempt can retain an observation but has no reservation; a later new prepare pins its own newly verified identity. An existing reservation's pin is never replaced by prepare/replay.
+
+Issue compares its fresh verified identity against that reservation pin. A transfer to another actor refuses issue even if that new actor supplies matching live guard context. Same-owner heartbeat/expiry/revision renewal can pass because those changing values are rechecked live, rather than pinned as identity. Historical PREPARED entries without a pin fail closed for new issue and retain their lease/history pending explicit Root reconciliation; recovery does not invent a binding or release them. No new graph schema, version or checkpoint node is introduced. The remaining external observation-to-commit race is unchanged.
+
+A successful new reservation/issue adds compact `beads_preflight` evidence with coordinator checkpoint ID, UTC heartbeat, expiry and observation time, plus `LEASED` or `LEGACY_LEASELESS` mode. This reports stored renewal evidence; this read-only guard never renews or mutates Beads. The exact native owner performs supported heartbeat/renewal and verifies the resulting expiry externally. The guard creates no graph schema, scheduler or mirrored tracker and sends no native request itself.
+
+The native local store remains trusted within the existing tool boundary; these observations are not cryptographic authentication. The coordinator lock cannot make Beads and the graph atomic: ownership may transfer after the final native observation and before graph commit. Every new `issue` checks again, and callers must still honor workers, writer leases and accepted BMAD/Linear scope.
 
 `prepare` durably reserves PREPARED, returning its dispatch ID. `issue` writes ISSUING synchronously before returning one `native_request:{tool,arguments}` for assistant execution. Execute its exact prompt/target with the supported native tool, save the actual tool response, then `ack`. A supported acknowledgement can be just `{"threadId":"..."}` or MCP `content:[{type:"text",text:"{\"threadId\":\"...\"}"}]`; no unavailable call ID is required. A queued acknowledgement only means ACKNOWLEDGED.
 
@@ -48,7 +110,7 @@ Result receipt is a small normalization of actual retained native/child evidence
 
 The hashed native final evidence must include the target thread and exact dispatch marker. The coordinator/operator checks its meaning and faithfully normalizes terminal quiescence, explicit child outcome, acceptance and artifact claims; this runtime verifies bindings, hashes and strict boolean/integer fields. It cannot authenticate a fabricated local receipt. Wrapper exit 0 is never a child exit. Missing artifacts, drift, failed child or nonterminal results never COMPLETE. FAILED/UNKNOWN retains its writer/worker lease unless terminal quiescence is explicitly evidenced. COMPLETE requires verified terminal quiescence and releases the lease and `prepare` returns REUSE after hashing retained artifacts again. Completed task IDs cannot be overwritten. If completed artifacts or receipts drift, retain the immutable historical task and submit a new authorized replacement task identity and replacement dependent tasks; completed-state rewriting and reconciliation are deliberately unsupported.
 
-After any interruption call `recover`. A prior ISSUING becomes UNKNOWN, retaining its lease. No subsequent issue/recover/status returns the old request. Resuming an unrelated pending observation does not suppress a new issue envelope. A crash before the tool call can sacrifice delivery to avoid duplicate dispatch; reconcile actual native records before abandonment. There is no exactly-once transport claim. No automatic retry uses a new dispatch ID. A genuinely new task needs an explicit new task ID after reconciliation. Locks coordinate this CLI, not direct external writers.
+After any interruption call `recover`. A prior ISSUING becomes UNKNOWN, retaining its lease. No subsequent issue/recover/status returns the old request. Pending prepare/issue calls refuse until explicit recovery; after recovery, an unrelated observation does not suppress a newly guarded issue envelope. A crash before the tool call can sacrifice delivery to avoid duplicate dispatch; reconcile actual native records before abandonment. There is no exactly-once transport claim. No automatic retry uses a new dispatch ID. A genuinely new task needs an explicit new task ID after reconciliation. Locks coordinate this CLI, not direct external writers.
 
 Dependencies must all COMPLETE with unchanged artifacts. Unknown/missing/failed prerequisites block with their exact IDs. Unobserved/busy workers block. Original writer claims are retained and resolved again under the DB lock before prepare/issue. A changed claim identity blocks that task; held leases conservatively cover both the original normalized paths and current resolved claims. Filesystem changes outside this lock remain outside its enforcement. Issuing consumes an IDLE observation by recording BUSY. Completion does not restore availability: the operator must submit a fresh native observation before later work can dispatch. Keep one live DB, its `.lock`, and required receipts/artifacts under the task work root. No SQLite pickle fallback or credential storage. Rollback: stop calling the CLI; preserve DB and referenced artifacts until superseded evidence is verified. Tests use isolated temporary DBs under the supplied pytest `--basetemp` work root.
 
@@ -63,4 +125,89 @@ Worker replacement is a checkpointed `rebind` event, never a manual dictionary e
 
 `summary` uses a query-only read transaction on the existing database. It neither creates an absent database/lock nor invokes/resumes the graph, reconciles dispatches or sends native requests. It reports checkpoint identity and `recovery_required` for pending checkpoints; `pending_checkpoint` and `uncertain_held_dispatches` distinguish pending graph execution from stored uncertain ownership. Explicitly recover/reconcile as appropriate. The returned project/workers/tasks keys remain, but task details are a compact allowlist (identity, state, ownership, dependencies, blockers and tracking refs). Worker evidence, prompts, events, receipts, native arguments and full history are omitted. Held tasks sort first, then task ID. `bounds` reports total tasks, next offset, string/list limits and every truncated field. Continue with the same limit and `next_offset`; a changing checkpoint ID means restart pagination for a coherent snapshot. Unreturned rows/fields are not proof of absence. Status/recover keep their earlier full responses and recovery side effects.
 
-Worker roles come from the nonempty project `workers` map. Names match `[a-z][a-z0-9_-]{0,63}`; every worker thread and the coordinator thread must be distinct. Tasks, observations and replacements must name a bound role. Summary includes every safe project role in lexical order. Invalid or unbound stored roles are omitted with total/omitted counts and a fixed truncation diagnostic; full status retains them for investigation. Output bounds do not bound the memory needed to deserialize the latest checkpoint or the work needed to evaluate readiness.
+`summary` returns the roles stored in the bound project map. Its role count is derived from current bindings and stored observations; unexpected stored roles remain visible in full status and are reported as omitted in the bounded summary.
+
+## Project-bound worker policy
+
+`register` adds one worker only when `--project-policy` supplies a validated policy bound to the same project ID and canonical root. The policy has `schema_version`, `project_id`, `root`, `worker_registrations`, and `legacy_leaseless_beads` fields. Registration authorization is an exact role/thread pair; legacy authorization is an exact Beads-ID/assignee pair. No project-specific identities are compiled into the coordinator.
+
+```json
+{
+  "schema_version": 1,
+  "project_id": "P-example",
+  "root": "/absolute/canonical/project",
+  "worker_registrations": [{"worker": "researcher", "thread_id": "research-thread"}],
+  "legacy_leaseless_beads": [{"beads_id": "global-example-legacy", "assignee": "codex:coordinator:task"}]
+}
+```
+
+Pass this file with `--project-policy` on `register`; pass it on `prepare` or `issue` only when the project needs an explicitly authorized legacy lease exception. A registered worker starts `UNKNOWN` and still needs a fresh observation before dispatch. Registration compares the full current role map, records an UNKNOWN observation and hashes the exact old-state projection; every existing task, observation, receipt, dispatch, lease and audit entry remains unchanged. Pending checkpoints still require explicit recovery before registration. The schema definition is available as `#/$defs/projectPolicy` in `schema.json`.
+
+Retain the exact event and referenced evidence through later checkpoints. Do not restore an old database over newer state; use a separately reviewed compatible source and reconciliation path if recovery is needed.
+
+## Dependency refresh and retained checkpoint recovery
+
+This candidate pins `langgraph==1.2.16` and `langgraph-checkpoint-sqlite==3.1.2`.
+The retained old lock uses 1.2.2/3.1.0. The only resolved transitive changes are
+`langgraph-sdk` 0.3.15 → 0.4.8 and `websockets` 17.2 → 16.1.1. Both isolated
+locked environments use Python 3.14.7; the canonical environment is unchanged.
+
+Saver 3.1.2 adds `writes.task_path` during its normal write-capable setup.
+Summary skips setup to preserve its query-only contract, so it detects that
+column with `PRAGMA table_info(writes)` and selects the saver's matching read
+path. Reading an old schema does not create the column. The owned restore
+roundtrip permits the dependency's ordinary additive setup; it does not prune
+checkpoints or run a custom migration. This compatibility branch uses the
+pinned saver's internal `_has_task_path` flag and must be rechecked when that
+pin changes. Upstream implementation: [SqliteSaver](https://github.com/langchain-ai/langgraph/blob/main/libs/checkpoint-sqlite/langgraph/checkpoint/sqlite/__init__.py).
+
+The reproducible run lives under
+`<run-root>/`: `run_dependency_compat.py`
+uses explicit old/new `.venv/bin/python` paths and
+`candidate/project-coordinator/tests/test_dependency_compat.py`. Its evidence
+is `validation/RESULT.json`, numbered old/new checkpoint projections and
+`validation/targeted-tests.txt`. The immutable Root snapshot's manifest,
+0600 mode, byte count and SHA-256 must match `SNAPSHOT-INPUT.json` before use.
+Use only one private `validation/working.sqlite` restore sequentially. The
+runner requires that working restore to match the immutable input at start;
+inspect an already advanced restore with the probe rather than overwriting it.
+
+The matrix reads every retained checkpoint in both environments, compares full
+model/component digests, history and original SQL row digests, writes/recoveries
+with the new environment, reads/recovers those checkpoints with the old one,
+and rereads old-written checkpoints with the new one. Pending registration and
+pending issue recovery use explicitly synthetic small fixtures, including held
+and uncertain work, guard claim retention, replay and no resend. Focused public
+CLI/API checks cover missing/expired guard, prepared actor transfer and renewal,
+registration preservation/replay, UNKNOWN newly registered roles and query-only summary. No test
+executes a returned native envelope or modifies the external manual claims.
+
+Retain the old source/lock/environment, compatible new source/lock/environment,
+Root's one immutable rollback input, the owned working restore and evidence
+through Root's adoption and rollback decision. Do not restore an older snapshot
+over newer canonical work. Fixture compatibility and the owned snapshot
+roundtrip do not accept canonical adoption; Root alone owns that final caller
+verification and any live source/environment/database change.
+
+After the writer freezes, independently inspect the same advanced working copy
+in each locked environment without copying or resetting it (from repository root):
+
+```bash
+run_root="<run-root>"
+for source in old-source candidate; do
+  "$run_root/$source/project-coordinator/.venv/bin/python" \
+    "$run_root/candidate/project-coordinator/tests/test_dependency_compat.py" \
+    inspect "$run_root/validation/working.sqlite"
+done
+```
+
+Compare the returned model/components, checkpoint, pending state, full history,
+retained history, original SQL row hashes and query-only summary digest against
+`validation/06-new-read-old-checkpoints.json`. The inspector hashes the main database and nonempty WAL
+before/after and refuses an unexpected write; SQLite may create empty WAL/shared
+memory sidecars while reading. Each subprocess exits before the
+next starts. For a small independent regression check, run the candidate's
+`tests/test_dependency_compat.py` and
+`tests/test_beads.py::test_prepared_claim_rejects_new_actor_context_and_allows_same_actor_renewal`
+with its explicit `.venv/bin/python -m pytest`, using a new small pytest
+`--basetemp` under this run directory. It creates only synthetic fixtures.

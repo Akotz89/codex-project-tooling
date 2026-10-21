@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 import json
 import multiprocessing
 from pathlib import Path
@@ -13,21 +14,34 @@ from project_coordinator.runtime import InvalidEvent, apply_event, build_graph, 
 
 
 class Harness:
-    def __init__(self, root, workers=None):
+    def __init__(self, root, *, project_id="P-test", workers=None):
         self.root = root
         self.db = root / "state.sqlite"
-        self.workers = workers if workers is not None else {f"core{i}": f"thread{i}" for i in range(1, 5)}
-        self.binding = {"project_id": "P-test", "root": str(root)}
-        self.call("init", project={**self.binding, "linear_ref": "linear:399", "beads_ref": "global:399",
+        self.binding = {"project_id": project_id, "root": str(root)}
+        self.workers = workers or {f"worker-{i}": f"thread{i}" for i in range(1, 5)}
+        directory = root / ".beads"
+        directory.mkdir()
+        now = datetime.now(timezone.utc)
+        (directory / "record.json").write_text(json.dumps({
+            "id": "bead-1", "external_ref": "linear:test-1", "status": "in_progress", "assignee": "codex:root:A",
+            "heartbeat_at": (now - timedelta(seconds=1)).isoformat(),
+            "lease_expires_at": (now + timedelta(hours=1)).isoformat(), "revision": "1"}))
+        binary = root / "fake-bd"
+        binary.write_text("#!/usr/bin/env python3\nimport os,pathlib\n"
+                          "print('[' + (pathlib.Path(os.environ['BEADS_DIR'])/'record.json').read_text() + ']')\n")
+        binary.chmod(0o700)
+        self.guard_context = {"beads_dir": str(directory), "assignee": "codex:root:A", "executable": str(binary)}
+        self.call("init", project={**self.binding, "linear_ref": "linear:test-1", "beads_ref": "global:bead-1",
                                   "coordinator_thread_id": "root", "workers": self.workers})
         for role in self.workers:
             self.call("observe", worker=role, state="IDLE", evidence="actual observation fixture")
 
     def call(self, op, **fields):
-        return apply_event(self.db, {**self.binding, "op": op, "event_id": str(uuid.uuid4()), **fields})
+        return apply_event(self.db, {**self.binding, "op": op, "event_id": str(uuid.uuid4()), **fields},
+                           guard_context=self.guard_context if op in {"prepare", "issue"} else None)
 
-    def add(self, name="A", worker="core1", paths=None, dependencies=None):
-        return self.call("add", task={"id": name, "worker": worker, "linear_ref": "linear:399", "beads_ref": "global:399",
+    def add(self, name="A", worker="worker-1", paths=None, dependencies=None):
+        return self.call("add", task={"id": name, "worker": worker, "linear_ref": "linear:test-1", "beads_ref": "global:bead-1",
                                      "prompt": "fixture", "source_digest": "source-1", "scope_digest": "scope-1",
                                      "writer_paths": paths or [], "dependencies": dependencies or []})
 
@@ -38,7 +52,7 @@ class Harness:
         prepared = self.prepare(name)
         dispatch = prepared["dispatch_id"]
         response = self.call("issue", task_id=name, dispatch_id=dispatch)
-        assert response["native_request"]["arguments"]["threadId"] == self.workers[self.task(name)["worker"]]
+        assert response["native_request"]["arguments"]["threadId"] == self.task(name)["dispatch_thread_id"]
         return dispatch
 
     def task(self, name="A"):
@@ -51,10 +65,11 @@ class Harness:
 
     def result(self, dispatch, name="A", **changes):
         task = self.task(name)
+        thread_id = task.get("dispatch_thread_id") or self.workers[task["worker"]]
         artifact = self.file(f"{name}-output.json", {"actual": "output"})
-        native = self.file(f"{name}-native.json", {"threadId": self.workers[task["worker"]],
+        native = self.file(f"{name}-native.json", {"threadId": thread_id,
                                                     "dispatch_id": dispatch, "terminal": "fixture final"})
-        result = {"thread_id": self.workers[task["worker"]], "dispatch_id": dispatch,
+        result = {"thread_id": thread_id, "dispatch_id": dispatch,
                   "source_digest": "source-1", "scope_digest": "scope-1", "terminal": True, "quiescent": True,
                   "child_exit_code": 0, "acceptance": True, "artifacts": [artifact], "native_evidence": native, **changes}
         receipt = self.file(f"{name}-result.json", result)
@@ -66,10 +81,64 @@ def h(tmp_path):
     return Harness(tmp_path)
 
 
+def project_policy(h, *, registrations=(), legacy=()):
+    return {"schema_version": 1, "project_id": h.binding["project_id"], "root": str(h.root),
+            "worker_registrations": [{"worker": role, "thread_id": thread} for role, thread in registrations],
+            "legacy_leaseless_beads": [{"beads_id": bead_id, "assignee": actor}
+                                       for bead_id, actor in legacy]}
+
+
+def test_second_project_uses_its_non_wow_role_map_and_dynamic_count(tmp_path):
+    workers = {"implementer": "build-thread", "review_qa": "review-thread", "release-manager": "release-thread"}
+    harness = Harness(tmp_path, project_id="P-second", workers=workers)
+    for role in workers:
+        harness.add(role, role)
+        dispatch = harness.issue(role)
+        assert harness.result(dispatch, role)["action"] == "COMPLETE"
+    summary = harness.call("summary")
+    assert summary["project"]["workers"] == workers
+    assert set(summary["workers"]) == set(workers)
+    assert {task["worker"] for task in summary["tasks"]} == set(workers)
+    assert summary["bounds"]["worker_role_count"] == 3
+    assert summary["bounds"]["omitted_worker_roles"] == 0
+
+
+def test_registration_policy_from_another_project_is_rejected(tmp_path):
+    from project_coordinator.runtime import InvalidEvent
+    first_root = tmp_path / "first"
+    first_root.mkdir()
+    first = Harness(first_root, project_id="P-first", workers={"builder": "builder-thread"})
+    second_root = tmp_path / "second"
+    second_root.mkdir()
+    second = Harness(second_root, project_id="P-second", workers={"reviewer": "review-thread"})
+    policy = project_policy(first, registrations=[("new_role", "new-thread")])
+    event = {**second.binding, "op": "register", "event_id": "cross-project-register", "worker": "new_role",
+             "new_thread_id": "new-thread", "expected_workers": second.workers, "evidence": "fixture"}
+    before = second.db.read_bytes()
+    with pytest.raises(InvalidEvent, match="project policy identity mismatch"):
+        apply_event(second.db, event, project_policy=policy)
+    assert second.db.read_bytes() == before
+
+
+def test_project_policy_symlink_loop_resolve_is_controlled(monkeypatch, tmp_path):
+    from project_coordinator.runtime import validate_project_policy
+
+    harness = Harness(tmp_path)
+    policy = project_policy(harness)
+
+    def symlink_loop(self, *, strict=False):
+        raise RuntimeError("Symlink loop from platform path resolver")
+
+    monkeypatch.setattr(Path, "resolve", symlink_loop)
+    with pytest.raises(InvalidEvent) as exc:
+        validate_project_policy(policy, harness.binding)
+    assert str(exc.value) == "project policy root is unavailable"
+
+
 def test_dependency_join(h):
     h.add()
-    h.add("B", "core2")
-    h.add("C", "core3", dependencies=["A", "B"])
+    h.add("B", "worker-2")
+    h.add("C", "worker-3", dependencies=["A", "B"])
     assert "dependency:A" in str(h.prepare("C"))
     h.result(h.issue())
     assert "dependency:B" in str(h.prepare("C"))
@@ -80,7 +149,7 @@ def test_dependency_join(h):
 
 def test_failed_join_branch(h):
     h.add()
-    h.add("C", "core2", dependencies=["A", "missing"])
+    h.add("C", "worker-2", dependencies=["A", "missing"])
     h.result(h.issue(), child_exit_code=1)
     response = h.prepare("C")
     assert "dependency:A:FAILED" in response["reasons"]
@@ -147,7 +216,7 @@ def test_parent_alias_overlap_and_unknown_lease(h):
     (h.root / "alias").symlink_to(h.root / "owned", target_is_directory=True)
     h.add(paths=["owned"])
     h.issue()
-    h.add("B", "core2", paths=["alias/child"])
+    h.add("B", "worker-2", paths=["alias/child"])
     assert "writer-lease:A" in str(h.prepare("B"))
     assert h.task()["status"] == "UNKNOWN"
     assert "writer-lease:A" in str(h.prepare("B"))
@@ -155,25 +224,25 @@ def test_parent_alias_overlap_and_unknown_lease(h):
 
 def test_busy_worker_and_same_worker_lease(h):
     h.add()
-    h.call("observe", worker="core1", state="BUSY", evidence="observed running")
+    h.call("observe", worker="worker-1", state="BUSY", evidence="observed running")
     assert h.prepare()["action"] == "WAIT"
-    h.call("observe", worker="core1", state="IDLE", evidence="observed idle")
+    h.call("observe", worker="worker-1", state="IDLE", evidence="observed idle")
     h.prepare()
     h.add("B")
     assert "worker-lease:A" in str(h.prepare("B"))
 
 
-def concurrent_prepare(db, binding, name, queue):
+def concurrent_prepare(db, binding, name, queue, guard_context):
     queue.put(apply_event(db, {**binding, "op": "prepare", "event_id": f"prepare-{name}", "task_id": name,
-                             "source_digest": "source-1", "scope_digest": "scope-1"})["action"])
+                             "source_digest": "source-1", "scope_digest": "scope-1"}, guard_context=guard_context)["action"])
 
 
 def test_two_controllers_one_claim(h):
     h.add(paths=["owned"])
-    h.add("B", "core2", paths=["owned"])
+    h.add("B", "worker-2", paths=["owned"])
     ctx = multiprocessing.get_context("spawn")
     queue = ctx.Queue()
-    children = [ctx.Process(target=concurrent_prepare, args=(h.db, h.binding, name, queue)) for name in ("A", "B")]
+    children = [ctx.Process(target=concurrent_prepare, args=(h.db, h.binding, name, queue, h.guard_context)) for name in ("A", "B")]
     for child in children:
         child.start()
     for child in children:
@@ -183,16 +252,16 @@ def test_two_controllers_one_claim(h):
 
 
 def test_idempotent_and_conflicting_replay(h):
-    event = {**h.binding, "op": "observe", "event_id": "same", "worker": "core1", "state": "IDLE", "evidence": "fixture"}
+    event = {**h.binding, "op": "observe", "event_id": "same", "worker": "worker-1", "state": "IDLE", "evidence": "fixture"}
     apply_event(h.db, event)
     assert apply_event(h.db, event)["action"] == "REPLAY"
     with pytest.raises(InvalidEvent, match="conflicting"):
         apply_event(h.db, {**event, "state": "BUSY"})
-    assert h.call("status")["workers"]["core1"]["state"] == "IDLE"
+    assert h.call("status")["workers"]["worker-1"]["state"] == "IDLE"
     h.add()
     dispatch = h.prepare()["dispatch_id"]
     issue = {**h.binding, "op": "issue", "event_id": "issue-once", "task_id": "A", "dispatch_id": dispatch}
-    assert "native_request" in apply_event(h.db, issue)
+    assert "native_request" in apply_event(h.db, issue, guard_context=h.guard_context)
     assert "native_request" not in apply_event(h.db, issue)
 
 
@@ -248,7 +317,7 @@ def test_completed_receipt_and_native_drift(h, changed):
     (h.root / changed).write_text("tampered")
     with pytest.raises(InvalidEvent, match="receipt drift"):
         h.prepare()
-    h.add("B", "core2", dependencies=["A"])
+    h.add("B", "worker-2", dependencies=["A"])
     assert "dependency:A:ARTIFACT_DRIFT" in str(h.prepare("B"))
 
 
@@ -259,12 +328,12 @@ def test_real_process_kill_after_durable_issue(h):
     code = """import json,sys,time
 from pathlib import Path
 from project_coordinator import apply_event
-result=apply_event(sys.argv[1],json.loads(sys.argv[2]))
+result=apply_event(sys.argv[1],json.loads(sys.argv[2]),guard_context=json.loads(sys.argv[4]))
 Path(sys.argv[3]).write_text(json.dumps(result))
 time.sleep(30)
 """
     output = h.root / "durable-issue.json"
-    child = subprocess.Popen([sys.executable, "-c", code, str(h.db), json.dumps(event), str(output)])
+    child = subprocess.Popen([sys.executable, "-c", code, str(h.db), json.dumps(event), str(output), json.dumps(h.guard_context)])
     import time
     try:
         deadline = time.monotonic() + 15
@@ -285,7 +354,7 @@ time.sleep(30)
     {"dispatch_id": "injected"}, {"lease": True}, {"writer_paths": [None]},
 ])
 def test_malformed_task_rejected_before_checkpoint(h, change):
-    task = {"id": "A", "worker": "core1", "linear_ref": "linear:399", "beads_ref": "global:399", "prompt": "fixture",
+    task = {"id": "A", "worker": "worker-1", "linear_ref": "linear:test-1", "beads_ref": "global:test-1", "prompt": "fixture",
             "source_digest": "source-1", "scope_digest": "scope-1", "dependencies": [], "writer_paths": [], **change}
     with pytest.raises(InvalidEvent):
         h.call("add", task=task)
@@ -297,7 +366,7 @@ def test_malformed_task_rejected_before_checkpoint(h, change):
 def test_dependency_cycle_rejected_before_checkpoint(h):
     h.add(dependencies=["B"])
     with pytest.raises(InvalidEvent, match="cycle"):
-        h.add("B", "core2", dependencies=["A"])
+        h.add("B", "worker-2", dependencies=["A"])
     assert [task["id"] for task in h.call("recover")["tasks"]] == ["A"]
 
 
@@ -305,7 +374,7 @@ def test_late_result_cannot_reacquire_released_lease(h):
     h.add(paths=["owned"])
     dispatch = h.issue()
     h.call("reconcile", task_id="A", dispatch_id=dispatch, quiescent=True, evidence="verified task and pending transport stopped")
-    h.add("B", "core2", paths=["owned"])
+    h.add("B", "worker-2", paths=["owned"])
     assert h.prepare("B")["action"] == "PREPARED"
     with pytest.raises(InvalidEvent, match="lease already released"):
         h.result(dispatch, terminal=False, quiescent=False)
@@ -324,16 +393,20 @@ def test_acknowledged_can_abandon_verified_quiescent_work(h):
     assert result["action"] == "FAILED" and result["lease"] is False
 
 
-def test_unrelated_pending_resume_does_not_suppress_fresh_issue(h):
+def test_pending_checkpoint_requires_explicit_recover_before_fresh_issue(h):
     h.add()
     dispatch = h.prepare()["dispatch_id"]
     with sqlite3.connect(h.db, check_same_thread=False) as conn:
         graph = build_graph(SqliteSaver(conn))
         config = {"configurable": {"thread_id": "project-coordinator-v1"}}
-        event = {**h.binding, "op": "observe", "event_id": "pending-observation", "worker": "core2", "state": "IDLE", "evidence": "fixture"}
+        event = {**h.binding, "op": "observe", "event_id": "pending-observation", "worker": "worker-2", "state": "IDLE", "evidence": "fixture"}
         stream = graph.stream({"event": event}, config, stream_mode="checkpoints", durability="sync")
         next(stream)
         stream.close()
+    with pytest.raises(InvalidEvent, match="pending checkpoint"):
+        h.call("issue", task_id="A", dispatch_id=dispatch)
+    assert h.call("summary")["pending_checkpoint"]
+    h.call("recover")
     response = h.call("issue", task_id="A", dispatch_id=dispatch)
     assert response["native_request"]["arguments"]["threadId"] == "thread1"
     assert "native_request" not in h.call("issue", task_id="A", dispatch_id=dispatch)
@@ -344,7 +417,7 @@ def test_symlink_change_before_prepare_blocks_changed_identity(h):
     h.add(paths=["future"])
     (h.root / "future").symlink_to(h.root / "target", target_is_directory=True)
     assert "claim-identity-changed:A" in str(h.prepare())
-    h.add("B", "core2", paths=["target"])
+    h.add("B", "worker-2", paths=["target"])
     assert h.prepare("B")["action"] == "PREPARED"
     assert h.task()["lease"] is False
 
@@ -361,7 +434,7 @@ def test_symlink_change_after_prepare_holds_old_and_current_claims(h):
     response = h.call("issue", task_id="A", dispatch_id=dispatch)
     assert response["action"] == "WAIT" and "native_request" not in response
     assert h.task()["lease"]
-    for name, path, worker in [("B", "old/child", "core2"), ("C", "target/child", "core3")]:
+    for name, path, worker in [("B", "old/child", "worker-2"), ("C", "target/child", "worker-3")]:
         h.add(name, worker, paths=[path])
         assert "writer-lease:A" in str(h.prepare(name))
 
@@ -369,11 +442,11 @@ def test_symlink_change_after_prepare_holds_old_and_current_claims(h):
 def test_worker_availability_consumed_until_fresh_observation(h):
     h.add()
     dispatch = h.issue()
-    assert h.call("status")["workers"]["core1"]["state"] == "BUSY"
+    assert h.call("status")["workers"]["worker-1"]["state"] == "BUSY"
     h.result(dispatch)
     h.add("B")
     assert "not-observed-idle" in str(h.prepare("B"))
-    h.call("observe", worker="core1", state="IDLE", evidence="fresh native idle observation after A")
+    h.call("observe", worker="worker-1", state="IDLE", evidence="fresh native idle observation after A")
     assert h.prepare("B")["action"] == "PREPARED"
 
 
@@ -397,7 +470,7 @@ def test_cli_malformed_receipt_is_bounded_json(h, receipt, command):
 
 def test_exact_native_tool_target_and_multiline_prompt(h):
     prompt = 'Inspect only designated output.\nKeep "quoted" text and $literal intact.\nReport terminal child evidence.'
-    h.call("add", task={"id": "A", "worker": "core1", "linear_ref": "linear:399", "beads_ref": "global:399", "prompt": prompt,
+    h.call("add", task={"id": "A", "worker": "worker-1", "linear_ref": "linear:test-1", "beads_ref": "global:bead-1", "prompt": prompt,
                         "source_digest": "source-1", "scope_digest": "scope-1", "dependencies": [], "writer_paths": []})
     dispatch = h.prepare()["dispatch_id"]
     native = h.call("issue", task_id="A", dispatch_id=dispatch)["native_request"]
@@ -409,10 +482,10 @@ def test_exact_native_tool_target_and_multiline_prompt(h):
 def test_readiness_invalidated_after_preparation_retains_lease(h, invalidation):
     h.add()
     h.result(h.issue())
-    h.add("B", "core2", dependencies=["A"])
+    h.add("B", "worker-2", dependencies=["A"])
     dispatch = h.prepare("B")["dispatch_id"]
     if invalidation == "worker":
-        h.call("observe", worker="core2", state="BUSY", evidence="fresh observed busy")
+        h.call("observe", worker="worker-2", state="BUSY", evidence="fresh observed busy")
     else:
         (h.root / "A-output.json").write_text("drift")
     response = h.call("issue", task_id="B", dispatch_id=dispatch)
@@ -434,45 +507,3 @@ def test_existing_v1_closed_failed_model_recovers_without_new_fields(h):
     for op in ("status", "recover"):
         task = h.call(op)["tasks"][0]
         assert task["status"] == "FAILED" and task["lease"] is False
-
-
-def test_project_defined_workers_dispatch_and_compact_status(tmp_path):
-    workers = {"implementer": "implementation-thread", "review_qa-2": "review-thread"}
-    harness = Harness(tmp_path, workers)
-    for index, role in enumerate(workers):
-        task_id = f"task-{index}"
-        harness.add(task_id, role)
-        dispatch = harness.issue(task_id)
-        assert harness.result(dispatch, task_id)["action"] == "COMPLETE"
-    summary = harness.call("summary")
-    assert summary["project"]["workers"] == workers
-    assert set(summary["workers"]) == set(workers)
-    assert {task["worker"] for task in summary["tasks"]} == set(workers)
-    assert summary["bounds"]["omitted_worker_roles"] == 0
-    assert all(task["status"] == "COMPLETE" for task in summary["tasks"])
-
-
-@pytest.mark.parametrize("role", ["", "../worker", "worker.name", "Worker", "a" * 65, "worker\n", "équipe", 1])
-def test_invalid_worker_roles_rejected_before_database_creation(tmp_path, role):
-    db = tmp_path / "absent" / "state.sqlite"
-    with pytest.raises(InvalidEvent, match="safe role"):
-        apply_event(db, {"op": "init", "event_id": "init", "project": {"project_id": "test", "root": str(tmp_path), "linear_ref": "linear:test", "beads_ref": "global:test", "coordinator_thread_id": "root", "workers": {role: "thread"}}})
-    assert not db.parent.exists()
-
-
-@pytest.mark.parametrize("workers", [{}, {"implementer": "same", "reviewer": "same"}, {"implementer": "root"}])
-def test_empty_roster_and_shared_thread_bindings_rejected(tmp_path, workers):
-    with pytest.raises(InvalidEvent):
-        Harness(tmp_path, workers)
-
-
-@pytest.mark.parametrize("op", ["add", "observe", "rebind"])
-@pytest.mark.parametrize("role", ["invalid/name", "unbound"])
-def test_worker_events_require_safe_bound_roles(h, op, role):
-    with pytest.raises(InvalidEvent, match="worker role|unbound worker"):
-        if op == "add":
-            h.add(worker=role)
-        elif op == "observe":
-            h.call(op, worker=role, state="IDLE", evidence="observation")
-        else:
-            h.call(op, worker=role, expected_old_thread_id="thread1", new_thread_id="replacement", evidence="observation")
