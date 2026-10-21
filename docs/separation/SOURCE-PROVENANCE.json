@@ -194,5 +194,24 @@
       "report_sha256": "145e14b3c134f3a1a56974c1129967e0f4065a8c3e3de0ecd870fb571a07ceb7",
       "task_evidence": "verification/final-20261021/gitleaks-filtered-summary.json"
     }
+  },
+  "destination": {
+    "repository": "Akotz89/codex-project-tooling",
+    "url": "https://github.com/Akotz89/codex-project-tooling",
+    "visibility": "private",
+    "initial_state": "empty; default branch configured as main",
+    "first_published_ref": "refs/heads/main",
+    "first_published_commit": "a13929cde7e2720a57373e7d4fe24bdb896a5411",
+    "first_published_tree": "3836b206cbf4c6b6adee8c4d0d8aa27e8aaf3929",
+    "immutable_tooling_source_pin": "a13929cde7e2720a57373e7d4fe24bdb896a5411",
+    "push_was_forced": false,
+    "remote_readback": {
+      "github_api_commit": "a13929cde7e2720a57373e7d4fe24bdb896a5411",
+      "git_ls_remote_commit": "a13929cde7e2720a57373e7d4fe24bdb896a5411",
+      "fetched_commit": "a13929cde7e2720a57373e7d4fe24bdb896a5411",
+      "fetched_tree": "3836b206cbf4c6b6adee8c4d0d8aa27e8aaf3929",
+      "tree_matches_local": true,
+      "task_evidence": "verification/final-20261021/initial-remote-readback.json"
+    }
   }
 }
