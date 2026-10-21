@@ -262,12 +262,11 @@ def test_summary_sql_trace_is_query_only(h, monkeypatch):
         connections[0].execute('SELECT 1')
 
 
-def test_summary_bounds_project_defined_roster(tmp_path):
+def test_summary_includes_full_project_defined_roster(tmp_path):
     harness = Harness(tmp_path, {f"worker-{i:02}": f"thread-{i}" for i in range(40)})
     summary = harness.call('summary')
-    assert list(summary['project']['workers']) == [f"worker-{i:02}" for i in range(32)]
+    assert list(summary['project']['workers']) == [f"worker-{i:02}" for i in range(40)]
     assert set(summary['workers']) == set(summary['project']['workers'])
+    assert summary['bounds']['truncated_fields'] == []
     assert summary['bounds']['worker_role_count'] == 40
-    assert summary['bounds']['omitted_worker_roles'] == 8
-    assert summary['bounds']['truncated_fields'] == ['workers.extra_roles']
     assert len(harness.call('status')['workers']) == 40

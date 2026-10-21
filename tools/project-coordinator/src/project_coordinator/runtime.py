@@ -475,7 +475,7 @@ def compact_status(state, event, checkpoint_id=None, pending=()):
         if task["status"] == "ISSUING":
             item["status"] = "UNKNOWN"
         page.append(bounded(item, f"tasks.{offset + len(page)}"))
-    roles = set(sorted(role for role in model["project"]["workers"] if worker_role(role))[:32])
+    roles = {role for role in model["project"]["workers"] if worker_role(role)}
     all_roles = set(model["project"]["workers"]) | set(model["workers"])
     if all_roles - roles:
         truncated.add("workers.extra_roles")
