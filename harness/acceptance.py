@@ -8,14 +8,9 @@ import re
 import subprocess
 
 from candidate_identity import identity
+from project_policy import PURPOSES, load_policy, validate_policy
 
 
-WORKFLOWS = {
-    "implementation": ("archon-implement", "implement"),
-    "review": ("archon-review", "publish"),
-    "runtime_suite": ("archon-verify-runtime-suite", "compare"),
-    "wrong_identity": ("archon-verify-runtime", "gate-verified"),
-}
 NATIVE_OUTCOMES = ("succeeded", "failed")
 SUITE_VERDICTS = ("passed", "failed", "inconclusive")
 IMPLEMENTATION_RED_CAUSES = ("", "introduced", "inherited", "environment", "incomplete")
@@ -102,10 +97,10 @@ def git(root, *args):
     return result.stdout.strip()
 
 
-def native_record(name, pin, directory, root):
+def native_record(name, pin, directory, root, policy):
     path = pinned(pin, directory)
     run = read_json(path, pin["sha256"])
-    workflow, node = WORKFLOWS[name]
+    workflow, node = (policy["workflows"][name][key] for key in ("workflow", "node"))
     require(run["id"] == pin["run_id"], f"{name}: wrong run ID")
     require(run["workflow_name"] == workflow, f"{name}: wrong workflow")
     require(absolute(run["working_path"]).resolve(strict=True) == root,
@@ -361,7 +356,8 @@ def requested_identity(run, bundle, directory, root):
     return text(inputs["candidate"]), evidence
 
 
-def accept(bundle, directory, failures=None):
+def accept(bundle, directory, policy, failures=None):
+    policy = validate_policy(policy)
     if failures is None:
         failures = []
     obj(bundle)
@@ -376,25 +372,26 @@ def accept(bundle, directory, failures=None):
     executable = identity(root)
     require(candidate["executable_identity"] == executable, "candidate executable identity has drifted")
     allocation = obj(bundle["allocation"])
-    require(allocation["issue"] == "CPI-402" and allocation["project_id"] == "P-CPI-10", "wrong allocation project or issue")
+    require(allocation["issue"] == policy["acceptance_issue"] and allocation["project_id"] == policy["project_id"], "wrong allocation project or issue")
     for key in ("task_id", "dispatch_id", "worker", "worker_thread_id"):
         text(allocation[key])
+    require(allocation["worker"] in policy["worker_roles"], "wrong allocation worker role")
     controls = obj(bundle["controls"])
     require(text(controls["baseline"]) == executable and text(controls["negative"]) != executable
             and text(controls["wrong_requested_identity"]) != executable, "invalid frozen control identities")
     require(re.fullmatch(r"[0-9a-f]{64}", controls["negative"]) is not None,
             "deliberate defect control must identify an exact executable")
     pins = obj(bundle["records"])
-    require(set(pins) == set(WORKFLOWS), "exactly four native records required")
+    require(set(pins) == set(PURPOSES), "exactly four native records required")
     require(len({text(obj(pin)["run_id"]) for pin in pins.values()}) == 4, "native run IDs must be distinct")
-    implementation, result = native_record("implementation", pins["implementation"], directory, root)
+    implementation, result = native_record("implementation", pins["implementation"], directory, root, policy)
     boolean_fields(result, ("done", "green"), "implementation")
     require(result["red_cause"] in IMPLEMENTATION_RED_CAUSES, "implementation: invalid red cause")
     if (implementation["outcome"] != "succeeded" or result["done"] is not True
             or result["green"] is not True or result["red_cause"] != ""):
         failures.append({"record": "implementation", "reason": "builder did not author a completed green result",
                          "red_cause": result["red_cause"], "summary": str(result.get("summary", ""))[:2000]})
-    review, result = native_record("review", pins["review"], directory, root)
+    review, result = native_record("review", pins["review"], directory, root, policy)
     baseline = obj(review["checkout_baseline"])
     require(baseline["kind"] == "git" and baseline["commit"] == head
             and obj(baseline["worktree"])["status"] == "clean", "review: dirty, unknown or stale checkout baseline")
@@ -405,9 +402,9 @@ def accept(bundle, directory, failures=None):
         failures.append({"record": "review", "reason": "review has unresolved findings", "action": result["action"],
                          "findings_summary": str(result.get("findings_summary", ""))[:2000],
                          "report": bundle["review_report"]})
-    suite, result = native_record("runtime_suite", pins["runtime_suite"], directory, root)
+    suite, result = native_record("runtime_suite", pins["runtime_suite"], directory, root, policy)
     runtime_files, suite_input = runtime_suite(suite, result, bundle, directory, root, failures)
-    wrong, result = native_record("wrong_identity", pins["wrong_identity"], directory, root)
+    wrong, result = native_record("wrong_identity", pins["wrong_identity"], directory, root, policy)
     requested, input_evidence = requested_identity(wrong, bundle, directory, root)
     require(requested == controls["wrong_requested_identity"] and requested != executable,
             "wrong_identity: run did not request frozen wrong identity")
@@ -429,6 +426,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("bundle", nargs="?", type=Path)
     parser.add_argument("--identity", action="store_true")
+    parser.add_argument("--policy", type=Path)
     args = parser.parse_args()
     failures = []
     try:
@@ -436,9 +434,10 @@ def main():
             with Path(__file__).open("rb") as stream:
                 print(hashlib.file_digest(stream, "sha256").hexdigest())
             return 0
-        require(args.bundle is not None, "BUNDLE.json is required")
+        require(args.bundle is not None and args.policy is not None, "BUNDLE.json and --policy are required")
+        policy = load_policy(args.policy)
         path = args.bundle.resolve(strict=True)
-        result = accept(read_json(path), path.parent, failures)
+        result = accept(read_json(path), path.parent, policy, failures)
         code = 0 if result["accepted"] else 3
     except (ValueError, KeyError, TypeError, OSError, UnicodeError, RecursionError,
             subprocess.SubprocessError) as error:

@@ -7,6 +7,8 @@ from pathlib import Path
 import sys
 from urllib.parse import urlparse
 
+from project_policy import load_policy, validate_policy
+
 
 def read_json(path):
     path = Path(path)
@@ -25,25 +27,26 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def intake(release, summary):
+def intake(release, summary, policy):
+    policy = validate_policy(policy)
     for key in ("task_id", "dispatch_id", "worker_thread_id", "checkpoint_id"):
         value = release[key]
         if not isinstance(value, str) or not value or value != value.strip() or "\0" in value:
             raise ValueError(f"invalid identity: {key}")
-    if release["worker"] not in {"core1", "core2", "core3", "core4"}:
-        raise ValueError("invalid core role")
+    if release["worker"] not in policy["worker_roles"]:
+        raise ValueError("invalid worker role")
     root = Path(release["root"]).resolve(strict=True)
     if (release.get("version") != 1 or release.get("accepted") is not True
-            or release.get("project_id") != "P-CPI-10"
+            or release.get("project_id") != policy["project_id"]
             or summary["project"]["project_id"] != release["project_id"]
             or Path(summary["project"]["root"]).resolve() != root):
         raise ValueError("accepted project binding is required")
     issue = release["issue"]
-    if not isinstance(issue, str) or not issue.startswith("CPI-") or not issue[4:].isdigit():
+    if issue != policy["acceptance_issue"]:
         raise ValueError("invalid Linear issue")
     ref = urlparse(release["linear_ref"])
     if (ref.scheme != "https" or ref.netloc != "linear.app"
-            or ref.path.strip("/").split("/")[:3] != ["codex-azyrra", "issue", issue]):
+            or ref.path.strip("/").split("/")[:3] != [policy["linear_workspace"], "issue", issue]):
         raise ValueError("Linear reference does not match issue")
     if not isinstance(release["work_order"], str) or not release["work_order"].strip():
         raise ValueError("work order is empty")
@@ -91,7 +94,7 @@ def intake(release, summary):
             raise ValueError("source pin drift or escape")
     return {"ready": True, "project_id": release["project_id"], "issue": issue,
             "task_id": task["id"], "dispatch_id": task["dispatch_id"],
-            "worker": task["worker"], "workflow": "archon-implement",
+            "worker": task["worker"], "workflow": policy["workflows"]["implementation"]["workflow"],
             "worker_thread_id": release["worker_thread_id"], "writer_paths": claims,
             "inputs": {"work": release["work_order"]},
             "publication": "none", "checkpoint_id": summary["checkpoint_id"]}
@@ -102,17 +105,19 @@ def main():
     parser.add_argument("release", nargs="?", type=Path)
     parser.add_argument("summary", nargs="?", type=Path)
     parser.add_argument("--identity", action="store_true")
+    parser.add_argument("--policy", type=Path)
     args = parser.parse_args()
     try:
         if args.identity:
             print(digest(__file__))
             return 0
-        if args.release is None or args.summary is None:
-            parser.error("release and summary are required")
-        result = intake(read_json(args.release), read_json(args.summary))
+        if args.release is None or args.summary is None or args.policy is None:
+            parser.error("release, summary and --policy are required")
+        policy = load_policy(args.policy)
+        result = intake(read_json(args.release), read_json(args.summary), policy)
         print(json.dumps(result, sort_keys=True))
         return 0 if result["ready"] else 3
-    except (ValueError, KeyError, TypeError, OSError) as error:
+    except (ValueError, KeyError, TypeError, OSError, RecursionError) as error:
         print(json.dumps({"ready": False, "error": str(error)}), file=sys.stderr)
         return 2
 

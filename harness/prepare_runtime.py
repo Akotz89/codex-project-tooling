@@ -8,6 +8,7 @@ import shlex
 import shutil
 
 from candidate_identity import identity
+from project_policy import load_policy, validate_policy
 from linear_intake import intake, read_json
 from post_builder import check_view
 
@@ -16,10 +17,11 @@ def write_json(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n")
 
 
-def prepare(root, release_path, summary_path, output):
+def prepare(root, release_path, summary_path, output, policy):
+    policy = validate_policy(policy)
     release, summary = read_json(release_path), read_json(summary_path)
-    check_view(release, root)
-    if not intake(release, summary)["ready"]:
+    check_view(release, root, policy)
+    if not intake(release, summary, policy)["ready"]:
         raise ValueError("Root admission is not ready")
     baseline = identity(root)
     original = (root / "harness/linear_intake.py").read_text()
@@ -32,12 +34,13 @@ def prepare(root, release_path, summary_path, output):
     output.mkdir(parents=True, exist_ok=False)
     negative = output / "negative"
     (negative / "harness").mkdir(parents=True)
-    for name in ("acceptance.py", "candidate_identity.py"):
+    for name in ("acceptance.py", "candidate_identity.py", "project_policy.py"):
         shutil.copyfile(root / "harness" / name, negative / "harness" / name)
     (negative / "harness/linear_intake.py").write_text(defective)
     defective_identity = identity(negative)
     if defective_identity == baseline:
         raise AssertionError("mutation changed no executable identity")
+    write_json(output / "policy.json", policy)
     write_json(output / "release.json", release)
     write_json(output / "summary.json", summary)
     for task in summary["tasks"]:
@@ -50,11 +53,12 @@ def prepare(root, release_path, summary_path, output):
 
     def scenario(target, candidate):
         cli = target / "harness/linear_intake.py"
-        positive_argv = ("python", cli, output / "release.json", output / "summary.json")
-        missing_argv = ("python", cli, output / "release.json", output / "missing-lease.json")
+        positive_argv = ("python", cli, output / "release.json", output / "summary.json", "--policy", output / "policy.json")
+        missing_argv = ("python", cli, output / "release.json", output / "missing-lease.json", "--policy", output / "policy.json")
         positive, missing = command(*positive_argv), command(*missing_argv)
         required_inputs = []
-        for path in dict.fromkeys((*positive_argv[2:], *missing_argv[2:])):
+        for path in dict.fromkeys(item for item in (*positive_argv[2:], *missing_argv[2:])
+                                  if isinstance(item, Path)):
             with path.open("rb") as stream:
                 digest = hashlib.file_digest(stream, "sha256").hexdigest()
             required_inputs.append({"path": str(path.resolve(strict=True)), "sha256": digest})
@@ -65,7 +69,7 @@ def prepare(root, release_path, summary_path, output):
         ], "environment": {"ownership": "external", "setup": "", "start": "", "teardown": "",
              "candidate_command": command("python", target / "harness/candidate_identity.py")},
              "candidate": candidate,
-             "context": {"required_inputs": required_inputs, "target_root": str(target), "evidence_boundary": "Local executable integration only; no C++/realm/gameplay acceptance; source is shared, not a hidden holdout."}}
+             "context": {"required_inputs": required_inputs, "target_root": str(target), "evidence_boundary": "Local executable integration only; no product deployment or end-user acceptance; source is shared, not a hidden holdout."}}
 
     write_json(output / "baseline.json", scenario(root, baseline))
     negative_scenario = scenario(negative, defective_identity)
@@ -87,6 +91,10 @@ if __name__ == "__main__":
     parser.add_argument("release", type=Path)
     parser.add_argument("summary", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--policy", type=Path, required=True)
     args = parser.parse_args()
-    print(json.dumps(prepare(Path(__file__).resolve().parent.parent, args.release.resolve(),
-                             args.summary.resolve(), args.output.resolve()), sort_keys=True))
+    try:
+        print(json.dumps(prepare(Path(__file__).resolve().parent.parent, args.release.resolve(),
+                                 args.summary.resolve(), args.output.resolve(), load_policy(args.policy)), sort_keys=True))
+    except (ValueError, KeyError, TypeError, OSError, RecursionError) as error:
+        parser.exit(2, f"runtime preparation held: {error}\n")

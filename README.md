@@ -500,3 +500,10 @@ python3 -B bin/audit.py --worker-policy-source /actual/archon-source --bun /exac
 This compares actual TypeScript allowedWorkerPair behavior over its current
 effort ladder and forbidden controls against the maintained Python owner cap.
 A policy mismatch fails the audit; no extra policy copy or service is installed.
+
+## Retained-evidence harness
+
+The optional [evidence harness](harness/README.md) validates caller-owned allocation,
+implementation, review and runtime records. Its APIs require an explicit project
+policy and operational CLIs require `--policy`; the linked guide includes a neutral
+example and the complete test command. It never dispatches or publishes work.

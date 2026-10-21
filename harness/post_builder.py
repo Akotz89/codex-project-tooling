@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 
 from candidate_identity import identity
+from project_policy import load_policy, validate_policy
 from linear_intake import digest, intake, read_json
 
 ALLOCATION = ("project_id", "issue", "task_id", "dispatch_id", "worker", "worker_thread_id",
@@ -22,7 +23,11 @@ def tracked(root):
     return [name for name in git(root, "ls-files", "-z").split("\0") if name]
 
 
-def check_view(view, candidate):
+def check_view(view, candidate, policy):
+    policy = validate_policy(policy)
+    if (view["project_id"] != policy["project_id"] or view["issue"] != policy["acceptance_issue"]
+            or view["worker"] not in policy["worker_roles"]):
+        raise ValueError("output allocation does not match project policy")
     proof = view["post_builder"]
     initial_path = Path(proof["input_release_path"])
     if digest(initial_path) != proof["input_release_sha256"]:
@@ -52,7 +57,8 @@ def check_view(view, candidate):
     return initial
 
 
-def output_view(initial_path, builder_path, summary_path, expected_run_id):
+def output_view(initial_path, builder_path, summary_path, expected_run_id, policy):
+    policy = validate_policy(policy)
     initial = read_json(initial_path)
     candidate = Path(initial["candidate_root"]).resolve(strict=True)
     root = Path(initial["root"]).resolve(strict=True)
@@ -71,11 +77,11 @@ def output_view(initial_path, builder_path, summary_path, expected_run_id):
     terminal = builder["terminal_record"]
     returns = terminal["returns"]
     if (not expected_run_id or builder["id"] != expected_run_id
-            or builder["workflow_name"] != "archon-implement"
+            or builder["workflow_name"] != policy["workflows"]["implementation"]["workflow"]
             or builder["status"] != "completed" or builder["outcome"] != "succeeded"
             or terminal["run_id"] != expected_run_id or terminal["status"] != "completed"
             or terminal["outcome"] != "succeeded" or returns["availability"] != "available"
-            or returns["node_id"] != "implement" or returns["value"].get("done") is not True
+            or returns["node_id"] != policy["workflows"]["implementation"]["node"] or returns["value"].get("done") is not True
             or returns["value"].get("green") is not True
             or returns["value"].get("red_cause") != ""
             or Path(builder["working_path"]).resolve() != candidate
@@ -106,8 +112,8 @@ def output_view(initial_path, builder_path, summary_path, expected_run_id):
                     "builder_run_id": expected_run_id, "builder_record_path": str(builder_path.resolve()),
                     "builder_record_sha256": digest(builder_path),
                     "output_source_digest": hashlib.sha256(json.dumps(list(pins.values()), sort_keys=True).encode()).hexdigest()})
-    check_view(view, candidate)
-    if not intake(view, summary)["ready"]:
+    check_view(view, candidate, policy)
+    if not intake(view, summary, policy)["ready"]:
         raise ValueError("same original allocation no longer owns the output")
     return view
 
@@ -118,9 +124,10 @@ if __name__ == "__main__":
     parser.add_argument("builder_get", type=Path)
     parser.add_argument("fresh_summary", type=Path)
     parser.add_argument("--expected-run-id", required=True)
+    parser.add_argument("--policy", type=Path, required=True)
     args = parser.parse_args()
     try:
         print(json.dumps(output_view(args.initial_release, args.builder_get, args.fresh_summary,
-                                     args.expected_run_id), indent=2))
-    except (ValueError, KeyError, TypeError, OSError, subprocess.SubprocessError) as error:
+                                     args.expected_run_id, load_policy(args.policy)), indent=2))
+    except (ValueError, KeyError, TypeError, OSError, RecursionError, subprocess.SubprocessError) as error:
         parser.exit(2, f"output candidate held: {error}\n")

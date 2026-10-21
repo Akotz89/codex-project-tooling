@@ -6,7 +6,7 @@ from pathlib import Path
 
 def identity(root):
     value = hashlib.sha256()
-    for name in ("linear_intake.py", "acceptance.py", "candidate_identity.py"):
+    for name in ("linear_intake.py", "acceptance.py", "candidate_identity.py", "project_policy.py"):
         path = Path(root) / "harness" / name
         if not path.is_file() or path.is_symlink() or not path.stat().st_size:
             raise ValueError(f"missing or unsafe runtime executable: {name}")

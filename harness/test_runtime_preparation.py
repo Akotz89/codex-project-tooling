@@ -1,4 +1,5 @@
 import json
+from test_project_policy import POLICY
 from pathlib import Path
 import shutil
 import subprocess
@@ -23,7 +24,7 @@ class RuntimePreparationTests(unittest.TestCase):
         self.root = self.fixture.root
         (self.root / "harness").mkdir()
         here = Path(__file__).resolve().parent
-        for name in ("linear_intake.py", "candidate_identity.py"):
+        for name in ("linear_intake.py", "candidate_identity.py", "project_policy.py"):
             shutil.copyfile(here / name, self.root / "harness" / name)
         # Parser/preparation fixture only; never a native builder result.
         (self.root / "harness/acceptance.py").write_text("# explicit unit-test fixture\n")
@@ -35,7 +36,7 @@ class RuntimePreparationTests(unittest.TestCase):
 
     def test_real_cli_mutation_is_detectable_and_original_unchanged(self):
         original = identity(self.root)
-        result = prepare(self.root, self.release, self.summary, self.output)
+        result = prepare(self.root, self.release, self.summary, self.output, POLICY)
         self.assertEqual(result["baseline"], original)
         self.assertEqual(identity(self.root), original)
         self.assertNotEqual(result["negative"], original)
@@ -44,7 +45,7 @@ class RuntimePreparationTests(unittest.TestCase):
                 (self.root, "missing-lease.json", 3),
                 (self.output / "negative", "missing-lease.json", 0)]:
             observed = subprocess.run([sys.executable, str(target / "harness/linear_intake.py"),
-                str(self.output / "release.json"), str(self.output / snapshot)],
+                str(self.output / "release.json"), str(self.output / snapshot), "--policy", str(self.output / "policy.json")],
                 capture_output=True, text=True, timeout=10)
             self.assertEqual(observed.returncode, expected, observed.stderr)
             self.assertEqual(json.loads(observed.stdout)["ready"], expected == 0)
@@ -54,14 +55,14 @@ class RuntimePreparationTests(unittest.TestCase):
     def test_missing_real_implementation_refuses_before_output(self):
         (self.root / "harness/acceptance.py").unlink()
         with self.assertRaises(ValueError):
-            prepare(self.root, self.release, self.summary, self.output)
+            prepare(self.root, self.release, self.summary, self.output, POLICY)
         self.assertFalse(self.output.exists())
 
     def test_unready_ownership_refuses_without_materializing(self):
         self.fixture.task["lease"] = False
         self.summary.write_text(json.dumps(self.fixture.summary))
         with self.assertRaises(ValueError):
-            prepare(self.root, self.release, self.summary, self.output)
+            prepare(self.root, self.release, self.summary, self.output, POLICY)
         self.assertFalse(self.output.exists())
 
     def test_existing_output_is_preserved(self):
@@ -69,7 +70,7 @@ class RuntimePreparationTests(unittest.TestCase):
         sentinel = self.output / "historical.json"
         sentinel.write_text("old evidence")
         with self.assertRaises(FileExistsError):
-            prepare(self.root, self.release, self.summary, self.output)
+            prepare(self.root, self.release, self.summary, self.output, POLICY)
         self.assertEqual(sentinel.read_text(), "old evidence")
 
 

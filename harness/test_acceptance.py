@@ -1,5 +1,6 @@
 """Parser fixtures only: none of these documents are native run evidence."""
 import copy
+from test_project_policy import POLICY
 import hashlib
 import json
 import os
@@ -13,7 +14,7 @@ import tempfile
 import unittest
 
 from candidate_identity import identity
-from acceptance import (WORKFLOWS, NATIVE_OUTCOMES, SUITE_VERDICTS,
+from acceptance import (NATIVE_OUTCOMES, SUITE_VERDICTS,
                         IMPLEMENTATION_RED_CAUSES, REVIEW_ACTIONS)
 
 
@@ -28,7 +29,7 @@ class AcceptanceTests(unittest.TestCase):
         self.directory = Path(self.temp.name)
         self.root = self.directory / "candidate"
         (self.root / "harness").mkdir(parents=True)
-        for name in ("acceptance.py", "linear_intake.py", "candidate_identity.py"):
+        for name in ("acceptance.py", "linear_intake.py", "candidate_identity.py", "project_policy.py"):
             shutil.copyfile(HERE / name, self.root / "harness" / name)
         (self.root / "fixture-target.txt").write_text("Explicit parser fixture target\n")
         for args in (["init", "-q"], ["add", "harness", "fixture-target.txt"],
@@ -45,9 +46,9 @@ class AcceptanceTests(unittest.TestCase):
             "version": 1,
             "candidate": {"root": str(self.root), "git_head": self.head,
                           "executable_identity": self.baseline},
-            "allocation": {"issue": "CPI-402", "project_id": "P-CPI-10",
+            "allocation": {"issue": "APP-42", "project_id": "sample-project",
                            "task_id": "fixture-task", "dispatch_id": "fixture-dispatch",
-                           "worker": "fixture-worker", "worker_thread_id": "fixture-thread"},
+                           "worker": "builder", "worker_thread_id": "fixture-thread"},
             "controls": {"baseline": self.baseline, "negative": self.negative,
                          "wrong_requested_identity": self.wrong},
             "records": {},
@@ -61,10 +62,8 @@ class AcceptanceTests(unittest.TestCase):
             "runtime_suite": self.suite(),
             "wrong_identity": self.runtime(self.baseline, "inconclusive"),
         }
-        workflows = {"implementation": ("archon-implement", "implement"),
-                     "review": ("archon-review", "publish"),
-                     "runtime_suite": ("archon-verify-runtime-suite", "compare"),
-                     "wrong_identity": ("archon-verify-runtime", "gate-verified")}
+        workflows = {purpose: (entry["workflow"], entry["node"])
+                     for purpose, entry in POLICY["workflows"].items()}
         self.documents = {}
         for role, (workflow, node) in workflows.items():
             run_id = "fixture-" + role.replace("_", "-")
@@ -177,7 +176,9 @@ class AcceptanceTests(unittest.TestCase):
     def run_cli(self, expected):
         path = self.directory / "bundle.fixture.json"
         path.write_text(json.dumps(self.bundle))
-        process = subprocess.run([sys.executable, str(CLI), str(path)],
+        policy_path = self.directory / "policy.fixture.json"
+        policy_path.write_text(json.dumps(POLICY))
+        process = subprocess.run([sys.executable, str(CLI), str(path), "--policy", str(policy_path)],
                                  capture_output=True, text=True, timeout=10)
         self.assertEqual(process.returncode, expected, process.stdout + process.stderr)
         self.assertNotIn("Traceback", process.stderr)
@@ -191,6 +192,23 @@ class AcceptanceTests(unittest.TestCase):
         result = self.run_cli(0)
         self.assertEqual(result["allocation"], self.bundle["allocation"])
         self.assertEqual(result["candidate"], self.bundle["candidate"])
+
+    def test_allocation_and_each_workflow_are_bound_to_caller_policy(self):
+        for field in ("project_id", "issue", "worker"):
+            original = self.bundle["allocation"][field]
+            self.bundle["allocation"][field] = "foreign"
+            self.run_cli(2)
+            self.bundle["allocation"][field] = original
+        for purpose, record in self.documents.items():
+            for target, field in ((record, "workflow_name"),
+                                  (record["terminal_record"]["returns"], "node_id")):
+                original = target[field]
+                target[field] = "foreign"
+                self.save_records()
+                self.run_cli(2)
+                target[field] = original
+        self.save_records()
+        self.run_cli(0)
 
     def test_identity_is_executable_sha_without_bundle(self):
         process = subprocess.run([sys.executable, str(CLI), "--identity"],
@@ -290,7 +308,7 @@ class AcceptanceTests(unittest.TestCase):
         self.run_cli(2)
         receipt = self.directory / "launch.fixture.json"
         receipt.write_text(json.dumps({"run_id": "fixture-wrong-identity",
-                                      "workflow_name": "archon-verify-runtime",
+                                      "workflow_name": POLICY["workflows"]["wrong_identity"]["workflow"],
                                       "working_path": str(self.root), "inputs": {"candidate": self.wrong}}))
         self.bundle["wrong_identity_launch_receipt"] = self.pin(receipt, "fixture-wrong-identity")
         self.run_cli(0)
@@ -398,7 +416,9 @@ class AcceptanceTests(unittest.TestCase):
                     json.dumps({"fixture_padding": "x" * (1024 * 1024)})):
             with self.subTest(size=len(raw)):
                 path.write_text(raw)
-                process = subprocess.run([sys.executable, str(CLI), str(path)],
+                policy_path = self.directory / "policy.fixture.json"
+                policy_path.write_text(json.dumps(POLICY))
+                process = subprocess.run([sys.executable, str(CLI), str(path), "--policy", str(policy_path)],
                                          capture_output=True, text=True, timeout=10)
                 self.assertEqual(process.returncode, 2, process.stdout + process.stderr)
                 self.assertEqual(json.loads(process.stdout)["action"], "hold")
@@ -601,7 +621,7 @@ class AcceptanceTests(unittest.TestCase):
         self.save_records()
         self.run_cli(2)
         receipt = self.directory / "suite-launch.fixture.json"
-        data = {"run_id": "fixture-runtime-suite", "workflow_name": "archon-verify-runtime-suite",
+        data = {"run_id": "fixture-runtime-suite", "workflow_name": POLICY["workflows"]["runtime_suite"]["workflow"],
                 "working_path": str(self.root), "inputs": {"manifest": str(self.manifest)}}
         receipt.write_text(json.dumps(data))
         self.bundle["runtime_suite_launch_receipt"] = self.pin(receipt, data["run_id"])
@@ -661,11 +681,12 @@ class AcceptanceTests(unittest.TestCase):
         path.write_text(json.dumps(original))
 
     def native_source(self, relative, expected_hash):
-        revision = json.loads((HERE.parent / "factory/pack.json").read_text())["integration_revision_required"]
-        from factory.consumer import read_settings
-        settings = read_settings(HERE.parent)
-        self.assertEqual(settings["revision"], revision)
-        path = Path(settings["source"]) / ".archon/workflows/sdlc" / relative
+        revision = json.loads((HERE.parent / "template/factory/pack.json").read_text())["integration_revision_required"]
+        source = os.environ.get("ARCHON_SOURCE")
+        self.assertTrue(source, "ARCHON_SOURCE must name the installed pinned source for conformance")
+        observed = subprocess.check_output(["git", "-C", source, "rev-parse", "HEAD"], text=True).strip()
+        self.assertEqual(observed, revision)
+        path = Path(source) / ".archon/workflows/sdlc" / relative
         self.assertTrue(path.is_file(), "Installed pinned Archon source required for native conformance")
         self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), expected_hash)
         return path
@@ -685,7 +706,10 @@ class AcceptanceTests(unittest.TestCase):
             "wrong_identity": ("verify-runtime", "ed716e0a233a384f54a06bad07cd34bbe6da382e100c5e1c5d88f3e1122dcb39"),
         }
         for role, (folder, digest) in owners.items():
-            workflow, node = WORKFLOWS[role]
+            workflow, node = {"implementation": ("archon-implement", "implement"),
+                              "review": ("archon-review", "publish"),
+                              "runtime_suite": ("archon-verify-runtime-suite", "compare"),
+                              "wrong_identity": ("archon-verify-runtime", "gate-verified")}[role]
             path = self.native_source(f"{folder}/archon-{folder}.yaml", digest)
             declarations = dict(line.split(": ", 1) for line in path.read_text().splitlines()
                                 if line.startswith(("name: ", "returns: ")))
@@ -722,16 +746,17 @@ class AcceptanceTests(unittest.TestCase):
         fixture = test_runtime_preparation.RuntimePreparationTests()
         self.addCleanup(fixture.doCleanups)
         fixture.setUp()
-        prepare(fixture.root, fixture.release, fixture.summary, fixture.output)
+        prepare(fixture.root, fixture.release, fixture.summary, fixture.output, POLICY)
         expected = [self.source_pin(fixture.output / filename)
-                    for filename in ("release.json", "summary.json", "missing-lease.json")]
+                    for filename in ("release.json", "summary.json", "policy.json", "missing-lease.json")]
         for filename, target in (("baseline.json", fixture.root),
                                  ("negative.json", fixture.output / "negative")):
             scenario = json.loads((fixture.output / filename).read_text())
             self.assertEqual(scenario["context"]["required_inputs"], expected)
             for index, snapshot in enumerate(("summary.json", "missing-lease.json")):
                 argv = ["python", str(target / "harness/linear_intake.py"),
-                        str(fixture.output / "release.json"), str(fixture.output / snapshot)]
+                        str(fixture.output / "release.json"), str(fixture.output / snapshot),
+                        "--policy", str(fixture.output / "policy.json")]
                 self.assertIn(shlex.join(argv), scenario["assertions"][index]["description"])
             native = self.native_script("verify-runtime/scripts/read-scenario.py",
                                        "788353f076f5dd73544088200e1f0996d142eb93583bbaa31478ec22b7c161de",
