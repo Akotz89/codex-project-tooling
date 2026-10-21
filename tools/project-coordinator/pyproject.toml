@@ -1,0 +1,21 @@
+[project]
+name = "wow-project-coordinator"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["langgraph==1.2.2", "langgraph-checkpoint-sqlite==3.1.0"]
+
+[project.scripts]
+project-coordinator = "project_coordinator.cli:main"
+
+[build-system]
+requires = ["setuptools==82.0.1"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[dependency-groups]
+dev = ["pytest==9.0.2"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
