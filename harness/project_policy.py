@@ -18,7 +18,8 @@ def validate_policy(policy):
     if not canonical(policy["project_id"]):
         raise ValueError("policy: invalid project_id")
     roles = policy["worker_roles"]
-    if (not isinstance(roles, list) or not roles or not all(canonical(role) for role in roles)
+    if (not isinstance(roles, list) or not roles
+            or not all(canonical(role) and re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", role) for role in roles)
             or len(set(roles)) != len(roles)):
         raise ValueError("policy: worker_roles must be nonempty unique canonical strings")
     if not canonical(policy["linear_workspace"]) or not re.fullmatch(r"[A-Za-z0-9_-]+", policy["linear_workspace"]):

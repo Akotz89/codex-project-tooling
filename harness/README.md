@@ -27,7 +27,8 @@ The caller owns this policy; save a project-specific copy outside the generic ha
 ```
 
 The exact fields and four workflow purposes are required. Values must be nonempty
-canonical strings, worker roles unique, workspace a URL segment, and issue an
+canonical strings; worker roles must be unique and match
+`[a-z][a-z0-9_-]{0,63}`; the workspace must be a URL segment and the issue an
 uppercase key plus numeric suffix. Workflow names must be distinct. The neutral
 names above are examples: choose the actual workflow and selected return node for
 each purpose. Those workflows must retain the structured native evidence contract;

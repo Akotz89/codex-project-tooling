@@ -34,7 +34,8 @@ class PolicyTests(unittest.TestCase):
                     for missing in POLICY]
         for field, values in {
                 "project_id": ["", " x ", None],
-                "worker_roles": [[], ["builder", "builder"], [None], "builder"],
+                "worker_roles": [[], ["builder", "builder"], [None], ["../worker"], ["Worker"],
+                                 ["a" * 65], "builder"],
                 "linear_workspace": ["", "../team", "team/issue"],
                 "acceptance_issue": ["", "APP", "APP-42/other"],
                 "workflows": [{}, [], {**POLICY["workflows"], "extra": {}}]}.items():
