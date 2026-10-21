@@ -1,16 +1,14 @@
 {
   "event_id": "example-init-1",
   "project": {
-    "project_id": "P-CPI-10",
-    "root": "/home/aaron/Documents/ChatGPT/wow private server",
-    "linear_ref": "https://linear.app/codex-azyrra/project/build-playerbots-wotlk-server-d5f6d232c150",
-    "beads_ref": "global-cpi-399",
-    "coordinator_thread_id": "01a1417d-f106-7af3-8319-010fe1993e16",
+    "project_id": "example-project",
+    "root": "/absolute/canonical/project",
+    "linear_ref": "https://linear.app/example/project/example-project",
+    "beads_ref": "global:example-execution",
+    "coordinator_thread_id": "coordinator-thread",
     "workers": {
-      "core1": "01a14766-d0b8-7dd2-8c32-8eac9490075b",
-      "core2": "01a14766-fe5e-7c03-953f-1463ca5f0c53",
-      "core3": "01a14767-4d1c-7291-a683-54fb2e5a130d",
-      "core4": "01a14ab2-e0ad-7ec1-b2f2-5926e53b1b84"
+      "implementer": "implementation-thread",
+      "reviewer": "review-thread"
     }
   }
 }

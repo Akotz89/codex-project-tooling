@@ -8,9 +8,9 @@ Run `uv sync --locked --project tools/project-coordinator` then `scripts/project
 
 Every mutating command requires a unique `event_id` string. Identical event IDs and canonical payloads return REPLAY; altered payloads with the same ID are rejected. A replay never exposes native arguments again. Status/summary/recover need no event ID.
 
-`init`: `{ "event_id":"init-1", "project": { "project_id": "P-CPI-10", "root": "/absolute/canonical/project", "linear_ref": "https://linear.app/...", "beads_ref": "global:execution-id", "coordinator_thread_id": "actual-root-thread", "workers": {"core1":"actual-thread", "core2":"actual-thread", "core3":"actual-thread", "core4":"actual-thread"} } }`
+`init`: `{ "event_id":"init-1", "project": { "project_id": "example-project", "root": "/absolute/canonical/project", "linear_ref": "https://linear.app/...", "beads_ref": "global:execution-id", "coordinator_thread_id": "actual-root-thread", "workers": {"implementer":"implementation-thread", "reviewer":"review-thread"} } }`
 
-All other commands require common binding `{ "project_id":"P-CPI-10", "root":"/absolute/canonical/project" }` plus:
+All other commands require common binding `{ "project_id":"example-project", "root":"/absolute/canonical/project" }` plus:
 
 | Command | Additional fields |
 | --- | --- |
@@ -63,4 +63,4 @@ Worker replacement is a checkpointed `rebind` event, never a manual dictionary e
 
 `summary` uses a query-only read transaction on the existing database. It neither creates an absent database/lock nor invokes/resumes the graph, reconciles dispatches or sends native requests. It reports checkpoint identity and `recovery_required` for pending checkpoints; `pending_checkpoint` and `uncertain_held_dispatches` distinguish pending graph execution from stored uncertain ownership. Explicitly recover/reconcile as appropriate. The returned project/workers/tasks keys remain, but task details are a compact allowlist (identity, state, ownership, dependencies, blockers and tracking refs). Worker evidence, prompts, events, receipts, native arguments and full history are omitted. Held tasks sort first, then task ID. `bounds` reports total tasks, next offset, string/list limits and every truncated field. Continue with the same limit and `next_offset`; a changing checkpoint ID means restart pagination for a coherent snapshot. Unreturned rows/fields are not proof of absence. Status/recover keep their earlier full responses and recovery side effects.
 
-Summary returns only the four schema roles core1..core4. Unexpected stored roles are omitted with total/omitted counts and a fixed truncation diagnostic; full status retains them for investigation. Output bounds do not bound the memory needed to deserialize the latest checkpoint or the work needed to evaluate readiness.
+Worker roles come from the nonempty project `workers` map. Names match `[a-z][a-z0-9_-]{0,63}`; every worker thread and the coordinator thread must be distinct. Tasks, observations and replacements must name a bound role. Summary returns the first 32 safe project roles in lexical order. Excess, invalid or unbound stored roles are omitted with total/omitted counts and a fixed truncation diagnostic; full status retains them for investigation. Output bounds do not bound the memory needed to deserialize the latest checkpoint or the work needed to evaluate readiness.

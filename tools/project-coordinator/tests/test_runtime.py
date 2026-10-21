@@ -13,14 +13,15 @@ from project_coordinator.runtime import InvalidEvent, apply_event, build_graph, 
 
 
 class Harness:
-    def __init__(self, root):
+    def __init__(self, root, workers=None):
         self.root = root
         self.db = root / "state.sqlite"
+        self.workers = workers if workers is not None else {f"core{i}": f"thread{i}" for i in range(1, 5)}
         self.binding = {"project_id": "P-test", "root": str(root)}
         self.call("init", project={**self.binding, "linear_ref": "linear:399", "beads_ref": "global:399",
-                                  "coordinator_thread_id": "root", "workers": {f"core{i}": f"thread{i}" for i in range(1, 5)}})
-        for i in range(1, 5):
-            self.call("observe", worker=f"core{i}", state="IDLE", evidence="actual observation fixture")
+                                  "coordinator_thread_id": "root", "workers": self.workers})
+        for role in self.workers:
+            self.call("observe", worker=role, state="IDLE", evidence="actual observation fixture")
 
     def call(self, op, **fields):
         return apply_event(self.db, {**self.binding, "op": op, "event_id": str(uuid.uuid4()), **fields})
@@ -37,7 +38,7 @@ class Harness:
         prepared = self.prepare(name)
         dispatch = prepared["dispatch_id"]
         response = self.call("issue", task_id=name, dispatch_id=dispatch)
-        assert response["native_request"]["arguments"]["threadId"] == self.task(name)["worker"].replace("core", "thread")
+        assert response["native_request"]["arguments"]["threadId"] == self.workers[self.task(name)["worker"]]
         return dispatch
 
     def task(self, name="A"):
@@ -51,9 +52,9 @@ class Harness:
     def result(self, dispatch, name="A", **changes):
         task = self.task(name)
         artifact = self.file(f"{name}-output.json", {"actual": "output"})
-        native = self.file(f"{name}-native.json", {"threadId": task["worker"].replace("core", "thread"),
+        native = self.file(f"{name}-native.json", {"threadId": self.workers[task["worker"]],
                                                     "dispatch_id": dispatch, "terminal": "fixture final"})
-        result = {"thread_id": task["worker"].replace("core", "thread"), "dispatch_id": dispatch,
+        result = {"thread_id": self.workers[task["worker"]], "dispatch_id": dispatch,
                   "source_digest": "source-1", "scope_digest": "scope-1", "terminal": True, "quiescent": True,
                   "child_exit_code": 0, "acceptance": True, "artifacts": [artifact], "native_evidence": native, **changes}
         receipt = self.file(f"{name}-result.json", result)
@@ -433,3 +434,45 @@ def test_existing_v1_closed_failed_model_recovers_without_new_fields(h):
     for op in ("status", "recover"):
         task = h.call(op)["tasks"][0]
         assert task["status"] == "FAILED" and task["lease"] is False
+
+
+def test_project_defined_workers_dispatch_and_compact_status(tmp_path):
+    workers = {"implementer": "implementation-thread", "review_qa-2": "review-thread"}
+    harness = Harness(tmp_path, workers)
+    for index, role in enumerate(workers):
+        task_id = f"task-{index}"
+        harness.add(task_id, role)
+        dispatch = harness.issue(task_id)
+        assert harness.result(dispatch, task_id)["action"] == "COMPLETE"
+    summary = harness.call("summary")
+    assert summary["project"]["workers"] == workers
+    assert set(summary["workers"]) == set(workers)
+    assert {task["worker"] for task in summary["tasks"]} == set(workers)
+    assert summary["bounds"]["omitted_worker_roles"] == 0
+    assert all(task["status"] == "COMPLETE" for task in summary["tasks"])
+
+
+@pytest.mark.parametrize("role", ["", "../worker", "worker.name", "Worker", "a" * 65, "worker\n", "équipe", 1])
+def test_invalid_worker_roles_rejected_before_database_creation(tmp_path, role):
+    db = tmp_path / "absent" / "state.sqlite"
+    with pytest.raises(InvalidEvent, match="safe role"):
+        apply_event(db, {"op": "init", "event_id": "init", "project": {"project_id": "test", "root": str(tmp_path), "linear_ref": "linear:test", "beads_ref": "global:test", "coordinator_thread_id": "root", "workers": {role: "thread"}}})
+    assert not db.parent.exists()
+
+
+@pytest.mark.parametrize("workers", [{}, {"implementer": "same", "reviewer": "same"}, {"implementer": "root"}])
+def test_empty_roster_and_shared_thread_bindings_rejected(tmp_path, workers):
+    with pytest.raises(InvalidEvent):
+        Harness(tmp_path, workers)
+
+
+@pytest.mark.parametrize("op", ["add", "observe", "rebind"])
+@pytest.mark.parametrize("role", ["invalid/name", "unbound"])
+def test_worker_events_require_safe_bound_roles(h, op, role):
+    with pytest.raises(InvalidEvent, match="worker role|unbound worker"):
+        if op == "add":
+            h.add(worker=role)
+        elif op == "observe":
+            h.call(op, worker=role, state="IDLE", evidence="observation")
+        else:
+            h.call(op, worker=role, expected_old_thread_id="thread1", new_thread_id="replacement", evidence="observation")

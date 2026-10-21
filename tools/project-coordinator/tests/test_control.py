@@ -8,7 +8,7 @@ import subprocess
 import pytest
 from langgraph.checkpoint.sqlite import SqliteSaver
 from project_coordinator.runtime import InvalidEvent, apply_event, build_graph, completion_valid
-from test_runtime import h
+from test_runtime import Harness, h
 
 
 def model(h):
@@ -230,7 +230,8 @@ def test_summary_extra_worker_keys_are_omitted_with_honest_bounds(h):
         config = {'configurable': {'thread_id': 'project-coordinator-v1'}}
         state = graph.get_state(config).values['model']
         for role in [giant_role, *[f'extra{n}' for n in range(110)]]:
-            state['project']['workers'][role] = 'extra-thread'
+            if role == giant_role:
+                state['project']['workers'][role] = 'extra-thread'
             state['workers'][role] = {'state': 'UNKNOWN', 'evidence': 'not output'}
         graph.update_state(config, {'model': state}, as_node='readiness')
     response = h.call('summary')
@@ -259,3 +260,14 @@ def test_summary_sql_trace_is_query_only(h, monkeypatch):
     assert all(query.split()[0].upper() in {'PRAGMA', 'BEGIN', 'SELECT'} for query in queries)
     with pytest.raises(sqlite3.ProgrammingError, match='closed'):
         connections[0].execute('SELECT 1')
+
+
+def test_summary_bounds_project_defined_roster(tmp_path):
+    harness = Harness(tmp_path, {f"worker-{i:02}": f"thread-{i}" for i in range(40)})
+    summary = harness.call('summary')
+    assert list(summary['project']['workers']) == [f"worker-{i:02}" for i in range(32)]
+    assert set(summary['workers']) == set(summary['project']['workers'])
+    assert summary['bounds']['worker_role_count'] == 40
+    assert summary['bounds']['omitted_worker_roles'] == 8
+    assert summary['bounds']['truncated_fields'] == ['workers.extra_roles']
+    assert len(harness.call('status')['workers']) == 40

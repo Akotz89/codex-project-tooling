@@ -6,6 +6,7 @@ from contextlib import closing
 import fcntl
 import hashlib
 import json
+import re
 from pathlib import Path
 import sqlite3
 from typing import TypedDict
@@ -34,6 +35,10 @@ def string(value):
     return isinstance(value, str) and bool(value)
 
 
+def worker_role(value):
+    return isinstance(value, str) and re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", value) is not None
+
+
 def validate_event(event):
     require(isinstance(event, dict), "event must be an object")
     op = event.get("op")
@@ -46,7 +51,7 @@ def validate_event(event):
         for field in ("root", "project_id", "linear_ref", "beads_ref", "coordinator_thread_id"):
             require(string(project.get(field)), f"project.{field} required")
         workers = project.get("workers")
-        require(isinstance(workers, dict) and set(workers) == {"core1", "core2", "core3", "core4"}, "bind exactly core1..core4")
+        require(isinstance(workers, dict) and bool(workers) and all(worker_role(role) for role in workers), "workers must bind nonempty safe role names")
         require(all(string(value) for value in workers.values()), "worker thread IDs must be strings")
     else:
         require(string(event.get("project_id")) and string(event.get("root")), "project_id and root required")
@@ -57,8 +62,11 @@ def validate_event(event):
         require(set(task) == fields, "task requires exactly the documented fields; reserved/unknown fields forbidden")
         for field in fields - {"dependencies", "writer_paths"}:
             require(string(task[field]), f"task.{field} required")
+        require(worker_role(task["worker"]), "invalid worker role")
         for field in ("dependencies", "writer_paths"):
             require(isinstance(task[field], list) and all(string(value) for value in task[field]), f"task.{field} must be a list of nonempty strings")
+    if op in {"observe", "rebind"}:
+        require(worker_role(event.get("worker")), "invalid worker role")
     if op == "summary":
         require(type(event.get("offset", 0)) is int and event.get("offset", 0) >= 0, "invalid status offset")
         require(type(event.get("limit", 50)) is int and 1 <= event.get("limit", 50) <= 100, "invalid status limit")
@@ -248,9 +256,8 @@ def transition(state):
         project["root"] = str(Path(project["root"]).resolve(strict=True))
         for field in ("project_id", "linear_ref", "beads_ref", "coordinator_thread_id"):
             require(isinstance(project.get(field), str) and project[field], f"project.{field} required")
-        require(set(project["workers"]) == {"core1", "core2", "core3", "core4"}, "bind exactly core1..core4")
         ids = list(project["workers"].values()) + [project["coordinator_thread_id"]]
-        require(len(set(ids)) == 5 and all(isinstance(i, str) and i for i in ids), "five distinct native thread IDs required")
+        require(len(set(ids)) == len(ids), "distinct native thread IDs required")
         if model:
             require(model["project"] == project, "database already bound to a different project")
         else:
@@ -468,16 +475,16 @@ def compact_status(state, event, checkpoint_id=None, pending=()):
         if task["status"] == "ISSUING":
             item["status"] = "UNKNOWN"
         page.append(bounded(item, f"tasks.{offset + len(page)}"))
-    roles = {"core1", "core2", "core3", "core4"}
+    roles = set(sorted(role for role in model["project"]["workers"] if worker_role(role))[:32])
     all_roles = set(model["project"]["workers"]) | set(model["workers"])
     if all_roles - roles:
         truncated.add("workers.extra_roles")
     project = {k: model["project"][k] for k in ("project_id", "root", "linear_ref", "beads_ref", "coordinator_thread_id")}
-    project["workers"] = {k: v for k, v in model["project"]["workers"].items() if k in roles}
+    project["workers"] = {k: model["project"]["workers"][k] for k in sorted(roles)}
     uncertain = sum(bool(t.get("lease")) and t["status"] in {"ISSUING", "UNKNOWN", "FAILED"} for t in tasks)
     return {"action": "OK", "checkpoint_id": checkpoint_id,
             "project": bounded(project, "project"),
-            "workers": bounded({k: {"state": v["state"]} for k, v in model["workers"].items() if k in roles}, "workers"),
+            "workers": bounded({k: {"state": model["workers"][k]["state"]} for k in sorted(roles) if k in model["workers"]}, "workers"),
             "tasks": page, "resumed_checkpoint": False, "recovery_required": bool(pending) or bool(uncertain),
             "pending_checkpoint": bool(pending), "uncertain_held_dispatches": uncertain,
             "bounds": {"offset": offset, "limit": limit, "total_tasks": len(tasks),

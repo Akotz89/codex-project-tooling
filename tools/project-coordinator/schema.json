@@ -56,12 +56,7 @@
       "type": "string"
     },
     "worker": {
-      "enum": [
-        "core1",
-        "core2",
-        "core3",
-        "core4"
-      ]
+      "$ref": "#/$defs/worker_role"
     },
     "state": {
       "enum": [
@@ -128,31 +123,14 @@
         },
         "workers": {
           "type": "object",
-          "required": [
-            "core1",
-            "core2",
-            "core3",
-            "core4"
-          ],
-          "properties": {
-            "core1": {
-              "type": "string",
-              "minLength": 1
-            },
-            "core2": {
-              "type": "string",
-              "minLength": 1
-            },
-            "core3": {
-              "type": "string",
-              "minLength": 1
-            },
-            "core4": {
-              "type": "string",
-              "minLength": 1
-            }
+          "minProperties": 1,
+          "propertyNames": {
+            "$ref": "#/$defs/worker_role"
           },
-          "additionalProperties": false
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1
+          }
         }
       }
     },
@@ -183,8 +161,7 @@
           "minLength": 1
         },
         "worker": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/$defs/worker_role"
         },
         "prompt": {
           "type": "string",
@@ -234,6 +211,11 @@
           "minimum": 0
         }
       }
+    },
+    "worker_role": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{0,63}(?![\\s\\S])",
+      "maxLength": 64
     }
   },
   "allOf": [
