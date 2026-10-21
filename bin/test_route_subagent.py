@@ -153,6 +153,88 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(result['spawn_agent'], {'model': 'gpt-6-luna', 'reasoning_effort': 'max', 'fork_turns': 'none'})
         self.assertEqual(json.loads(Path(result['receipt_path']).read_text()), result)
 
+    def test_actual_payload_has_separate_sourced_economics_and_unknowns(self):
+        seen = []
+        code, result, _ = self.command(transport=lambda p, *_: seen.append(p) or self.answer(p))
+        self.assertEqual(code, 0)
+        payload = seen[0]
+        context = payload['state']['economic_context']
+        self.assertEqual(context['version'], 'CPI404_COST_CONTEXT_20261021_V1')
+        self.assertEqual(payload['state']['task'], self.request['task'])
+        self.assertEqual(set(payload['questions']), {'worker_pair'})
+        panels = {(p['model'], p['benchmark']): p for p in context['panels']}
+        self.assertEqual(len(panels), 4)
+        for model, efforts in jev_router.WORKER_EFFORTS.items():
+            for benchmark in ['VulcanBench Frontier v4 retired-binary parity', 'DeepSWE v1.1 Score']:
+                panel = panels[model, benchmark]
+                self.assertEqual({row[0] for row in panel['rows']}, efforts)
+                self.assertTrue(panel['source_url'].startswith('https://'))
+                self.assertTrue(panel['accessed'].startswith('2026-10-2'))
+                self.assertIn('protocol', panel)
+                self.assertIn('report_date', panel)
+        luna = panels['gpt-6-luna', 'VulcanBench Frontier v4 retired-binary parity']
+        sol = panels['gpt-6.1-sol', 'VulcanBench Frontier v4 retired-binary parity']
+        self.assertEqual((luna['protocol'], luna['solver_cli'], luna['report_date']),
+                         ('3.16', '0.155.0', '2026-09-28'))
+        self.assertEqual((sol['protocol'], sol['solver_cli'], sol['report_date']),
+                         ('3.18', '0.159.0', '2026-10-01'))
+        self.assertEqual(luna['rows'][3], ['xhigh', 71.9354, 5.4728, 11, 23, 2, .159686, 21, False, 52.5745])
+        self.assertEqual(sol['rows'][2], ['high', 88.2342, .4008, 23, 23, 0, .33007, 23, True, 10.2219])
+        for model, expected in [('gpt-6-luna', ['max', 66.6, .22]), ('gpt-6.1-sol', ['high', 75.2, .65])]:
+            panel = panels[model, 'DeepSWE v1.1 Score']
+            self.assertEqual(panel['rows'][-1], expected)
+            self.assertEqual(panel['columns'], ['effort', 'quality_percent', 'published_cost_per_task_usd'])
+            for field in ['report_date', 'timing_seconds', 'sample_count', 'confidence_interval']:
+                self.assertIsNone(panel[field])
+        for field in ['ttft_seconds', 'generation_tokens_per_second']:
+            self.assertIsNone(luna[field])
+            self.assertIsNone(sol[field])
+        prices = {p['model']: p for p in context['api_prices']}
+        self.assertEqual(prices['gpt-6-luna']['input'], .1)
+        self.assertEqual(prices['gpt-6.1-sol']['output'], 10)
+        for price in prices.values():
+            self.assertEqual(price['units'], 'USD per million tokens')
+            self.assertIn('developers.openai.com', price['source_url'])
+            self.assertIn('tool/cache-write charges excluded', price['service_tier'])
+        self.assertTrue(all(v is None for v in context['local_accounting'].values()))
+        wire = json.dumps(payload)
+        for historical in ['local_observations', 'local_cumulative_tokens', 'preparation_id',
+                           'source_sha256', 'HOST-CONFIG-OBSERVATION', 'jev-ccd70d9f',
+                           'jev-d73ef7e0', 'jev-1f376b5d', 'jev-655c0169', '2511187']:
+            self.assertNotIn(historical, wire)
+        for rule in ['qualitative cross-model choice is allowed', 'model identity',
+                     'protocol/date/harness confounds', 'No invalid pooled metric',
+                     'combined rank', 'Pareto claim', 'not local acceptance probability']:
+            self.assertIn(rule, context['comparison_rule'])
+        instructions = payload['questions']['worker_pair']['instructions']
+        for text in ['affordable useful accepted outcome', 'state.economic_context',
+                     'concrete task requirement', 'research/review label', 'subscription quota']:
+            self.assertIn(text, instructions)
+        self.assertEqual(result['receipt']['request_sha256'],
+                         __import__('hashlib').sha256(json.dumps(self.request, sort_keys=True).encode()).hexdigest())
+        context['local_accounting']['provider_billing_usd'] = 0
+        self.assertIsNone(jev_router.ECONOMIC_CONTEXT['local_accounting']['provider_billing_usd'])
+
+    def test_economic_context_and_question_participate_in_source_binding(self):
+        import shutil
+        source = self.base / 'economic-source'
+        shutil.copytree(BASE, source, ignore=shutil.ignore_patterns('.git', 'work', '__pycache__'))
+        spec = importlib.util.spec_from_file_location('economic_adapter', source / 'runtime/adapter.py')
+        adapter = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(adapter)
+        digest = adapter.source_digest(source)
+        for relative, before, after in [
+                ('runtime/factory/jev_router.py', b'CPI404_COST_CONTEXT_20261021_V1', b'CPI404_COST_CONTEXT_20261021_V2'),
+                ('template/factory/assessment_questions.json', b'affordable', b'expensive')]:
+            path = source / relative
+            self.assertIn(path, adapter.source_files(source))
+            original = path.read_bytes()
+            self.assertIn(before, original)
+            path.write_bytes(original.replace(before, after))
+            self.assertNotEqual(adapter.source_digest(source), digest)
+            path.write_bytes(original)
+            self.assertEqual(adapter.source_digest(source), digest)
+
     def test_safe_actual_response_provenance_preserves_unknowns_and_redacts_credential(self):
         code, result, _ = self.command(transport=lambda p, *_: {
             **self.answer(p), '_http': {'status': 200, 'request_id': 'offline-request-id'},
