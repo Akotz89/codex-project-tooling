@@ -66,6 +66,27 @@ def dispatch_input(event):
     return arguments, locator, binding
 
 
+def native_result_handle(response):
+    """Recognize supported spawn results, without widening generic identifiers."""
+    if (not isinstance(response, dict)
+            or set(response) - {'agent_id', 'agentId', 'task_name', 'nickname'}):
+        return None
+    handles = []
+    for key in ('agent_id', 'agentId', 'task_name'):
+        if key not in response or (key != 'task_name' and response[key] is None):
+            continue
+        value = response[key]
+        if key == 'task_name':
+            # V2: /root followed by the lowercase/digit/underscore task segments.
+            valid = isinstance(value, str) and re.fullmatch(r'/root(?:/[a-z0-9_]+)+', value)
+        else:
+            valid = _identifier(value)
+        if not valid:
+            return None
+        handles.append(value)
+    # Distinct aliases cannot be joined to one child from this result alone.
+    return handles[0] if handles and len(set(handles)) == 1 else None
+
 
 def native_caller_mapping(prepared, session_id):
     """WSL ThreadId only: raw UUID or exact native:<same UUID>, no task-path inference."""
@@ -203,10 +224,8 @@ def handle(event, root):
         response = event.get('tool_response')
         if isinstance(response, str):
             response = json.loads(response)
-        handle_id = response.get('agent_id') if isinstance(response, dict) else None
-        if handle_id is None and isinstance(response, dict):
-            handle_id = response.get('agentId')
-        observed = _identifier(handle_id)
+        handle_id = native_result_handle(response)
+        observed = handle_id is not None
         persist_private(path.with_suffix('.result.json'),
                         {'schema': 'CPI414NATIVERESULTV2', 'identity': identity,
                          'preparation_id': prepared['preparation_id'],

@@ -1244,5 +1244,130 @@ class EncryptedNativePreparationTests(unittest.TestCase):
             else:self.assertIn('native_transport_binding_mismatch',target.REFUSAL_REASONS)
         self.assertEqual(adapters.source_digest(source),bound['digest'])
 
+class NativeTaskNameResultTests(unittest.TestCase):
+    setUp = RoutingTests.setUp
+    project = RoutingTests.project
+    bound_request = RoutingTests.bound_request
+    answer = RoutingTests.answer
+    prepared_native = WorkerAdmissionTests.prepared_native
+    hook = WorkerAdmissionTests.hook
+    assert_denied = WorkerAdmissionTests.assert_denied
+
+    def post_result(self, response, *, carrier=True):
+        prepared, event = self.prepared_native(carrier=carrier)
+        path = Path(prepared['receipt_path'])
+        applied = self.hook(event)['hookSpecificOutput']['updatedInput']
+        post = {**event, 'hook_event_name': 'PostToolUse',
+                'tool_input': applied, 'tool_response': response}
+        self.assertEqual(self.hook(post), {})
+        return prepared, event, post, json.loads(path.with_suffix('.result.json').read_text())
+
+    def test_canonical_carrier_result_object_and_json_preserve_unknown_usage(self):
+        for encoded in (False, True):
+            with self.subTest(encoded=encoded):
+                prepared, event = self.prepared_native(carrier=True)
+                path = Path(prepared['receipt_path'])
+                applied = self.hook(event)['hookSpecificOutput']['updatedInput']
+                canonical = '/root/' + applied['task_name']
+                self.assertFalse(bridge._identifier(canonical))
+                response = {'task_name': canonical, 'nickname': None}
+                post = {**event, 'hook_event_name': 'PostToolUse', 'tool_input': applied,
+                        'tool_response': json.dumps(response) if encoded else response}
+                self.assertEqual(self.hook(post), {})
+                result = json.loads(path.with_suffix('.result.json').read_text())
+                self.assertEqual(result['status'], 'native_handle_observed')
+                self.assertEqual(result['native_handle'], canonical)
+                self.assertEqual(result['declared_task'], prepared['native_dispatch'])
+                reserved = json.loads(path.with_suffix('.consume.json').read_text())
+                self.assertEqual(result['observed_post_arguments_sha256'], reserved['applied_arguments_sha256'])
+                self.assertEqual(result['observed_post_message_sha256'], reserved['observed_message_sha256'])
+                for key in ('observed_model', 'observed_effort', 'worker_usage'):
+                    self.assertIsNone(result[key])
+                self.assertEqual(result['acceptance'], 'not_performed')
+                self.assertEqual(result['plaintext_attestation'], 'unavailable')
+                self.assertIn('native_dispatch_already_reserved', json.dumps(self.hook(post)))
+
+    def test_canonical_path_grammar_without_generic_identifier_expansion(self):
+        for value in ('/root/task_3', '/root/task1/task_3', '/root/' + 'a' * 1024):
+            self.assertEqual(native_hook.native_result_handle({'task_name': value}), value)
+            self.assertFalse(bridge._identifier(value))
+        for value in (None, 3, '', '/root', '/root/', 'task_3', 'root/task_3', '/other/task_3',
+                      '/root//task_3', '/root/task-3', '/root/Task3', '/root/task.3',
+                      '/root/../task_3', '/root/task_3/', '/root/task_3\n', '/root/修復'):
+            with self.subTest(value=value):
+                self.assertIsNone(native_hook.native_result_handle({'task_name': value}))
+
+    def test_legacy_ids_and_nullable_fallback_keep_plaintext_and_carrier_results(self):
+        for carrier in (False, True):
+            for response in ({'agent_id': 'worker:legacy'}, {'agentId': 'worker:legacy'},
+                             {'agent_id': None, 'agentId': 'worker:legacy'},
+                             {'agent_id': 'worker:legacy', 'agentId': 'worker:legacy'}):
+                with self.subTest(carrier=carrier, response=response):
+                    _, _, _, result = self.post_result(response, carrier=carrier)
+                    self.assertEqual(result['status'], 'native_handle_observed')
+                    self.assertEqual(result['native_handle'], 'worker:legacy')
+        self.assertIsNone(native_hook.native_result_handle({'agent_id': '/root/task_3'}))
+
+    def test_absent_malformed_error_and_conflicting_results_stay_unknown(self):
+        responses = [None, [], 'null', {}, {'nickname': 'only metadata'},
+                     {'task_name': '/root/invalid-name'}, {'agent_id': ['worker:a']},
+                     {'agent_id': 'worker:a', 'agentId': 'worker:b'},
+                     {'task_name': '/root/task_3', 'agent_id': 'worker:a'},
+                     {'task_name': '/root/task_3', 'agentId': 'worker:a'},
+                     {'task_name': None, 'agent_id': 'worker:a'},
+                     {'task_name': '/root/task_3', 'error': 'failure must not be success'},
+                     {'agent_id': 'worker:a', 'isError': True},
+                     {'agentId': 'worker:a', 'success': False},
+                     {'content': [{'task_name': '/root/task_3'}]}]
+        for response in responses:
+            with self.subTest(response=response):
+                _, _, _, result = self.post_result(response)
+                self.assertEqual(result['status'], 'unknown_native_result')
+                self.assertIsNone(result['native_handle'])
+                self.assertNotIn('failure must not be success', json.dumps(result))
+
+    def test_malformed_json_response_requires_reconciliation_without_result(self):
+        prepared, event = self.prepared_native(carrier=True)
+        path = Path(prepared['receipt_path'])
+        applied = self.hook(event)['hookSpecificOutput']['updatedInput']
+        post = {**event, 'hook_event_name': 'PostToolUse', 'tool_input': applied,
+                'tool_response': '{malformed private-like output'}
+        result = self.hook(post)
+        self.assertIn('requires reconciliation', result['hookSpecificOutput']['additionalContext'])
+        self.assertNotIn('private-like', json.dumps(result))
+        self.assertFalse(path.with_suffix('.result.json').exists())
+        self.assertTrue(path.with_suffix('.consume.json').exists())
+
+    def test_canonical_result_preserves_exact_opaque_and_identity_post_expiry_guards(self):
+        prepared, event = self.prepared_native(carrier=True)
+        path = Path(prepared['receipt_path'])
+        applied = self.hook(event)['hookSpecificOutput']['updatedInput']
+        reserved = path.with_suffix('.consume.json').read_bytes()
+        canonical = '/root/' + applied['task_name']
+        post = {**event, 'hook_event_name': 'PostToolUse', 'tool_input': applied,
+                'tool_response': {'task_name': canonical}}
+        changes = [('tool_input', 'message', 'opaque:v1:changed'),
+                   ('tool_input', 'task_name', 'cpi414_00'),
+                   ('tool_input', 'model', 'gpt-6.1-sol'),
+                   ('tool_input', 'reasoning_effort', 'ultra'),
+                   ('tool_input', 'fork_turns', 'all'),
+                   (None, 'session_id', '01a15564-fd5f-7550-aadb-de6160ef7b5e'),
+                   (None, 'turn_id', 'other-turn'), (None, 'tool_use_id', 'other-tool')]
+        for box, key, value in changes:
+            with self.subTest(key=key):
+                invalid = copy.deepcopy(post)
+                (invalid[box] if box else invalid)[key] = value
+                self.assertIn('requires reconciliation', self.hook(invalid)['hookSpecificOutput']['additionalContext'])
+                self.assertFalse(path.with_suffix('.result.json').exists())
+                self.assertEqual(path.with_suffix('.consume.json').read_bytes(), reserved)
+        with patch.object(native_hook.time, 'time', return_value=prepared['capability_expires_at'] + 10):
+            self.assert_denied(self.hook(event))
+            self.assertEqual(self.hook(post), {})
+        result = json.loads(path.with_suffix('.result.json').read_text())
+        self.assertEqual(result['native_handle'], canonical)
+        self.assertEqual(result['observed_post_arguments_sha256'],
+                         json.loads(reserved)['applied_arguments_sha256'])
+
+
 if __name__ == '__main__':
     unittest.main()
