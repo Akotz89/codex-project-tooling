@@ -29,9 +29,10 @@ _CODES = frozenset((
     'app_contract_topology',
     'app_identity_drift',
     'authority_pin_drift',
-    'caller_fixed_cap_drift',
     'capacity_infeasible',
     'capacity_sample_invalid',
+    'cgroup_domain',
+    'cpu_not_delegated',
     'compute_release_authority_drift',
     'compute_release_birth_coverage_drift',
     'compute_release_birth_present',
@@ -46,6 +47,7 @@ _CODES = frozenset((
     'cpu_budget',
     'cpu_manager_timespan',
     'duplicate_held_binding',
+    'delegation_manager',
     'dynamic_capacity_refused',
     'grant_cap_drift',
     'grant_config_pin_drift',
@@ -79,6 +81,11 @@ _CODES = frozenset((
     'invalid_counter_baseline_app_event',
     'invalid_counter_charged',
     'invalid_counter_contract_limit',
+    'invalid_counter_available_bytes',
+    'invalid_counter_disk_free_bytes',
+    'invalid_counter_free_inodes',
+    'invalid_counter_own_forecast',
+    'invalid_counter_promise_memory',
     'invalid_counter_file',
     'invalid_counter_shmem',
     'invalid_external_reserve',
@@ -87,6 +94,7 @@ _CODES = frozenset((
     'job_path_binding',
     'ledger_version',
     'manager_budget',
+    'management_throttled',
     'missing_cgroup',
     'missing_file_shmem_counter',
     'own_config_limits_drift',
@@ -100,7 +108,10 @@ _CODES = frozenset((
     'own_not_running',
     'own_ready_binding_drift',
     'own_unexpected_ledger_record',
+    'nonempty_service_root',
+    'process_limit_actual',
     'physical_budget',
+    'finite_limits_unsupported',
     'ready_binding',
     'ready_missing',
     'release_birth_unverified',
@@ -117,9 +128,12 @@ _CODES = frozenset((
     'runtime_budget',
     'unexpected_native_ledger_record',
     'unit_inventory_failed',
+    'topology_binding',
+    'unexpected_topology',
     'unknown_active_unit',
     'unknown_nonterminal_owner',
     'unsupported_finite_ancestor',
+    'workload_cpu_readback',
 ))
 
 
@@ -149,6 +163,8 @@ def _witness(sample):
             result[key] = sample[key]
     if type(sample.get('feasible')) is bool:
         result['feasible'] = sample['feasible']
+    if type(sample.get('forecast_only')) is bool:
+        result['forecast_only'] = sample['forecast_only']
     deltas = sample.get('app_event_deltas')
     if type(deltas) is dict:
         result['app_event_deltas'] = {key: deltas[key] for key in
@@ -178,12 +194,12 @@ def _witness(sample):
         observed = result.get('metrics', {}).get(metric)
         needed = result.get(required)
         if observed is not None and needed is not None:
-            result[label + '_headroom'] = observed - needed
-            if observed <= needed:
+            result[label + '_headroom'] = observed if result.get('forecast_only') else observed - needed
+            if observed <= (0 if result.get('forecast_only') else needed):
                 reasons.append(label + '_capacity')
     pressure = result.get('metrics', {}).get('pressure_avg10', {})
     for name, threshold in (('memory', 5), ('io', 10)):
-        if pressure.get(name, -1) >= threshold:
+        if not result.get('forecast_only') and pressure.get(name, -1) >= threshold:
             reasons.append(name + '_pressure')
     result['reasons'] = reasons or ['sample_reported_infeasible' if result.get('feasible') is False
                                     else 'guard_failure']

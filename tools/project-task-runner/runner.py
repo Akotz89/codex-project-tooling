@@ -22,7 +22,7 @@ sys.dont_write_bytecode=True
 HERE=Path(__file__).resolve().parent
 CODE_ROOT=HERE.parents[1]
 ENV_KEYS=('HOME','USER','LOGNAME','PATH','LANG','LC_ALL','LC_CTYPE','TMPDIR','XDG_CONFIG_HOME','XDG_CACHE_HOME','XDG_DATA_HOME','CCACHE_DIR','CCACHE_CONFIGPATH','CCACHE_TEMPDIR')
-PROPS=('LoadState','ActiveState','SubState','MainPID','InvocationID','ControlGroup','Description','MemoryMax','MemorySwapMax','CPUQuotaPerSecUSec','LimitAS','LimitASSoft','RuntimeMaxUSec','KillMode','Restart','ExecMainCode','ExecMainStatus','Result','Delegate','DelegateSubgroup')
+PROPS=('LoadState','ActiveState','SubState','MainPID','InvocationID','ControlGroup','Description','MemoryMax','MemoryHigh','MemorySwapMax','CPUQuotaPerSecUSec','TasksMax','LimitNPROC','LimitNPROCSoft','LimitAS','LimitASSoft','RuntimeMaxUSec','KillMode','Restart','ExecMainCode','ExecMainStatus','Result','Delegate','DelegateSubgroup')
 
 class Refused(Exception):pass
 def need(value,code):
@@ -215,11 +215,11 @@ def unit_show(unit,env):
     return values
 def limits_config(c):
     need(type(c) is dict and set(c)=={'memory_bytes','cpu_percent','address_space_bytes','runtime_seconds'},'unsupported_limit_property')
-    for key in ('memory_bytes','cpu_percent'):need(type(c[key]) is int and c[key]>0,'finite_budget')
-    need(c['runtime_seconds']=='infinity' or type(c['runtime_seconds']) is int and c['runtime_seconds']>0,'runtime_budget')
-    need(c['memory_bytes']>=16777216 and (c['runtime_seconds']=='infinity' or c['runtime_seconds']>=10),'budget_too_small')
-    need(c['address_space_bytes']=='infinity' or type(c['address_space_bytes']) is int and c['address_space_bytes']>0,'address_space_budget')
+    need(all(type(value) is str and value=='infinity' for value in c.values()),'finite_limits_unsupported')
     return c
+def limits_are_unlimited(c):
+    return (type(c) is dict and set(c)=={'memory_bytes','cpu_percent','address_space_bytes','runtime_seconds'}
+            and all(type(value) is str and value=='infinity' for value in c.values()))
 def configuration(path):
     raw=read_bytes(path);c=json.loads(raw)
     need(type(c) is dict and set(c) in ({'argv','cwd','limits','sources'},{'argv','cwd','limits','sources','stdin_file'}),'unsupported_config_property')
@@ -323,7 +323,7 @@ def pins(values):
         need(type(name) is str and Path(name).is_absolute() and type(expected) is str and source_digest(Path(name))==expected,'source_changed')
 def source_pins():
     return {str(p):source_digest(p) for p in [HERE/'runner.py',CODE_ROOT/'scripts/project-task-runner',Path(sys.executable).resolve()]}
-def budget_check(intent,ready,info):
+def historical_budget_check(intent,ready,info):
     limit=intent['config']['limits'];cg=cgdir(ready['process']['cgroup']);need(cg is not None,'missing_cgroup')
     actual={n:(cg/n).read_text().strip() for n in ('memory.max','memory.swap.max','cpu.max')}
     need(actual['memory.max']==str(limit['memory_bytes']) and actual['memory.swap.max']=='0','physical_budget')
@@ -334,6 +334,44 @@ def budget_check(intent,ready,info):
     need(info['LimitAS']==info['LimitASSoft']==wanted_as,'address_space_manager')
     need(runtime_matches(info['RuntimeMaxUSec'],limit['runtime_seconds']),'runtime_manager')
     need(info['MemoryMax']==str(limit['memory_bytes']) and info['MemorySwapMax']=='0' and info['KillMode']=='mixed' and info['Restart']=='no','manager_budget')
+    return actual
+def unlimited_properties():
+    return {'MemoryMax':'infinity','MemoryHigh':'infinity','MemorySwapMax':'infinity','CPUQuota':'',
+            'TasksMax':'infinity','LimitNPROC':'infinity','LimitAS':'infinity','RuntimeMaxSec':'infinity',
+            'TimeoutStopSec':5,'KillMode':'mixed','Restart':'no','UMask':'0077',
+            'StandardOutput':'null','StandardError':'null'}
+def budget_check(intent,ready,info):
+    limit=intent.get('config',{}).get('limits',{})
+    if limits_are_unlimited(limit):
+        pass
+    elif (type(limit) is dict and set(limit)=={'memory_bytes','cpu_percent','address_space_bytes','runtime_seconds'}
+          and type(limit['memory_bytes']) is int and limit['memory_bytes']>=16777216
+          and type(limit['cpu_percent']) is int and limit['cpu_percent']>0
+          and (limit['address_space_bytes']=='infinity' or type(limit['address_space_bytes']) is int and limit['address_space_bytes']>0)
+          and (limit['runtime_seconds']=='infinity' or type(limit['runtime_seconds']) is int and limit['runtime_seconds']>=10)):
+        return historical_budget_check(intent,ready,info)
+    else:
+        need(False,'finite_limits_unsupported')
+    groups=[ready['process']['cgroup']]
+    if intent.get('topology')==TOPOLOGY:
+        topology=ready.get('topology',{})
+        need(set(topology)=={'version','service','management','workload'} and topology['version']==TOPOLOGY,'topology_binding')
+        groups=[topology[name] for name in ('service','management','workload')]
+    actual={}
+    for value in groups:
+        cg=cgdir(value);need(cg is not None,'missing_cgroup')
+        fields={name:(cg/name).read_text().strip() for name in ('memory.max','memory.high','memory.swap.max','pids.max','cpu.max')}
+        need(all(fields[name]=='max' for name in ('memory.max','memory.high','memory.swap.max','pids.max')),'physical_budget')
+        quota=fields['cpu.max'].split()
+        need(len(quota)==2 and quota[0]=='max' and quota[1].isascii() and quota[1].isdecimal() and int(quota[1])>0,'cpu_budget')
+        actual[value]=fields
+    actual=actual[ready['process']['cgroup']]
+    infinity=resource.RLIM_INFINITY
+    need(ready['address_space']==[infinity,infinity] and ready['process_limit']==[infinity,infinity],'process_limit_actual')
+    need(info['LimitAS']==info['LimitASSoft']=='infinity','address_space_manager')
+    need(info['RuntimeMaxUSec']=='infinity','runtime_manager')
+    need(all(info[name]=='infinity' for name in ('MemoryMax','MemoryHigh','MemorySwapMax','CPUQuotaPerSecUSec','TasksMax','LimitNPROC','LimitNPROCSoft'))
+         and info['KillMode']=='mixed' and info['Restart']=='no','manager_budget')
     return actual
 def load_job(job):
     job=private_dir(job);intent=read(job/'intent.json')
@@ -387,7 +425,7 @@ def launch(job,config):
     if c.get('stdin_file'):
         f,intent['stdin_identity']=open_input(c['stdin_file']);f.close()
     publish(job/'environment.json',env);publish(job/'intent.json',intent)
-    limits=c['limits'];properties={'MemoryMax':limits['memory_bytes'],'MemorySwapMax':0,'CPUQuota':str(limits['cpu_percent'])+'%','LimitAS':limits['address_space_bytes'],'RuntimeMaxSec':limits['runtime_seconds'],'TimeoutStopSec':5,'KillMode':'mixed','Restart':'no','UMask':'0077','StandardOutput':'null','StandardError':'null'}
+    properties=unlimited_properties()
     argv=['systemd-run','--user','--quiet','--unit='+intent['unit'],'--description=wow-task '+jobid,'--service-type=exec','--remain-after-exit','--expand-environment=no','--working-directory='+str(job)]
     for k,v in properties.items():argv.append('--property='+k+'='+str(v))
     for k,v in env.items():argv.append('--setenv='+k+'='+v)
@@ -488,7 +526,7 @@ def worker(job):
     try:
         need(ctypes.CDLL(None).prctl(36,1,0,0,0)==0,'subreaper')
         need(all(os.environ.get(k)==v for k,v in env.items()),'unit_environment')
-        ready={'job_id':intent['job_id'],'intent_sha256':digest(read_bytes(job/'intent.json')),'process':process(os.getpid()),'invocation_id':os.environ['INVOCATION_ID'],'address_space':list(resource.getrlimit(resource.RLIMIT_AS)),'environment_sha256':digest(canonical(env))}
+        ready={'job_id':intent['job_id'],'intent_sha256':digest(read_bytes(job/'intent.json')),'process':process(os.getpid()),'invocation_id':os.environ['INVOCATION_ID'],'address_space':list(resource.getrlimit(resource.RLIMIT_AS)),'process_limit':list(resource.getrlimit(resource.RLIMIT_NPROC)),'environment_sha256':digest(canonical(env))}
         publish(job/'ready.json',ready)
         deadline=time.monotonic()+6
         while not (job/'admission.json').exists():

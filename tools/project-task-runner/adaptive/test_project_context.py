@@ -47,12 +47,12 @@ class ProjectContext(unittest.TestCase):
     def config(self, root):
         executable = Path('/usr/bin/true').resolve()
         config = {'version': 2, 'argv': [str(executable)], 'cwd': str(root),
-                  'limits': {'memory_bytes': 16777216, 'cpu_percent': 10,
-                             'address_space_bytes': 'infinity', 'runtime_seconds': 10},
+                  'limits': {'memory_bytes': 'infinity', 'cpu_percent': 'infinity',
+                             'address_space_bytes': 'infinity', 'runtime_seconds': 'infinity'},
                   'sources': {str(executable): self.run.base.source_digest(executable)},
                   'owner': 'offline-fixture', 'lease': 'private', 'kind': 'command',
                   'inputs': [str(executable)], 'estimates': {'memory_bytes': 1, 'disk_bytes': 0, 'inodes': 0},
-                  'foreground': False, 'cooperative': {'enabled': True, 'max_fanout': 1}}
+                  'foreground': False, 'cooperative': {'enabled': True}}
         path = root / 'config.json'
         self.run.base.publish(path, config)
         return path
