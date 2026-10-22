@@ -17,6 +17,30 @@ TERMINAL = {'terminal', 'failed-before-launch', 'cancelled-before-launch'}
 _seen_grants = {}
 
 
+def unlimited(limits):
+    return (type(limits) is dict
+            and set(limits) == {'memory_bytes', 'cpu_percent', 'address_space_bytes', 'runtime_seconds'}
+            and all(type(value) is str and value == 'infinity' for value in limits.values()))
+
+
+def unlimited_budget_check(intent, ready, info, api):
+    actual = api.budget_check(intent, {**ready, 'process': {**ready['process'], 'cgroup': api.service_cgroup(ready)}}, info)
+    if intent.get('topology') == api.TOPOLOGY:
+        api.topology_check(intent, ready, info)
+    return actual
+
+
+def promise_memory(binding, approved, api):
+    if unlimited(approved['limits']):
+        api.need(binding.get('cap_bytes') in (None, 'infinity'), 'grant_cap_drift')
+        forecast = approved['estimates']['memory_bytes'] if 'estimates' in approved else binding.get('memory_forecast_bytes')
+        if type(forecast) is not int:
+            raise ValueError('invalid_counter_promise_memory')
+        return checked_counter(forecast, 'promise_memory')
+    api.need(approved['limits']['memory_bytes'] == binding['cap_bytes'], 'grant_cap_drift')
+    return checked_counter(binding['cap_bytes'], 'promise_memory')
+
+
 def granted_growth(binding, ledger, api, env):
     for path, expected in binding['control_pins'].items():
         api.need(hashlib.sha256(api.read_bytes(Path(path), private=False)).hexdigest() == expected,
@@ -24,14 +48,14 @@ def granted_growth(binding, ledger, api, env):
     config_raw = api.read_bytes(Path(binding['config_path']), private=False)
     api.need(hashlib.sha256(config_raw).hexdigest() == binding['config_sha256'], 'grant_config_pin_drift')
     approved = json.loads(config_raw)
-    api.need(approved['limits']['memory_bytes'] == binding['cap_bytes'], 'grant_cap_drift')
+    promised = promise_memory(binding, approved, api)
     job = Path(binding['job'])
     matches = [(key, row) for key, row in ledger['jobs'].items() if row.get('job') == str(job)]
     api.need(len(matches) <= 1, 'grant_duplicate_ledger_job')
     if not (job / 'intent.json').exists():
         api.need(not matches and not binding.get('intent_sha256'), 'grant_missing_bound_intent')
-        return {'job': str(job), 'state': 'PENDING_ROOT_GRANTED', 'remaining_bytes': binding['cap_bytes'],
-                'current_charged_bytes': 0, 'file_allowance_bytes': 0, 'cap_bytes': binding['cap_bytes'], 'owner': binding['owner']}, None
+        return {'job': str(job), 'state': 'PENDING_ROOT_GRANTED', 'remaining_bytes': promised,
+                'current_charged_bytes': 0, 'file_allowance_bytes': 0, 'cap_bytes': approved['limits']['memory_bytes'], 'owner': binding['owner']}, None
     job, intent = api.load_job(job)
     ihash = hashlib.sha256(api.read_bytes(job / 'intent.json')).hexdigest()
     api.need(intent['config'] == approved and intent['config_sha256'] == binding['config_sha256']
@@ -45,7 +69,7 @@ def granted_growth(binding, ledger, api, env):
                  and row['lease'] == binding['lease'] and row['source_pins'] == intent['source_pins']
                  and row['estimates'] == approved['estimates'], 'grant_ledger_identity_drift')
         api.need(all(type(row.get(field)) is int and 0 <= row[field] <= limit for field, limit in
-                     [('remaining_memory_bytes', binding['cap_bytes']),
+                     [('remaining_memory_bytes', promised),
                       ('remaining_disk_bytes', binding['disk_bytes']), ('remaining_inodes', binding['inodes'])]),
                  'grant_promise_exceeds_cap')
     else:
@@ -72,6 +96,9 @@ def granted_growth(binding, ledger, api, env):
         api.need(ready is not None and int(info.get('MainPID', '0')) > 0, 'grant_live_missing_custody')
         cg = api.cgdir(api.service_cgroup(ready))
         def caps(current):
+            if unlimited(approved['limits']):
+                unlimited_budget_check(intent, ready, current, api)
+                return
             quota, period = map(int, (cg / 'cpu.max').read_text().split())
             api.need(quota > 0 and period > 0 and quota * 100 <= period * approved['limits']['cpu_percent']
                      and cpu_quota_seconds(api, current['CPUQuotaPerSecUSec']) <= approved['limits']['cpu_percent'] / 100,
@@ -92,10 +119,10 @@ def granted_growth(binding, ledger, api, env):
     else:
         state = 'KNOWN_NONRUNNING_FULL_HOLD'
     return {'job': str(job), 'job_id': intent['job_id'], 'state': state,
-            'remaining_bytes': max(0, binding['cap_bytes'] - charged), 'current_charged_bytes': charged,
+            'remaining_bytes': max(0, promised - charged), 'current_charged_bytes': charged,
             'file_allowance_bytes': file_allowance,
             'intent_sha256': ihash, 'ready_sha256': rhash, 'ready': ready,
-            'cap_bytes': binding['cap_bytes'], 'owner': binding['owner'], 'unit': info,
+            'cap_bytes': approved['limits']['memory_bytes'], 'owner': binding['owner'], 'unit': info,
             'canonical': api.public_status(job, env) if state == 'KNOWN_NONRUNNING_FULL_HOLD' else None}, allowed
 
 
@@ -156,6 +183,8 @@ def runtime_limit_matches(api, actual, seconds):
 
 
 def own_budget_check(config, intent, ready, info, api):
+    if unlimited(intent['config']['limits']):
+        return unlimited_budget_check(intent, ready, info, api)
     if not config.get('own_adaptive_cpu', False):
         return api.budget_check(intent, ready, info)
     limit = intent['config']['limits']
@@ -262,11 +291,11 @@ def app_contract_state(config, job_parents, api, env):
              and info.get('InvocationID') == app['invocation_id']
              and info.get('MainPID') == str(app['main']['pid'])
              and info.get('ControlGroup') == app['cgroup']
-             and info.get('MemoryMax') == str(app['cap_bytes'])
+             and info.get('MemoryMax') == ('infinity' if app['cap_bytes'] == 'infinity' else str(app['cap_bytes']))
              and api.process(app['main']['pid']) == app['main']
              and api.process(app['backend']['pid']) == app['backend'], 'app_identity_drift')
     actual_cap = (app_cg / 'memory.max').read_text().strip()
-    contract_need(actual_cap == str(app['cap_bytes']), 'app_cap_drift',
+    contract_need(actual_cap == ('max' if app['cap_bytes'] == 'infinity' else str(app['cap_bytes'])), 'app_cap_drift',
                   {'app_memory_max': observed_limit(actual_cap), 'app_memory_cap_bytes': app['cap_bytes']})
     high = api.command(['systemctl', '--user', 'show', app['unit'], '--property=MemoryHigh',
                         '--value', '--no-pager'], env)
@@ -424,7 +453,8 @@ def compute_release(binding, ledger, api, env):
 
 
 def snapshot(config=None, api=None, metrics=None):
-    config = json.loads((HERE / 'BUDGET.json').read_text()) if config is None else config
+    if config is None:
+        raise ValueError('project_config_required')
     api = canonical_reader(config, api)
     for path, expected in config.get('authority_pins', {}).items():
         api.need(hashlib.sha256(api.read_bytes(Path(path), private=False)).hexdigest() == expected, 'authority_pin_drift')
@@ -482,18 +512,19 @@ def snapshot(config=None, api=None, metrics=None):
                  and info.get('InvocationID') == app['invocation_id']
                  and info.get('MainPID') == str(app['main']['pid'])
                  and info.get('ControlGroup') == app['cgroup']
-                 and info.get('MemoryMax') == str(app['cap_bytes'])
+                 and info.get('MemoryMax') == ('infinity' if app['cap_bytes'] == 'infinity' else str(app['cap_bytes']))
                  and api.process(app['main']['pid']) == app['main']
                  and api.process(app['backend']['pid']) == app['backend'], 'app_identity_drift')
     app_identity()
     app_cg = api.cgdir(app['cgroup'])
-    api.need((app_cg / 'memory.max').read_text().strip() == str(app['cap_bytes']), 'app_cap_drift')
+    app_memory_max = 'max' if app['cap_bytes'] == 'infinity' else str(app['cap_bytes'])
+    api.need((app_cg / 'memory.max').read_text().strip() == app_memory_max, 'app_cap_drift')
     app_current = checked_counter((app_cg / 'memory.current').read_text(), 'charged')
     app_stat = memory_stat_counters((app_cg / 'memory.stat').read_text())
     app_file = checked_file_allowance(app_current, app_stat['file'], app_stat['shmem'])
     app_identity()
-    api.need((app_cg / 'memory.max').read_text().strip() == str(app['cap_bytes']), 'app_cap_drift')
-    app_remaining = max(0, app['cap_bytes'] - app_current)
+    api.need((app_cg / 'memory.max').read_text().strip() == app_memory_max, 'app_cap_drift')
+    app_remaining = None if app['cap_bytes'] == 'infinity' else max(0, app['cap_bytes'] - app_current)
     observations = []
     allowed = set()
     for key, binding in held.items():
@@ -595,7 +626,13 @@ def snapshot(config=None, api=None, metrics=None):
         granted.append(observed)
         if unit: allowed.add(unit)
     own_job = Path(config['own_job'])
-    own_future = config['own_limits']['memory_bytes']
+    cap_free = unlimited(config['own_limits'])
+    api.need(not cap_free or app['cap_bytes'] == 'infinity', 'app_cap_drift')
+    own_future = (own_approved['estimates']['memory_bytes'] if cap_free and own_binding and 'estimates' in own_approved
+                  else config.get('own_memory_forecast_bytes') if cap_free else config['own_limits']['memory_bytes'])
+    if cap_free and type(own_future) is not int:
+        raise ValueError('invalid_counter_own_forecast')
+    own_future = checked_counter(own_future, 'own_forecast')
     own_file_allowance = 0
     if own_binding and ('ready' in own_binding or 'ready_sha256' in own_binding):
         api.need((own_job / 'ready.json').exists(), 'own_missing_bound_ready')
@@ -653,12 +690,19 @@ def snapshot(config=None, api=None, metrics=None):
         metrics = {'available_bytes': int(memory['MemAvailable'].split()[0]) * 1024,
                    'disk_free_bytes': fs.f_bavail * fs.f_frsize, 'free_inodes': fs.f_favail,
                    'pressure_avg10': pressure}
-    memory_required = config['policy_reserve_bytes'] + app_remaining + app_file + sum(row['memory_bytes'] for row in held.values()) + sum(row['remaining_bytes'] + row['file_allowance_bytes'] for row in granted) + own_future + own_file_allowance
-    disk_required = config['disk_floor_bytes'] + sum(row['disk_bytes'] for row in held.values()) + sum(row['disk_bytes'] for row in config.get('granted', [])) + config['own_disk_forecast_bytes']
-    inode_required = config['inode_floor'] + sum(row['inodes'] for row in held.values()) + sum(row['inodes'] for row in config.get('granted', [])) + config['own_inode_forecast']
+    memory_required = (0 if cap_free else config['policy_reserve_bytes'] + app_remaining + app_file) + sum(row['memory_bytes'] for row in held.values()) + sum(row['remaining_bytes'] + row['file_allowance_bytes'] for row in granted) + own_future + own_file_allowance
+    disk_required = (0 if cap_free else config['disk_floor_bytes']) + sum(row['disk_bytes'] for row in held.values()) + sum(row['disk_bytes'] for row in config.get('granted', [])) + config['own_disk_forecast_bytes']
+    inode_required = (0 if cap_free else config['inode_floor']) + sum(row['inodes'] for row in held.values()) + sum(row['inodes'] for row in config.get('granted', [])) + config['own_inode_forecast']
+    for key in ('available_bytes', 'disk_free_bytes', 'free_inodes'):
+        checked_counter(metrics[key], key)
+    for name in ('memory', 'io'):
+        value = metrics['pressure_avg10'][name]
+        api.need(type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 100, 'capacity_sample_invalid')
     feasible = (metrics['available_bytes'] > memory_required and metrics['disk_free_bytes'] > disk_required
                 and metrics['free_inodes'] > inode_required and metrics['pressure_avg10']['memory'] < 5
                 and metrics['pressure_avg10']['io'] < 10)
+    if cap_free:
+        feasible = all(metrics[key] > 0 for key in ('available_bytes', 'disk_free_bytes', 'free_inodes'))
     contract_deltas = None
     if app_contract is not None:
         contract_deltas = check_app_baseline(
@@ -672,22 +716,20 @@ def snapshot(config=None, api=None, metrics=None):
                     'file_bytes': checked_counter(app_stat['file'], 'file'),
                     'shmem_bytes': checked_counter(app_stat['shmem'], 'shmem'),
                     'invocation_id': app['invocation_id'], 'main': app['main'], 'backend': app['backend']},
-            'policy_reserve_bytes': config['policy_reserve_bytes'],
+            'policy_reserve_bytes': 0 if cap_free else config['policy_reserve_bytes'],
             'compute_releases': compute_releases,
             'released_absences': released_absences,
             'held': observations, 'granted': granted, 'active_units': sorted(units),
-            'accounting': 'MemAvailable already excludes charged usage. Fresh app remaining, each live admitted job remaining cap plus its file-minus-shmem allowance, app file-minus-shmem allowance, configured policy reserve and known held reserves are added once; no promise is released.'}
+            'forecast_only': cap_free,
+            'accounting': 'Forecast-only on unlimited launch contracts; historical finite accounting retained. MemAvailable already excludes charged usage. Fresh app remaining, each live admitted job remaining cap plus its file-minus-shmem allowance, app file-minus-shmem allowance, configured policy reserve and known held reserves are added once; no promise is released.'}
 
 
 def refreshed(config, api=None, metrics=None):
-    if config['own_limits']['memory_bytes'] != 2 * 1024**3:
-        raise RuntimeError('caller_fixed_cap_drift')
     observation = snapshot(config=config, api=api, metrics=metrics)
     if not observation['feasible']:
         raise RuntimeError('dynamic_capacity_refused')
-    # Existing profile caller adds full own2GiB even when supervised charge already exists.
-    # Removing the full cap here leaves the caller exactly fresh own remaining, never a second charge.
-    external = observation['memory_required_bytes'] - config['own_limits']['memory_bytes']
+    # Keep the caller's own forecast separate from external commitments.
+    external = observation['memory_required_bytes'] - observation['own_future_bytes']
     if external < 0:
         raise RuntimeError('invalid_external_reserve')
     return {**config, 'host_reserve_bytes': external, 'disk_reserve_bytes': observation['disk_required_bytes'],

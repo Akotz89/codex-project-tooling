@@ -9,13 +9,13 @@ cgroup and its ancestors are read. No processes or application memory are read.
 
 decide(snapshot, jobs, previous=None, now=None, tuning=None) returns allocations,
 admissions, headroom, status/reasons and state (pass state as previous next time).
-Jobs require id/owner/lease/state and nonnegative ceiling_cpu, working_set_bytes,
+Jobs require id/owner/lease/state and nonnegative working_set_bytes,
 actual_memory_bytes, remaining_memory_bytes, remaining_disk_bytes. Remaining
 values are unconsumed promises; actual footprints are ALREADY in host usage.
 Optional remaining_inodes (default zero) reserves future files. actual_cpu
 (cores) identifies project load; absent means conservatively
-all measured load is external. cooperative controls checkpoint/fanout hints;
-foreground reserves configurable host capacity. This module changes no limits.
+all measured load is external. cooperative controls checkpoint/fanout hints derived from observed CPU capacity.
+Estimates and pressure are observations; this module changes no limits.
 """
 
 import math
@@ -25,7 +25,6 @@ import time
 
 _PREVIOUS = {}
 _CGROUP_ROOT = Path('/sys/fs/cgroup')
-_GIB = 1024 ** 3
 
 
 def _read(path):
@@ -131,7 +130,7 @@ def sample_host(project_root, cgroup=None, previous=None):
     limits = [memory['available_bytes']] + [entry['headroom_bytes'] for entry in ancestors if entry['headroom_bytes'] is not None]
     memory.update(effective_headroom_bytes=min(limits), cgroup=ancestors[0] if ancestors else None,
                   ancestors=ancestors, cgroup_stat=own_stat)
-    capacity = min([float(os.cpu_count() or 1)] + quotas + ([float(cpuset)] if cpuset else []))
+    capacity = min([float(len(os.sched_getaffinity(0)))] + quotas + ([float(cpuset)] if cpuset else []))
     key = (str(Path(project_root).resolve()), str(group))
     if previous is None:
         previous = _PREVIOUS.get(key)
@@ -178,18 +177,14 @@ def _safe(value):
 
 
 def decide(snapshot, jobs, previous=None, now=None, tuning=None):
-    """Calculate targets only; callers serialize admission and validate custody."""
-    config = {'max_sample_age': 10, 'memory_reserve_bytes': _GIB,
-              'foreground_memory_fraction': 0.05, 'disk_reserve_bytes': _GIB,
-              'inode_reserve': 1024, 'cpu_reserve': 0.25, 'foreground_cpu_fraction': 0.10,
-              'calm_seconds': 15, 'recovery_cores_per_second': 0.25,
-              'memory_psi': 5.0, 'cpu_psi': 20.0, 'io_psi': 10.0,
-              'swap_growth_bytes_per_second': 1024 * 1024,
-              'io_bytes_per_second': 256 * 1024 * 1024}
-    config.update(tuning or {})
+    """Keep serialized admission/custody; forecasts never become enforcement."""
+    config = {'max_sample_age': 10}
+    if tuning is not None:
+        if type(tuning) is not dict or not tuning.keys() <= config.keys():
+            raise ValueError('unsupported tuning')
+        config.update(tuning)
     if not all(_number(value) for value in config.values()):
         raise ValueError('tuning values must be finite and nonnegative')
-    previous = previous or {}
     now = time.monotonic() if now is None else now
     reasons = list(snapshot.get('missing', []))
     memory, cpu, disk = (snapshot.get(key, {}) for key in ('memory', 'cpu', 'disk'))
@@ -203,163 +198,53 @@ def decide(snapshot, jobs, previous=None, now=None, tuning=None):
     reasons.extend(name for value, name in required if not _number(value))
     if not reasons and not 0 <= now - snapshot['timestamp'] <= config['max_sample_age']:
         reasons.append('sample.stale_or_future')
-    pressures = {}
     for resource in ('memory', 'cpu', 'io'):
-        value = snapshot.get('pressure', {}).get(resource) or {}
-        avg = value.get('some', {}).get('avg10')
-        if not _number(avg):
-            reasons.append('pressure.' + resource)
-        else:
-            pressures[resource] = avg
+        avg = (snapshot.get('pressure', {}).get(resource) or {}).get('some', {}).get('avg10')
+        if not _number(avg): reasons.append('pressure.' + resource)
     rates = (snapshot.get('io') or {}).get('rates')
     if not isinstance(rates, dict) or not all(_number(rates.get(key)) for key in ('rbytes_per_second', 'wbytes_per_second')):
         reasons.append('io.interval')
-    invalid_sample = bool(reasons)
     active = [job for job in jobs if job.get('state') in ('running', 'starting')]
     ready = sorted((job for job in jobs if job.get('state') == 'ready'),
                    key=lambda job: (job.get('ready_since', now), str(job.get('id', ''))))
     invalid_jobs = {}
     seen = set()
     for job in active + ready:
-        ident = job.get('id')
-        errors = []
+        ident = job.get('id'); errors = []
         if not isinstance(ident, str) or not ident or ident in seen:
             errors.append('job.id_missing_or_duplicate')
         seen.add(ident if isinstance(ident, str) else '')
         if not job.get('owner') or not job.get('lease'):
             errors.append('job.custody_missing')
-        for name in ('ceiling_cpu', 'working_set_bytes', 'actual_memory_bytes',
-                     'remaining_memory_bytes', 'remaining_disk_bytes'):
-            if not _number(job.get(name)):
-                errors.append('job.' + name)
-        if all(_number(job.get(name)) for name in ('working_set_bytes', 'actual_memory_bytes', 'remaining_memory_bytes')) and job['working_set_bytes'] > job['actual_memory_bytes'] + job['remaining_memory_bytes']:
-            errors.append('job.working_set_unreserved')
-        if not _number(job.get('remaining_inodes', 0)):
-            errors.append('job.remaining_inodes')
-        if errors:
-            invalid_jobs[str(ident)] = errors
-    if invalid_jobs:
-        # An unknown live promise cannot safely be treated as zero.
-        reasons.append('jobs.invalid')
-        invalid_sample = True
-    foreground = any(job.get('foreground') for job in active + ready)
-    memory_free = _safe(memory.get('effective_headroom_bytes'))
-    disk_free = _safe(disk.get('free_bytes'))
-    inode_free = _safe(disk.get('free_inodes')) - config['inode_reserve'] - sum(_safe(job.get('remaining_inodes', 0)) for job in active)
-    remaining_memory = sum(job.get('remaining_memory_bytes', 0) for job in active if _number(job.get('remaining_memory_bytes')))
-    remaining_disk = sum(job.get('remaining_disk_bytes', 0) for job in active if _number(job.get('remaining_disk_bytes')))
-    foreground_memory = foreground * _safe(memory.get('total_bytes')) * config['foreground_memory_fraction'] * (1 + min(1, pressures.get('memory', 0) / max(0.001, config['memory_psi'])))
-    memory_free -= config['memory_reserve_bytes'] + foreground_memory + remaining_memory
-    disk_free -= config['disk_reserve_bytes'] + remaining_disk
-    if not invalid_sample:
-        # Quota stalls can raise global PSI while CPUs are idle; include owned CPU here.
-        cpu_saturated = max(cpu['busy_cores'], cpu['load1']) + config['cpu_reserve'] >= cpu['capacity']
-        reasons.extend('pressure.' + resource for resource, avg in pressures.items()
-                       if avg >= config[resource + '_psi'] and (resource != 'cpu' or cpu_saturated))
-        if memory_free < 0:
-            reasons.append('memory.reserve')
-        if disk_free < 0:
-            reasons.append('disk.reserve')
-        if inode_free <= 0:
-            reasons.append('disk.inodes')
-        io_rate = sum(rates[key + '_per_second'] for key in ('rbytes', 'wbytes'))
-        if io_rate >= config['io_bytes_per_second']:
-            reasons.append('io.throughput')
-        old_swap = previous.get('swap_free_bytes')
-        interval = now - previous.get('last_sample_at', now)
-        if _number(old_swap) and interval > 0 and (old_swap - memory['swap_free_bytes']) / interval >= config['swap_growth_bytes_per_second']:
-            reasons.append('memory.swap_growth')
-    pressured = bool(reasons)
-    cpu_pressure_only = reasons == ['pressure.cpu']
-    calm_since = None if pressured else previous.get('calm_since')
-    if calm_since is None and not pressured:
-        calm_since = now
-    recovered = not pressured and now - calm_since >= config['calm_seconds']
+        for name in ('working_set_bytes', 'actual_memory_bytes', 'remaining_memory_bytes', 'remaining_disk_bytes'):
+            if not _number(job.get(name)): errors.append('job.' + name)
+        if not _number(job.get('remaining_inodes', 0)): errors.append('job.remaining_inodes')
+        if errors: invalid_jobs[str(ident)] = errors
+    if invalid_jobs: reasons.append('jobs.invalid')
+    invalid_sample = bool(reasons)
     capacity = _safe(cpu.get('capacity'))
-    known_project_load = sum(job.get('actual_cpu', 0) for job in active if _number(job.get('actual_cpu')))
-    external_load = max(0, _safe(cpu.get('busy_cores')) - known_project_load,
-                        _safe(cpu.get('load1')) - known_project_load)
-    foreground_cpu = max(0, capacity * config['foreground_cpu_fraction'] - external_load) if foreground else 0
-    budget = max(0, capacity - external_load - config['cpu_reserve'] - foreground_cpu)
-    admissions = {}
-    selected = list(active)
-    drain_job = None
-    reservation_blocks = False
-    memory_capacity = min([_safe(memory.get('total_bytes'))] +
-                          [entry['max_bytes'] for entry in memory.get('ancestors', [])
-                           if _number(entry.get('max_bytes'))]) - config['memory_reserve_bytes'] - foreground_memory
-    for job in ready:
-        ident = str(job.get('id'))
-        why = list(reasons)
-        impossible = not invalid_sample and (
-            job['remaining_memory_bytes'] > memory_capacity or job['ceiling_cpu'] <= 0 or
-            (_number(disk.get('total_bytes')) and job['remaining_disk_bytes'] > disk['total_bytes'] - config['disk_reserve_bytes']) or
-            (_number(disk.get('total_inodes')) and job.get('remaining_inodes', 0) > disk['total_inodes'] - config['inode_reserve']))
-        if impossible:
-            why.append('job.unschedulable')
-        if reservation_blocks:
-            why.append('queue.drain')
-        if not recovered:
-            why.append('recovery.hysteresis')
-        if budget <= 0 or _safe(job.get('ceiling_cpu')) <= 0:
-            why.append('cpu.capacity')
-        if not invalid_sample and job.get('remaining_memory_bytes', 0) > memory_free:
-            why.append('memory.promise')
-        if not invalid_sample and job.get('remaining_disk_bytes', 0) > disk_free:
-            why.append('disk.promise')
-        if not invalid_sample and job.get('remaining_inodes', 0) > inode_free:
-            why.append('disk.inode_promise')
-        admit = not why
-        admissions[ident] = {'admit': admit, 'reasons': sorted(set(why)), 'unschedulable': impossible}
-        if not admit and not impossible and drain_job is None:
-            drain_job = {'id': ident, 'lease': job.get('lease')}
-            # One backfill round, then let existing work drain for the oldest waiter.
-            reservation_blocks = previous.get('drain_job') == drain_job
-        if admit:
-            selected.append(job)
-            memory_free -= job['remaining_memory_bytes']
-            disk_free -= job['remaining_disk_bytes']
-            inode_free -= job.get('remaining_inodes', 0)
-    previous_targets = previous.get('last_targets', {})
-    selected_ids = {str(job.get('id')) for job in selected}
-    old_budget = sum(value for ident, value in previous_targets.items() if ident in selected_ids and _number(value))
-    if invalid_sample:
-        budget = 0
-    elif pressured:
-        # CPU PSI can include own quota stalls; do not recursively halve that target.
-        budget *= 0.5
-    elif any(ident in selected_ids for ident in previous_targets):
-        budget = min(budget, old_budget + (max(0, now - previous.get('last_sample_at', now)) * config['recovery_cores_per_second'] if recovered else 0))
-    targets = {str(job['id']): 0.0 for job in selected if str(job.get('id')) not in invalid_jobs}
-    pending = {}
-    for job in selected:
-        ident = str(job['id'])
-        if ident in invalid_jobs:
-            continue
-        ceiling = job['ceiling_cpu']
-        if cpu_pressure_only:
-            ceiling *= 0.5
-        pending[ident] = ceiling
-    while pending and budget > 1e-9:
-        share = budget / len(pending)
-        for ident, ceiling in list(pending.items()):
-            grant = min(ceiling, share)
-            targets[ident] += grant
-            budget -= grant
-            pending[ident] -= grant
-            if pending[ident] < 1e-9:
-                del pending[ident]
-    if invalid_sample:
-        targets = previous.get('last_targets', {})
-    allocations = {} if invalid_sample else {str(job['id']): {'cpu': targets[str(job['id'])],
-                    'fanout': max(1, math.floor(targets[str(job['id'])])) if recovered and targets[str(job['id'])] > 0 else 0,
-                    'checkpoint': bool(pressured and job.get('cooperative'))}
-                   for job in selected if str(job.get('id')) in targets}
+    known_load = sum(job.get('actual_cpu', 0) for job in active if _number(job.get('actual_cpu')))
+    external_load = max(0, _safe(cpu.get('busy_cores')) - known_load,
+                        _safe(cpu.get('load1')) - known_load)
+    available_cpu = max(0, capacity - external_load)
+    physical_reasons = []
+    for value, label in ((_safe(memory.get('effective_headroom_bytes')), 'memory.capacity'),
+                         (_safe(disk.get('free_bytes')), 'disk.capacity'),
+                         (_safe(disk.get('free_inodes')), 'disk.inodes'),
+                         (available_cpu, 'cpu.capacity')):
+        if value <= 0: physical_reasons.append(label)
+    admissions = {str(job['id']): {'admit': not (reasons or physical_reasons),
+                  'reasons': sorted(set(reasons + physical_reasons)), 'unschedulable': False} for job in ready}
+    selected = active + [job for job in ready if admissions[str(job['id'])]['admit']]
+    share = available_cpu / len(selected) if selected else 0
+    allocations = {} if invalid_sample else {str(job['id']): {'cpu': share,
+                    'fanout': max(1, math.floor(share)) if share > 0 else 0,
+                    'checkpoint': False} for job in selected}
     return {'allocations': allocations, 'admissions': admissions,
-            'headroom': {'memory_bytes': max(0, memory_free), 'disk_bytes': max(0, disk_free),
-                         'external_cpu': external_load, 'inodes': max(0, inode_free)},
-            'status': 'unknown' if invalid_sample else 'pressure' if pressured else 'ready' if recovered else 'recovering',
-            'reasons': sorted(set(reasons)),
-            'state': {'calm_since': calm_since, 'last_targets': targets,
-                      'last_sample_at': now, 'swap_free_bytes': memory.get('swap_free_bytes'),
-                      'drain_job': drain_job}}
+            'headroom': {'memory_bytes': _safe(memory.get('effective_headroom_bytes')),
+                         'disk_bytes': _safe(disk.get('free_bytes')), 'external_cpu': external_load,
+                         'inodes': _safe(disk.get('free_inodes'))},
+            'status': 'unknown' if invalid_sample else 'pressure' if physical_reasons else 'ready',
+            'reasons': sorted(set(reasons + physical_reasons)),
+            'state': {'last_targets': {key: value['cpu'] for key, value in allocations.items()},
+                      'last_sample_at': now, 'swap_free_bytes': memory.get('swap_free_bytes')}}

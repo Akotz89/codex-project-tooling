@@ -10,7 +10,6 @@ import math
 import os
 from pathlib import Path
 import resource
-import re
 import signal
 import stat
 import subprocess
@@ -108,8 +107,8 @@ def configuration(path):
     need(type(c['sources']) is dict and c['sources'], 'sources')
     base.pins(c['sources'])
     need(type(c['estimates']) is dict and set(c['estimates']) == {'memory_bytes', 'disk_bytes', 'inodes'}, 'estimates')
-    need(all(type(v) is int and v >= 0 for v in c['estimates'].values()) and 0 < c['estimates']['memory_bytes'] <= c['limits']['memory_bytes'], 'finite_estimates')
-    need(type(c['cooperative']) is dict and set(c['cooperative']) == {'enabled', 'max_fanout'} and type(c['cooperative']['enabled']) is bool and type(c['cooperative']['max_fanout']) is int and c['cooperative']['max_fanout'] >= 1, 'cooperative')
+    need(all(type(v) is int and v >= 0 for v in c['estimates'].values()), 'estimates')
+    need(type(c['cooperative']) is dict and set(c['cooperative']) == {'enabled'} and type(c['cooperative']['enabled']) is bool, 'cooperative')
     need(type(c['inputs']) is list and c['inputs'], 'explicit_inputs')
     for name in c['inputs']:
         path = Path(name)
@@ -218,51 +217,22 @@ def inventory_budget(estimates):
     return min(5000, max(256, estimates['inodes'] * 2 + 64))
 
 
-def cpu_quota_seconds(value):
-    """Manager CPU quotas use subsecond timespans as well as bare microseconds."""
-    if value.isdigit():
-        return int(value) / 1000000
-    units = {'h': 3600, 'min': 60, 's': 1, 'ms': .001, 'us': .000001, 'µs': .000001, 'μs': .000001}
-    total = 0
-    previous = float('inf')
-    for part in value.split():
-        match = re.fullmatch(r'([0-9]+(?:\.[0-9]+)?)(h|min|ms|us|µs|μs|s)', part)
-        need(match is not None and units[match[2]] < previous, 'cpu_manager_timespan')
-        previous = units[match[2]]
-        total += float(match[1]) * previous
-    need(value and math.isfinite(total), 'cpu_manager_timespan')
-    return total
-
-
 def apply_allocation(job, allocation, env):
     job, intent = base.load_job(job)
     need(intent.get('contract_version') == 2 and intent.get('candidate') == str(HERE), 'not_opted_in')
     base.pins(intent['source_pins'])
     cpu = allocation['cpu']
-    need(type(cpu) in (float, int) and math.isfinite(cpu) and 0 <= cpu <= intent['config']['limits']['cpu_percent'] / 100, 'cpu_target')
+    need(type(cpu) in (float, int) and math.isfinite(cpu) and cpu >= 0, 'cpu_target')
+    need(type(allocation['fanout']) is int and allocation['fanout'] >= 0
+         and type(allocation['checkpoint']) is bool, 'allocation_format')
     info = base.unit_show(intent['unit'], env)
     ready = base.custody(job, intent, info)
     need(info.get('ActiveState') == 'active' and info.get('MainPID') == str(ready['process']['pid']), 'not_running')
-    percent = max(0.1, round(cpu * 100, 2))
-    base.custody(job, intent, base.unit_show(intent['unit'], env))
-    delegated = intent.get('topology') == base.TOPOLOGY
-    group = base.cgdir(ready['topology']['workload'] if delegated else base.service_cgroup(ready))
-    if delegated:
-        period = max(int((group / 'cpu.max').read_text().split()[1]), math.ceil(1000 / (percent / 100)))
-        (group / 'cpu.max').write_text(str(max(1000, round(percent / 100 * period))) + ' ' + str(period))
-    else:
-        result = base.command(['systemctl', '--user', 'set-property', '--runtime', intent['unit'], 'CPUQuota=' + str(percent) + '%'], env)
-        need(result.returncode == 0, 'quota_apply')
-    info = base.unit_show(intent['unit'], env)
-    base.custody(job, intent, info)
-    quota, period = map(int, (group / 'cpu.max').read_text().split())
-    expected = max(1000 / period, percent / 100) if delegated else percent / 100
-    need(abs(quota / period - expected) <= 1 / period, 'quota_readback')
-    if delegated:
-        budget_check(intent, ready, info, expected)
-    else:
-        need(abs(cpu_quota_seconds(info['CPUQuotaPerSecUSec']) - expected) <= .00001, 'quota_readback')
-    event = {'at': time.time(), 'allocation': allocation, 'cpu_percent': percent, 'minimum_quota_applied': expected > cpu, 'topology': ready.get('topology'), 'cpu_max': [quota, period], 'manager': info, 'invocation_id': ready['invocation_id']}
+    actual = budget_check(intent, ready, info, cpu)
+    percent = round(cpu * 100, 2)
+    event = {'at': time.time(), 'allocation': allocation, 'cpu_percent': percent,
+             'topology': ready.get('topology'), 'cpu_max': actual['cpu.max'].split(),
+             'manager': info, 'invocation_id': ready['invocation_id']}
     current = job / 'allocation-current.json'
     previous = base.read(current).get('telemetry', {}) if current.exists() else {}
     points = previous.get('transitions', [])
@@ -281,8 +251,8 @@ def apply_allocation(job, allocation, env):
                           'latest_checkpoint': point if point['checkpoint'] else previous.get('latest_checkpoint')}
     replace(current, event)
     cooperative = intent['config']['cooperative']
-    replace(job / 'control.json', {'version': 2, 'job_id': intent['job_id'], 'cpu': expected,
-             'fanout': min(allocation['fanout'], cooperative['max_fanout']) if cooperative['enabled'] else None,
+    replace(job / 'control.json', {'version': 2, 'job_id': intent['job_id'], 'cpu': cpu,
+             'fanout': allocation['fanout'] if cooperative['enabled'] else None,
              'checkpoint': allocation['checkpoint'] if cooperative['enabled'] else None})
     return event
 
@@ -336,27 +306,10 @@ def reconcile(state, env, snapshot=None, expected_job=None):
 
 
 def budget_check(intent, ready, info, cpu):
-    limit = intent['config']['limits']
-    cg = base.cgdir(base.service_cgroup(ready))
-    actual = {n: (cg / n).read_text().strip() for n in ('memory.max', 'memory.swap.max', 'cpu.max')}
-    need(actual['memory.max'] == str(limit['memory_bytes']) and actual['memory.swap.max'] == '0', 'physical_budget')
-    quota, period = map(int, actual['cpu.max'].split())
-    ancestor_cpu = limit['cpu_percent'] / 100 if intent.get('topology') == base.TOPOLOGY else cpu
-    need(abs(quota / period - ancestor_cpu) <= 1 / period and abs(cpu_quota_seconds(info['CPUQuotaPerSecUSec']) - ancestor_cpu) <= .00001, 'initial_cpu_readback')
+    actual = base.budget_check(intent, {**ready, 'process': {**ready['process'], 'cgroup': base.service_cgroup(ready)}}, info)
     if intent.get('topology') == base.TOPOLOGY:
         base.topology_check(intent, ready, info)
-        leaf = base.cgdir(ready['topology']['workload'])
-        quota, period = map(int, (leaf / 'cpu.max').read_text().split())
-        need(abs(quota / period - max(1000 / period, cpu)) <= 1 / period, 'workload_cpu_readback')
-        ancestry = []
-        current = cg
-        while current != Path('/sys/fs/cgroup'):
-            ancestry.append({'path': str(current), **{name: (current / name).read_text().strip() for name in ('cpu.max', 'memory.max', 'memory.swap.max')}})
-            current = current.parent
-        actual.update(workload_cpu_max=(leaf / 'cpu.max').read_text().strip(), topology=ready['topology'], ancestors=ancestry)
-    wanted = resource.RLIM_INFINITY if limit['address_space_bytes'] == 'infinity' else limit['address_space_bytes']
-    need(ready['address_space'] == [wanted, wanted] and info['LimitAS'] == info['LimitASSoft'] == ('infinity' if wanted == resource.RLIM_INFINITY else str(wanted)), 'address_space')
-    need(base.runtime_matches(info['RuntimeMaxUSec'], limit['runtime_seconds']) and info['MemoryMax'] == str(limit['memory_bytes']) and info['MemorySwapMax'] == '0' and info['KillMode'] == 'mixed' and info['Restart'] == 'no', 'emergency_manager')
+        actual['topology'] = ready['topology']
     return actual
 
 
@@ -381,7 +334,7 @@ def launch(job, config, state, project_root=None):
     base.publish(job / 'environment.json', env)
     base.publish(job / 'intent.json', intent)
     record = {'id': ident, 'job': str(job), 'state': 'ready', 'ready_since': time.monotonic(), 'owner': c['owner'], 'lease': c['lease'],
-              'source_pins': intent['source_pins'], 'estimates': c['estimates'], 'ceiling_cpu': c['limits']['cpu_percent'] / 100,
+              'source_pins': intent['source_pins'], 'estimates': c['estimates'],
               'working_set_bytes': c['estimates']['memory_bytes'], 'actual_memory_bytes': 0,
               'remaining_memory_bytes': c['estimates']['memory_bytes'], 'remaining_disk_bytes': c['estimates']['disk_bytes'],
               'remaining_inodes': c['estimates']['inodes'], 'foreground': c['foreground'], 'cooperative': c['cooperative']['enabled']}
@@ -394,15 +347,10 @@ def launch(job, config, state, project_root=None):
 
 
 def start_unit(job, intent, record, env):
-    cpu = max(.001, round(record['allocation']['cpu'], 4))
-    limits = intent['config']['limits']
-    properties = {'MemoryMax': limits['memory_bytes'], 'MemorySwapMax': 0, 'CPUQuota': str(limits['cpu_percent']) + '%',
-                  'LimitAS': limits['address_space_bytes'], 'RuntimeMaxSec': limits['runtime_seconds'], 'TimeoutStopSec': 5,
-                  'KillMode': 'mixed', 'Restart': 'no', 'UMask': '0077', 'StandardOutput': 'null', 'StandardError': 'null'}
+    properties = base.unlimited_properties()
+    cpu = record['allocation']['cpu']
     if intent.get('topology') == base.TOPOLOGY:
         properties.update(Delegate='cpu', DelegateSubgroup='management')
-    else:
-        properties['CPUQuota'] = format(cpu * 100, '.2f') + '%'
     argv = ['systemd-run', '--user', '--quiet', '--unit=' + intent['unit'], '--description=wow-task ' + intent['job_id'],
             '--service-type=exec', '--remain-after-exit', '--expand-environment=no', '--working-directory=' + str(job)]
     argv += ['--property=' + k + '=' + str(v) for k, v in properties.items()]
@@ -433,7 +381,7 @@ def start_unit(job, intent, record, env):
     allocation = record['allocation']
     descriptor = intent['config']['cooperative']
     replace(job / 'control.json', {'version': 2, 'job_id': intent['job_id'], 'cpu': cpu,
-             'fanout': min(allocation['fanout'], descriptor['max_fanout']) if descriptor['enabled'] else None,
+             'fanout': allocation['fanout'] if descriptor['enabled'] else None,
              'checkpoint': allocation['checkpoint'] if descriptor['enabled'] else None})
     base.publish(job / 'admission.json', {'intent_sha256': base.digest(base.read_bytes(job / 'intent.json')), 'invocation_id': ready['invocation_id']})
     record['state'] = 'running'
@@ -453,7 +401,8 @@ def advance(job, env=None):
             start_unit(job, intent, record, env)
             replace(state / 'capacity.json', ledger)
         result = {'job_id': intent['job_id'], 'state': record['state'].upper(), 'allocation': record.get('allocation'),
-                  'capacity_status': ledger['decision']['status'], 'reasons': ledger['decision']['reasons'], 'emergency_ceilings': intent['config']['limits']}
+                  'capacity_status': ledger['decision']['status'], 'reasons': ledger['decision']['reasons'],
+                  'resource_contract': 'unlimited'}
         if (job / 'ready.json').exists():
             result.update(base.public_status(job, env))
             if record['state'] != 'terminal' and result['state'] in TERMINAL:
@@ -659,7 +608,7 @@ def worker(job):
         need(all(os.environ.get(k) == v for k, v in env.items()), 'unit_environment')
         topology = base.setup_topology(intent, info) if delegated else None
         service = info['ControlGroup']
-        ready = {'job_id': intent['job_id'], 'intent_sha256': base.digest(base.read_bytes(job / 'intent.json')), 'process': base.process(os.getpid()), 'invocation_id': os.environ['INVOCATION_ID'], 'address_space': list(resource.getrlimit(resource.RLIMIT_AS)), 'environment_sha256': base.digest(base.canonical(env))}
+        ready = {'job_id': intent['job_id'], 'intent_sha256': base.digest(base.read_bytes(job / 'intent.json')), 'process': base.process(os.getpid()), 'invocation_id': os.environ['INVOCATION_ID'], 'address_space': list(resource.getrlimit(resource.RLIMIT_AS)), 'process_limit': list(resource.getrlimit(resource.RLIMIT_NPROC)), 'environment_sha256': base.digest(base.canonical(env))}
         if delegated: ready['topology'] = topology
         base.publish(job / 'ready.json', ready)
         deadline = time.monotonic() + 6
