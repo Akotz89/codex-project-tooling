@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import select
 import subprocess
 import sys
 import tempfile
@@ -68,6 +69,106 @@ class ProjectContext(unittest.TestCase):
             self.assertEqual(result['capacity_status'], 'unknown')
             self.assertEqual(sample.call_args.args[0], root)
         return result
+
+    def reap_helper(self, helper):
+        if helper is not None:
+            if 'gate' in helper:
+                os.close(helper.pop('gate'))
+            try:
+                os.waitpid(helper['process']['pid'], 0)
+            except ChildProcessError:
+                pass
+            finally:
+                if 'pidfd' in helper:
+                    os.close(helper['pidfd'])
+
+    def helper_exited(self, helper):
+        self.assertTrue(select.select([helper['pidfd']], [], [], 2)[0], 'helper did not exit')
+        counters = {}
+        result = self.run.poll_helper(helper, counters)
+        if result is None:
+            helper.pop('pidfd')
+        self.assertIsNone(result)
+        self.assertEqual(counters, {'helpers_reaped': 1, 'helper_last_status': 0})
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(helper['process']['pid'], os.WNOHANG)
+
+    def test_real_helper_waits_for_parent_gate_before_reconciliation(self):
+        root = self.roots[0]
+        state = self.run.bind_context(root, root / 'state')
+        marker = root / 'reconciled'
+        reader, writer = os.pipe()
+        parent = os.getpid()
+        read = os.read
+        def entering_read(fd, count):
+            if os.getpid() != parent:
+                os.write(writer, b'R')
+            return read(fd, count)
+        helper = None
+        try:
+            with patch.object(self.run.os, 'read', side_effect=entering_read), \
+                 patch.object(self.run, 'reconcile', side_effect=lambda *args: marker.write_text('released')):
+                helper = self.run.start_helper({'state_dir': str(state)}, {})
+                os.close(writer)
+                writer = None
+                self.assertTrue(select.select([reader], [], [], 2)[0], 'child did not reach the gate')
+                self.assertEqual(read(reader, 1), b'R')
+                self.assertFalse(marker.exists())
+                self.assertFalse((state / 'capacity.lock').exists())
+                self.assertEqual(os.waitpid(helper['process']['pid'], os.WNOHANG), (0, 0))
+                self.run.release_helper(helper)
+                self.helper_exited(helper)
+                helper = None
+                self.assertEqual(marker.read_text(), 'released')
+        finally:
+            self.reap_helper(helper)
+            os.close(reader)
+            if writer is not None:
+                os.close(writer)
+
+    def test_real_helper_identity_refusal_closes_gate_and_reaps_without_reconciliation(self):
+        root = self.roots[0]
+        state = self.run.bind_context(root, root / 'state')
+        marker = root / 'unexpected-reconciliation'
+        before = (state / 'capacity.json').read_bytes()
+        process = self.run.base.process
+        parent = os.getpid()
+        children = []
+        def wrong_identity(pid):
+            identity = process(pid)
+            if pid != parent:
+                children.append(pid)
+                identity['uid'] = -1
+            return identity
+        with patch.object(self.run.base, 'process', side_effect=wrong_identity), \
+             patch.object(self.run, 'reconcile', side_effect=lambda *args: marker.write_text('unexpected')):
+            with self.assertRaisesRegex(self.run.base.Refused, 'helper_handoff_refused_before_reconcile_child_reaped'):
+                self.run.start_helper({'state_dir': str(state)}, {})
+        self.assertEqual(len(children), 1)
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(children[0], os.WNOHANG)
+        self.assertFalse(Path('/proc', str(children[0])).exists())
+        self.assertFalse(marker.exists())
+        self.assertFalse((state / 'capacity.lock').exists())
+        self.assertEqual((state / 'capacity.json').read_bytes(), before)
+
+    def test_real_helper_busy_project_flock_exits_without_reconciliation_or_ledger_change(self):
+        root = self.roots[0]
+        state = self.run.bind_context(root, root / 'state')
+        marker = root / 'unexpected-reconciliation'
+        before = (state / 'capacity.json').read_bytes()
+        helper = None
+        try:
+            with self.run.locked(state), \
+                 patch.object(self.run, 'reconcile', side_effect=lambda *args: marker.write_text('unexpected')):
+                helper = self.run.start_helper({'state_dir': str(state)}, {})
+                self.run.release_helper(helper)
+                self.helper_exited(helper)
+                helper = None
+                self.assertFalse(marker.exists())
+                self.assertEqual((state / 'capacity.json').read_bytes(), before)
+        finally:
+            self.reap_helper(helper)
 
     def test_import_selects_no_project_or_state(self):
         self.assertIsNone(self.run.ROOT)
