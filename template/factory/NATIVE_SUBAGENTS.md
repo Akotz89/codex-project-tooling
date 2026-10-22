@@ -3,8 +3,15 @@
 `project-factory route-subagent` is a preparation-only shared entry. It reads the
 current project's existing consumer settings and root/tracker/context binding.
 It never starts a worker or changes the coordinator's model, trust, approvals,
-backlog, native configuration, or ownership. The native coordinator selects the
-authorized bounded task and owns dispatch, liveness, writer leases and acceptance.
+backlog, native configuration, or ownership. The native Core coordinator retains
+global accepted-scope allocation, cross-lane coordination, and canonical Graph
+authority. Within an accepted lane, the coordinator may explicitly assign a Core
+lead as native coordinator for bounded children. That lead may prepare and dispatch
+through the selected route, record local linked claims, own actual child handles and
+writer-path leases, verify results against the assigned acceptance, and report
+actual liveness and evidence to the coordinator. This bounded delegation does not
+broaden or reassign project scope or create another scheduler. Execution remains
+with actually routed bounded workers.
 
 Invoke from the adopting project's Git root:
 
@@ -184,6 +191,10 @@ The caller must then:
    remove obsolete task-owned scratch after checking live dependencies.
 
 Existing workers and same-worker continuations keep their current settings.
+For a same-task continuation, resume the accepted assignment, current claim, real
+worker handle/result and next acceptance; refresh only materially changed
+dependencies or checks the current human explicitly requests, not full unchanged
+intake.
 This contract governs new bounded native handoffs; it does not start product work
 or transfer dispatcher ownership.
 
