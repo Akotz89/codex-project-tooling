@@ -35,7 +35,6 @@ The bounded JSON input is at most 1 MiB. Its required fields are:
   },
   "task": "Current authorized goal, known facts and ambiguities, risk and safeguards, dependencies/interfaces, acceptance and useful verification",
   "ordinary": {"provider": "codex", "model": "gpt-6.1-sol", "effort": "medium"},
-  "remaining_ms": 4000,
   "capability_provenance": {
     "source": "current_runtime_tool_schema",
     "tool": "collaboration.spawn_agent",
@@ -83,8 +82,10 @@ an advertised, policy-permitted pair can reach Jev. Copy current metadata when
 available; do not invent descriptions, prices, benchmarks or rankings. Descriptors
 remain caller-supplied context, and never expand capabilities or task authority.
 
-The task is nonempty; the combined task, native dispatch packet and any human constraint is at most 8192 UTF-8 bytes. The assessment deadline
-is more than zero and at most 8000 milliseconds. Routing intersects the supplied
+The task is nonempty; the combined task, native dispatch packet and any human
+constraint is at most 8192 UTF-8 bytes. Supply `remaining_ms` only with a real
+caller deadline; otherwise omit it or use null. Supplied budgets must be finite
+and positive. The bridge does not infer a Codex deadline. Routing intersects the supplied
 options with the accepted Luna/Sol worker policy: Sol low/medium/high, Luna only
 its supported native efforts through max (currently low/medium/high/xhigh/max). An unavailable or forbidden ordinary pair refuses.
 

@@ -139,14 +139,15 @@ def route(request, root, key_file=None, jev_model='jev-latest', *, allowed_model
                             else eligible(request.get('catalog'), time.time())).values()
                 if allowed_models is None or row['model'] in allowed_models):
             raise ModelPolicyError('human pair unavailable or forbidden')
-        remaining, task, ordinary = request['remaining_ms'], request['task'], request['ordinary']
-        if (isinstance(remaining, bool) or not isinstance(remaining, (int, float))
-                or not math.isfinite(remaining) or not 0 < remaining <= 8000
+        remaining, task, ordinary = request.get('remaining_ms'), request['task'], request['ordinary']
+        if (remaining is not None and
+                (isinstance(remaining, bool) or not isinstance(remaining, (int, float))
+                or not math.isfinite(remaining) or remaining <= 0)
                 or not isinstance(task, str)):
             raise ValueError('native context')
         if capability is not None and 'catalog' in request:
             raise ValueError('choose one capability provenance source')
-        deadline = started + remaining / 1000
+        deadline = started + remaining / 1000 if remaining is not None else None
         if attribution is not None:
             task += '\nHuman pair constraint: ' + json.dumps(choice, sort_keys=True)
         # Validate ordinary policy/capability before credential IO; ordinary is context only.

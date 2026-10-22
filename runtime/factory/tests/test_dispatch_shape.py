@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import signal
 import sys
 import tempfile
 import unittest
@@ -271,6 +272,187 @@ class TypedAssessmentBridgeTests(unittest.TestCase):
         self.assertNotIn('offline-test-token', json.dumps(seen))
         self.assertNotIn('secret=value', json.dumps(seen))
         self.assertNotIn('offline-test-token', json.dumps(result))
+
+    def test_budget_is_optional_and_explicit_values_have_no_8000ms_ceiling(self):
+        for budget in ('omitted', None, 7800, 8000, 9001):
+            with self.subTest(budget=budget), patch.object(bridge, 'read_credential', return_value='offline-test-token'), \
+                    patch.object(bridge.time, 'monotonic', return_value=100.0):
+                request = self.request()
+                if budget == 'omitted':
+                    request.pop('remaining_ms')
+                    expected = None
+                else:
+                    request['remaining_ms'] = budget
+                    expected = None if budget is None else 100.0 + budget / 1000
+                seen = []
+                result = bridge.route(request, ROOT, transport=lambda p, _, deadline:
+                    seen.append(deadline) or self.answer(p))
+                self.assertEqual(result['status'], 'selected')
+                self.assertEqual(seen, [expected])
+
+    def test_invalid_and_expired_budgets_refuse_before_transport(self):
+        for budget in (0, -1, float('nan'), float('inf'), True, '8000'):
+            with self.subTest(budget=budget), patch.object(bridge, 'read_credential',
+                    side_effect=AssertionError('invalid budget must be rejected before credentials')):
+                result = bridge.route({**self.request(), 'remaining_ms': budget}, ROOT,
+                                      transport=lambda *_: self.fail('invalid budget reached transport'))
+                self.assertEqual(result['status'], 'refused')
+        with patch.object(bridge.time, 'monotonic', return_value=100.0):
+            _, receipt = jev_router.choose('bounded task', None, 'offline-test-token', 'jev-latest',
+                99.0, ordinary={'provider': 'codex', 'model': 'gpt-6-luna', 'effort': 'low'},
+                capability_provenance=self.capability(),
+                transport=lambda *_: self.fail('expired budget reached transport'))
+        self.assertEqual(receipt['reason'], 'deadline')
+
+    def test_http_transport_uses_stdlib_default_or_explicit_deadline(self):
+        class Child:
+            pid, returncode = 321, 0
+            def __init__(self, output):
+                self.output = output
+                self.timeouts = []
+            def communicate(self, data=None, **kwargs):
+                self.timeouts.append(kwargs.get('timeout'))
+                return self.output, None
+            def poll(self): return self.returncode
+        for deadline, expected_timeout in ((None, None), (100.0, 5.0)):
+            child = Child(b'{"ok":true,"result":{}}')
+            with self.subTest(deadline=deadline), patch.object(jev_router.subprocess, 'Popen', return_value=child), \
+                    patch.object(jev_router.time, 'monotonic', return_value=95.0):
+                jev_router.http_choice({'bounded': True}, 'offline-test-token', deadline)
+            self.assertEqual(child.timeouts, [expected_timeout])
+
+    def test_child_wait_timeout_maps_to_deadline_and_reaps_child(self):
+        class Child:
+            pid = 321
+            def __init__(self):
+                self.calls = 0
+                self.returncode = None
+                self.killed = False
+                self.reaped = False
+            def communicate(self, data=None, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise subprocess.TimeoutExpired('http child', 5)
+                self.returncode = -9
+                self.reaped = True
+                return b'', None
+            def poll(self): return self.returncode
+            def kill(self): self.killed = True; self.returncode = -9
+        child = Child()
+        with patch.object(jev_router.subprocess, 'Popen', return_value=child), \
+                patch.object(jev_router.time, 'monotonic', return_value=95.0), \
+                self.assertRaises(jev_router.TransportFailure) as raised:
+            jev_router.http_choice({'bounded': True}, 'offline-test-token', 100.0)
+        self.assertEqual(raised.exception.kind, 'deadline')
+        self.assertTrue(raised.exception.transport['reaped'])
+        self.assertTrue(child.killed)
+        self.assertTrue(child.reaped)
+        self.assertEqual(child.calls, 2)
+
+    def test_http_request_uses_stdlib_default_or_remaining_budget(self):
+        class Response:
+            status = 200
+            headers = {}
+            def __init__(self): self.chunks = iter((b'{"ok":true}', b''))
+            def __enter__(self): return self
+            def __exit__(self, *_): pass
+            def read1(self, _): return next(self.chunks)
+        for deadline, expected in ((None, ((), {})), (110.0, ((), {'timeout': 10.0}))):
+            with self.subTest(deadline=deadline), patch.object(jev_router.time, 'monotonic', return_value=100.0), \
+                    patch.object(jev_router.urllib.request, 'urlopen', return_value=Response()) as open_url:
+                jev_router._http_once({}, 'offline-test-token', deadline)
+            self.assertEqual(open_url.call_args.args[1:], ())
+            self.assertEqual(open_url.call_args.kwargs, expected[1])
+
+    def test_parent_cancellation_kills_and_reaps_http_child(self):
+        class Child:
+            pid = 321
+            def __init__(self, signal_in_communicate=True):
+                self.calls = 0; self.killed = False; self.returncode = None; self.reaped = False
+                self.signal_in_communicate = signal_in_communicate
+            def communicate(self, data=None, **kwargs):
+                self.calls += 1
+                if self.calls == 1 and self.signal_in_communicate:
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    self.returncode = 0
+                    self.reaped = True
+                    return b'{"ok":true,"result":{}}', None
+                self.returncode = -9
+                self.reaped = True
+                return b'', None
+            def poll(self): return self.returncode
+            def kill(self): self.killed = True; self.returncode = -9
+        original = signal.getsignal(signal.SIGTERM)
+        for prior_kind in ('return', 'raise', 'timeout_raise', 'default', 'pending', 'pending_raise', 'ignored'):
+            with self.subTest(prior_kind=prior_kind):
+                child = Child(signal_in_communicate=prior_kind not in ('pending', 'pending_raise'))
+                received = []
+                prior_timeout = subprocess.TimeoutExpired('prior handler', 1)
+                if prior_kind == 'default':
+                    prior_handler = signal.SIG_DFL
+                elif prior_kind == 'ignored':
+                    prior_handler = signal.SIG_IGN
+                elif prior_kind in ('return', 'pending'):
+                    def prior_handler(signum, frame): received.append(signum)
+                elif prior_kind == 'timeout_raise':
+                    def prior_handler(signum, frame):
+                        received.append(signum)
+                        raise prior_timeout
+                else:
+                    def prior_handler(signum, frame):
+                        received.append(signum)
+                        raise ValueError('prior handler failure')
+                signal.signal(signal.SIGTERM, prior_handler)
+                def launch(*_args, **_kwargs):
+                    if prior_kind in ('pending', 'pending_raise'):
+                        os.kill(os.getpid(), signal.SIGTERM)
+                    return child
+                try:
+                    with patch.object(jev_router.subprocess, 'Popen', side_effect=launch), \
+                            patch.object(jev_router.time, 'monotonic', return_value=100.0):
+                        if prior_kind == 'return':
+                            with self.assertRaises(jev_router.TransportFailure) as raised:
+                                jev_router.http_choice({'bounded': True}, 'offline-test-token', None)
+                            self.assertEqual(raised.exception.kind, 'cancelled')
+                            caller_continued = True
+                        elif prior_kind == 'pending':
+                            with self.assertRaises(jev_router.TransportFailure) as raised:
+                                jev_router.http_choice({'bounded': True}, 'offline-test-token', None)
+                            self.assertEqual(raised.exception.kind, 'cancelled')
+                            caller_continued = True
+                        elif prior_kind == 'pending_raise':
+                            with self.assertRaisesRegex(ValueError, 'prior handler failure'):
+                                jev_router.http_choice({'bounded': True}, 'offline-test-token', None)
+                            caller_continued = True
+                        elif prior_kind == 'raise':
+                            with self.assertRaisesRegex(ValueError, 'prior handler failure'):
+                                jev_router.http_choice({'bounded': True}, 'offline-test-token', None)
+                            caller_continued = True
+                        elif prior_kind == 'timeout_raise':
+                            with self.assertRaises(subprocess.TimeoutExpired) as raised:
+                                jev_router.http_choice({'bounded': True}, 'offline-test-token', None)
+                            self.assertIs(raised.exception, prior_timeout)
+                            caller_continued = True
+                        elif prior_kind == 'ignored':
+                            result = jev_router.http_choice({'bounded': True}, 'offline-test-token', None)
+                            self.assertTrue(result)
+                            caller_continued = True
+                        else:
+                            with self.assertRaises(SystemExit) as raised:
+                                jev_router.http_choice({'bounded': True}, 'offline-test-token', None)
+                            self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+                            caller_continued = False
+                    self.assertIs(signal.getsignal(signal.SIGTERM), prior_handler)
+                    self.assertEqual(received, [] if prior_kind in ('default', 'ignored') else [signal.SIGTERM])
+                    self.assertEqual(child.killed, prior_kind != 'ignored')
+                    self.assertTrue(child.reaped)
+                    self.assertEqual(child.calls, 1 if prior_kind in ('pending', 'pending_raise', 'ignored') else 2)
+                    self.assertEqual(caller_continued, prior_kind != 'default')
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+                        child.reaped = True
+                    signal.signal(signal.SIGTERM, original)
 
 
 if __name__ == '__main__':

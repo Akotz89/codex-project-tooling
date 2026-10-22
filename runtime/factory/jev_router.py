@@ -8,9 +8,11 @@ import math
 import os
 from pathlib import Path
 import re
+import signal
 import tempfile
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 import urllib.request
@@ -328,8 +330,8 @@ def collaboration_capability_pairs(provenance, *, credential=None):
 
 def _http_once(payload, credential, deadline):
     """One bounded stdlib HTTP request. No transport retries or worker launches."""
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
+    remaining = deadline - time.monotonic() if deadline is not None else None
+    if remaining is not None and remaining <= 0:
         raise TimeoutError('routing deadline')
     body = json.dumps(payload, separators=(',', ':')).encode()
     if len(body) > MAX_BYTES:
@@ -337,13 +339,15 @@ def _http_once(payload, credential, deadline):
     body = body.replace(credential.encode(), b'[REDACTED]')
     request = urllib.request.Request('https://api.typesafe.ai/v1/systemone', data=body,
         headers={'Authorization': 'Bearer ' + credential, 'Content-Type': 'application/json'})
-    with urllib.request.urlopen(request, timeout=remaining) as response:
+    response_context = (urllib.request.urlopen(request, timeout=remaining) if remaining is not None
+                        else urllib.request.urlopen(request))
+    with response_context as response:
         http_status = response.status
         request_id = response.headers.get('x-request-id') or response.headers.get('request-id')
         chunks = []
         size = 0
         while True:
-            if time.monotonic() >= deadline:
+            if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError('routing deadline')
             part = response.read1(min(4096, MAX_BYTES + 1 - size))
             if not part:
@@ -352,7 +356,7 @@ def _http_once(payload, credential, deadline):
             size += len(part)
             if size > MAX_BYTES:
                 raise ValueError('response limit')
-    if time.monotonic() >= deadline:
+    if deadline is not None and time.monotonic() >= deadline:
         raise TimeoutError('routing deadline')
     answer = json.loads(b''.join(chunks))
     if isinstance(answer, dict):
@@ -368,17 +372,54 @@ class TransportFailure(RuntimeError):
 
 
 def http_choice(payload, credential, deadline):
-    """One finite HTTP child: credential on stdin only; hard overall deadline/reaping."""
+    """One HTTP child: credential on stdin only; explicit deadlines and parent cancellation reap it."""
     child = None
+    previous_sigterm = None
+    restore_sigterm = False
+    pending_sigterm = None
+    prior_handler_exception = None
     try:
         data = json.dumps({'payload': payload, 'credential': credential, 'deadline': deadline}, separators=(',', ':')).encode()
-        if len(data) > MAX_BYTES + 16384 or time.monotonic() >= deadline:
+        if len(data) > MAX_BYTES + 16384 or deadline is not None and time.monotonic() >= deadline:
             raise TransportFailure('deadline_or_request_limit', None, True)
+        if threading.current_thread() is threading.main_thread():
+            previous_sigterm = signal.getsignal(signal.SIGTERM)
+            if previous_sigterm is not signal.SIG_IGN:
+                def terminate_on_sigterm(signum, frame):
+                    nonlocal pending_sigterm, prior_handler_exception
+                    if previous_sigterm is signal.SIG_DFL:
+                        if child is None:
+                            pending_sigterm = signum
+                            return
+                        raise SystemExit(128 + signum)
+                    try:
+                        previous_sigterm(signum, frame)
+                    except BaseException as error:
+                        prior_handler_exception = error
+                        if child is None:
+                            pending_sigterm = signum
+                            return
+                        raise
+                    if child is None:
+                        pending_sigterm = signum
+                        return
+                    raise TransportFailure('cancelled', child.pid, False)
+                signal.signal(signal.SIGTERM, terminate_on_sigterm)
+                restore_sigterm = True
         child = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '--http-once'],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             env={key: value for key, value in os.environ.items() if key != 'TYPESAFE_API_KEY'})
-        output, _ = child.communicate(data, timeout=max(.001, deadline - time.monotonic()))
-        if len(output) > MAX_BYTES or child.returncode or time.monotonic() >= deadline:
+        if prior_handler_exception is not None:
+            raise prior_handler_exception
+        if pending_sigterm is not None:
+            if previous_sigterm is signal.SIG_DFL:
+                raise SystemExit(128 + pending_sigterm)
+            raise TransportFailure('cancelled', child.pid, False)
+        if deadline is None:
+            output, _ = child.communicate(data)
+        else:
+            output, _ = child.communicate(data, timeout=max(.001, deadline - time.monotonic()))
+        if len(output) > MAX_BYTES or child.returncode or deadline is not None and time.monotonic() >= deadline:
             raise TransportFailure('response_or_deadline', child.pid, True)
         response = json.loads(output)
         if response.get('ok') is not True or not isinstance(response.get('result'), dict):
@@ -386,19 +427,29 @@ def http_choice(payload, credential, deadline):
         result = response['result']
         result['_transport'] = {'child_pid': child.pid, 'reaped': True}
         return result
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as error:
+        if error is prior_handler_exception:
+            raise
         raise TransportFailure('deadline', child.pid if child else None, False) from None
     except TransportFailure:
         raise
-    except Exception:
+    except Exception as error:
+        if error is prior_handler_exception:
+            raise
         raise TransportFailure('spawn_or_protocol', child.pid if child else None, child is None or child.poll() is not None) from None
     finally:
-        if child is not None and child.poll() is None:
-            child.kill()
-            child.communicate()  # Exactly one child, always reaped; never retry the HTTP request.
-        error = sys.exc_info()[1]
-        if isinstance(error, TransportFailure) and child is not None:
-            error.transport['reaped'] = child.poll() is not None
+        try:
+            if child is not None and child.poll() is None:
+                try:
+                    child.kill()
+                finally:
+                    child.communicate()  # Exactly one child, always reaped; never retry the HTTP request.
+            error = sys.exc_info()[1]
+            if isinstance(error, TransportFailure) and child is not None:
+                error.transport['reaped'] = child.poll() is not None
+        finally:
+            if restore_sigterm:
+                signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 def _http_child():
@@ -407,7 +458,7 @@ def _http_child():
         if len(raw) > MAX_BYTES + 16384:
             raise ValueError('request limit')
         data = json.loads(raw)
-        result = _http_once(data['payload'], data['credential'], data['deadline'])
+        result = _http_once(data['payload'], data['credential'], data.get('deadline'))
         output = json.dumps({'ok': True, 'result': result}, separators=(',', ':'), ensure_ascii=False).encode()
         if len(output) > MAX_BYTES:
             raise ValueError('response limit')
@@ -533,7 +584,7 @@ def choose(task, catalog, credential, jev_model, deadline, *, ordinary=None,
         if receipt['task_utf8_bytes'] > max_task_bytes:
             receipt['reason'] = 'context_oversize'
             return None, receipt
-        if started >= deadline:
+        if deadline is not None and started >= deadline:
             receipt['reason'] = 'deadline'
             return None, receipt
         allowed_catalog = [{'model': row['model'], 'effort': row['effort'],
@@ -574,7 +625,7 @@ def choose(task, catalog, credential, jev_model, deadline, *, ordinary=None,
         receipt['usage'] = {key: value for key, value in usage.items()
                             if key in {'input_tokens', 'output_tokens', 'total_tokens'}
                             and isinstance(value, int) and not isinstance(value, bool) and value >= 0} if isinstance(usage, dict) else {}
-        if time.monotonic() >= deadline:
+        if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError('routing deadline')
         try:
             items = assessments(answer, payload['questions'])

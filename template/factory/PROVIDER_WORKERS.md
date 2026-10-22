@@ -11,10 +11,13 @@ project-factory route-worker --caller-id archon:<run-id> \
 Run from the canonical adopting Git project. The service checks current local
 settings, tracker/context/root binding and immutable Archon source before
 selection. Request schema is CPI414PROVIDERWORKERV1 with caller_id, task_id,
-project_binding, task, ordinary, remaining_ms, catalog and catalog_provenance.
+project_binding, task, ordinary, optional remaining_ms, catalog and catalog_provenance.
 Task is the exact bounded final prompt, at most 65536 UTF-8 bytes without
 truncation; native subagent limits remain 8192. Ordinary is contextual
-{provider:"codex",model,effort}, never a bypass. Budget is >0 through 8000ms.
+{provider:"codex",model,effort}, never a bypass. `remaining_ms` may be omitted
+or null to use the stdlib transport default and parent cancellation, or supplied
+as a finite positive millisecond budget. The bridge enforces only an explicitly
+supplied budget; it does not infer a Codex deadline.
 
 Catalog is the actual result from the same authenticated app-server connection
 which will create the worker, normalized as:
