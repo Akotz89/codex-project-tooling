@@ -78,3 +78,11 @@ genuine review by an independent human, or an external independent report format
 that project guidance accepts. In every case it must identify the PR's current head,
 be credible and independent of the implementer, state a ready verdict, and contain
 no unresolved blocking findings. Stale, ambiguous, or self-attested evidence holds.
+
+## BMAD Build manager-to-worker handoff
+
+These manager duties apply only when the current native handoff assigns the chat the manager/orchestrator role. For new work and continuations, the assigned manager owns accepted scope, claims, writer reconciliation, dispatch, coordination metadata, read-only inspection and verification, review, and original-caller acceptance. Source and test edits, Git staging/commit/push, and task-owned cleanup execution belong in the bounded worker assignment; the manager coordinates those actions and inspects their results read-only.
+
+The assigned execution worker performs its bounded work directly. Reading manager guidance is not a reason to redispatch. Before an assigned manager makes implementation or task-owned execution writes, it dispatches the actual bounded worker through the existing native route. The plan and typed request carry the complete accepted scope, task and source boundaries, writer ownership, project context, exclusions, caller acceptance, and exact artifact paths.
+
+Preserve the selected delivery route and exact launch-ready assessed worker pair; do not change the running Core model. Existing workers and same-task continuations keep their current settings. This role guidance adds no tool-denial rule and makes no universal-enforcement claim.
