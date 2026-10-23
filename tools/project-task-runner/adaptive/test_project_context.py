@@ -19,6 +19,10 @@ CONTEXT_SPEC = importlib.util.spec_from_file_location(
     'generic_project_context_helpers', HERE.parent / 'project_context.py')
 context_helpers = importlib.util.module_from_spec(CONTEXT_SPEC)
 CONTEXT_SPEC.loader.exec_module(context_helpers)
+CALLER_API_SPEC = importlib.util.spec_from_file_location(
+    'generic_project_caller_api', HERE.parent / 'caller_api.py')
+caller_api = importlib.util.module_from_spec(CALLER_API_SPEC)
+CALLER_API_SPEC.loader.exec_module(caller_api)
 
 
 def load():
@@ -62,6 +66,71 @@ class ProjectContext(unittest.TestCase):
         path = root / 'config.json'
         self.run.base.publish(path, config)
         return path
+
+    def packet_chain(self, root, authorized):
+        state = 'ROOT05_SUCCESSOR' if authorized else 'ROOT04_LEGACY'
+        refs = {}
+        for name in ('source_evidence', 'candidate', 'adoption'):
+            refs[name] = {'path': str(root / 'work' / f'{name}.json'),
+                          'sha256': name[0] * 64}
+        pins = {'/tooling/runtime.py': 'a' * 64}
+        evidence = {'source': {'observed_merge': 'b' * 40},
+                    'runtime_source_pins': pins}
+        candidate = {'project_root': str(root), 'canonical_state': str(root / 'state'),
+                     'source_evidence': refs['source_evidence'],
+                     'runtime_source_pins': pins}
+        adoption = {
+            'project_root': str(root), 'canonical_state': str(root / 'state'),
+            'code_root': '/tooling', 'runtime_path': '/tooling/adaptive',
+            'state': state, 'actual_job_authorized': authorized,
+            'actual_runtime_adoption_authorized': True,
+            'candidate': refs['candidate']['path'],
+            'candidate_sha256': refs['candidate']['sha256'],
+            'source_validation': {'root_source_evidence': refs['source_evidence']},
+            'runtime_source_pins': pins,
+        }
+        packets = {'source_evidence': evidence, 'candidate': candidate, 'adoption': adoption}
+        contract = {
+            'packets': {name: {'path': str(Path(ref['path']).relative_to(root)),
+                               'sha256': ref['sha256']} for name, ref in refs.items()},
+            'actual_job_authorized': authorized,
+            'observed_merge': evidence['source']['observed_merge'],
+            'canonical_state': str(root / 'state'), 'code_root': '/tooling',
+            'runtime_path': '/tooling/adaptive', 'adoption_state': state,
+        }
+        return packets, refs, contract
+
+    def test_root_packet_chain_accepts_exact_true_and_preserves_legacy_false(self):
+        root = self.roots[0]
+        for authorized in (True, False):
+            with self.subTest(actual_job_authorized=authorized):
+                packets, refs, contract = self.packet_chain(root, authorized)
+                bound = context_helpers.validate_root_packet_chain(
+                    packets, refs, contract, root)
+                self.assertIs(bound['adoption']['actual_job_authorized'], authorized)
+
+    def test_root_packet_chain_refuses_missing_or_mismatched_pins_and_non_boolean_auth(self):
+        root = self.roots[0]
+        for malformed in ('missing_ref', 'wrong_ref_hash', 'contract_non_boolean',
+                          'adoption_non_boolean', 'runtime_pin_mismatch',
+                          'project_identity_mismatch'):
+            with self.subTest(malformed=malformed):
+                packets, refs, contract = self.packet_chain(root, True)
+                if malformed == 'missing_ref':
+                    del refs['candidate']
+                elif malformed == 'wrong_ref_hash':
+                    refs['candidate'] = dict(refs['candidate'], sha256='f' * 64)
+                elif malformed == 'contract_non_boolean':
+                    contract['actual_job_authorized'] = 1
+                elif malformed == 'adoption_non_boolean':
+                    packets['adoption']['actual_job_authorized'] = 1
+                elif malformed == 'runtime_pin_mismatch':
+                    packets['candidate']['runtime_source_pins'] = {'/tooling/runtime.py': 'f' * 64}
+                else:
+                    packets['candidate']['project_root'] = str(root / 'other')
+                with self.assertRaises(ValueError):
+                    context_helpers.validate_root_packet_chain(
+                        packets, refs, contract, root)
 
     def test_binding_clears_stale_cross_project_legacy_binding(self):
         class Runtime:
@@ -250,6 +319,20 @@ class ProjectContext(unittest.TestCase):
         self.assertEqual(references['source_evidence']['sha256'], descriptors['source_evidence']['sha256'])
         self.assertEqual(len(api.reads), 1)
         self.assertEqual(api.reads[0][2], 128)
+
+    def test_packet_set_refuses_tampered_bytes_before_packet_validation(self):
+        root = self.roots[0]
+        packet = root / 'work' / 'packets' / 'adoption.json'
+        packet.parent.mkdir(parents=True)
+        original = b'{"actual_job_authorized":true}\n'
+        packet.write_bytes(original)
+        descriptor = {'adoption': {
+            'path': 'work/packets/adoption.json',
+            'sha256': __import__('hashlib').sha256(original).hexdigest()}}
+        packet.write_bytes(b'{"actual_job_authorized":false}\n')
+
+        with self.assertRaisesRegex(caller_api.Refused, 'source_pin_before_execute'):
+            context_helpers.read_pinned_packet_set(descriptor, root, caller_api)
 
     def test_second_project_binding_drives_public_run_status_stop_and_payload_paths(self):
         second = self.roots[1]

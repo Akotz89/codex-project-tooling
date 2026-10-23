@@ -159,6 +159,7 @@ def validate_root_packet_chain(packets, references, contract, project_root):
     candidate_ref = references["candidate"]
     adoption_ref = references["adoption"]
     source = evidence.get("source")
+    authorized = contract.get("actual_job_authorized")
     if (candidate.get("source_evidence") != evidence_ref
             or adoption.get("candidate") != candidate_ref["path"]
             or adoption.get("candidate_sha256") != candidate_ref["sha256"]
@@ -172,7 +173,9 @@ def validate_root_packet_chain(packets, references, contract, project_root):
             or adoption.get("code_root") != contract.get("code_root")
             or adoption.get("runtime_path") != contract.get("runtime_path")
             or adoption.get("state") != contract.get("adoption_state")
-            or adoption.get("actual_job_authorized") is not contract.get("actual_job_authorized")
+            or type(authorized) is not bool
+            or type(adoption.get("actual_job_authorized")) is not bool
+            or adoption.get("actual_job_authorized") is not authorized
             or adoption.get("actual_runtime_adoption_authorized") is not True):
         raise ValueError("packet_chain_binding")
     pins = candidate.get("runtime_source_pins")
@@ -246,9 +249,7 @@ def bind_selected_runtime_context(selection, historical, contract, project_root,
     selected = {"schema": selection["schema"], **refs}
     if selection != selected:
         raise ValueError("successor_context_selection_binding")
-    # Root04 is a source-preparation packet with actual_job_authorized=false.
-    # No selected packet can elevate that immutable grant; a future authorized
-    # chain must be independently added to the trusted binding contract first.
+    # Only the packet triple already selected by the trusted contract can bind.
     expected = contract["packets"]
     for key in expected:
         expected_ref = {"path": str(Path(project_root) / expected[key]["path"]),
