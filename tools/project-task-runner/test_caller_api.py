@@ -209,6 +209,26 @@ class PromotionReceiptTests(unittest.TestCase):
         self.assertEqual(module.VALUE, "verified")
         self.assertIs(importlib.util.spec_from_file_location, original)
 
+    def test_verified_loader_binds_an_inert_second_project_without_wow_paths(self):
+        generic_source = (ROOT / "caller_api.py").read_bytes().lower()
+        for project_marker in (b"wow", b"root04", b"wow private server"):
+            self.assertNotIn(project_marker, generic_source)
+
+        project = self.root / "projects" / "second-project"
+        project.mkdir(parents=True)
+        source = project / "task_entry.py"
+        raw = ("PROJECT_ID = 'second-project'\n"
+               "PROJECT_ROOT = __file__.rsplit('/', 1)[0]\n").encode()
+        source.write_bytes(raw)
+
+        module = caller_api.execute_verified_source(
+            "second_project_entry", source, raw,
+            source_bytes={source: raw}, trusted_root=project)
+
+        self.assertEqual(module.PROJECT_ID, "second-project")
+        self.assertEqual(Path(module.PROJECT_ROOT), project)
+        self.assertNotIn("wow", str(source).lower())
+
     def test_nested_unpinned_import_under_trusted_root_is_refused(self):
         unpinned = self.root / "unpinned.py"
         unpinned.write_text("VALUE = 'untrusted'\n", encoding="utf-8")
