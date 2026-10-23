@@ -70,6 +70,24 @@ WORK = HOME / "work/cpi410/tests"
 WORK.mkdir(parents=True, exist_ok=True)
 
 
+class NativeAuditEntryTests(unittest.TestCase):
+    def test_shared_command_uses_actual_project_and_propagates_status(self):
+        from factory import usage_collector
+        actual = Path("/actual/bound/caller")
+        args = ["--preparation", "work/task/private.json", "--thread-id", "caller", "--call-id", "call"]
+        with patch.object(consumer, "project_root", return_value=actual), \
+                patch.object(usage_collector, "audit_native_cli", return_value=1) as audit:
+            self.assertEqual(consumer.main(["audit-native-call", *args]), 1)
+            audit.assert_called_once_with(actual, args)
+
+    def test_help_exposes_audit_and_existing_commands(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(consumer.main(["--help"]), 0)
+        for command in ("audit-native-call", "route-subagent", "route-worker", "factory schedule", "factory run"):
+            self.assertIn(command, output.getvalue())
+
+
 class Fixture(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=WORK, prefix="factory consumer ")
@@ -195,7 +213,10 @@ class ConsumerTests(Fixture):
     def test_actual_flat_native_hook_rewrites_and_denies_wrong_locator(self):
         self.native_hook_source_boundary("collaborationspawn_agent")
 
-    def native_hook_source_boundary(self, tool_name):
+    def test_actual_native_audit_opaque_hook_records(self):
+        self.native_hook_source_boundary("collaborationspawn_agent", opaque=True)
+
+    def native_hook_source_boundary(self, tool_name, opaque=False):
         session_id = "01a15564-fd5f-7550-aadb-de6160ef7b5d"
         caller = "native:" + session_id
         body = "Perform the bounded parser task and verify its assertions."
@@ -223,15 +244,20 @@ class ConsumerTests(Fixture):
             return json.loads(result.stdout)
 
         def event(receipt, tool_id):
+            packet = dict(receipt["native_request"])
+            if opaque:
+                import base64
+                packet["message"] = base64.urlsafe_b64encode(b"\x80" + b"\0" * 8 + b"x" * 64).decode()
             return {"hook_event_name": "PreToolUse", "cwd": str(self.app),
                     "session_id": session_id, "turn_id": "turn:1", "tool_use_id": tool_id,
-                    "tool_name": tool_name, "tool_input": dict(receipt["native_request"])}
+                    "tool_name": tool_name, "tool_input": packet}
 
         def hook(receipt, tool_id, wrong_locator=False):
             payload = event(receipt, tool_id)
             if wrong_locator:
-                locator = "work/native/jev-00000000000000000000000000000000.json"
-                payload["tool_input"]["task_name"] = "cpi414_" + locator.encode().hex()
+                from factory.jev_prepared_bridge import native_carrier
+                payload["tool_input"]["task_name"] = native_carrier(
+                    "work/native/jev-00000000000000000000000000000000.json")
             result = subprocess.run(hook_args, input=json.dumps(payload), cwd=self.app,
                                     capture_output=True, text=True, timeout=15)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -242,14 +268,56 @@ class ConsumerTests(Fixture):
         self.assertEqual(wrong["permissionDecision"], "deny")
         self.assertNotIn("updatedInput", wrong)
         self.assertFalse(Path(positive["receipt_path"]).with_suffix(".consume.json").exists())
-        allowed = hook(positive, "tool:valid")
+        allowed = hook(positive, "call_fixture_original")
         self.assertEqual(allowed["permissionDecision"], "allow")
         self.assertEqual(allowed["updatedInput"]["model"], "gpt-6.1-sol")
         self.assertEqual(allowed["updatedInput"]["reasoning_effort"], "medium")
         self.assertEqual(allowed["updatedInput"]["fork_turns"], "none")
         self.assertEqual(positive["receipt"]["attempts"], 1)
-        self.assertEqual(allowed["updatedInput"]["task_name"], positive["native_task_name"])
-        self.assertEqual(allowed["updatedInput"]["message"], body)
+        self.assertEqual(allowed["updatedInput"]["task_name"], positive["native_request"]["task_name"])
+        self.assertEqual(allowed["updatedInput"]["message"], event(positive, "call_fixture_original")["tool_input"]["message"])
+
+        if opaque:
+            post_event = event(positive, "call_fixture_original")
+            post_event.update(hook_event_name="PostToolUse", tool_response={"task_name":"/root/fixture_worker"})
+            post_result = subprocess.run(hook_args, input=json.dumps(post_event), cwd=self.app,
+                                         capture_output=True, text=True, timeout=15)
+            self.assertEqual(post_result.returncode, 0, post_result.stderr)
+            self.assertEqual(json.loads(post_result.stdout), {})
+
+        # Public shared audit uses real binding/carrier/source checks and owned original records.
+        import sqlite3
+        from datetime import datetime, timezone
+        codex_home = self.base / "audit-codex"
+        rollout = codex_home / "sessions/2026/10/23" / ("rollout-fixture-" + session_id + ".jsonl")
+        rollout.parent.mkdir(parents=True)
+        call_id = "call_fixture_original"
+        rows = [{"type": "session_meta", "payload": {"id": session_id, "cwd": str(self.app)}},
+                {"type": "response_item", "timestamp": datetime.now(timezone.utc).isoformat(),
+                 "payload": {"type": "function_call", "name": tool_name, "call_id": call_id,
+                             "arguments": json.dumps(event(positive, "call_fixture_original")["tool_input"])}},
+                {"type": "response_item", "payload": {"type": "function_call_output", "call_id": call_id,
+                 "output": json.dumps({"task_name": "/root/fixture_worker"})}}]
+        rollout.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        with contextlib.closing(sqlite3.connect(codex_home / "state_5.sqlite")) as connection, connection:
+            connection.execute("CREATE TABLE threads (id TEXT, rollout_path TEXT, cwd TEXT)")
+            connection.execute("INSERT INTO threads VALUES (?, ?, ?)", (session_id, str(rollout), str(self.app)))
+        audit_args = [sys.executable, "-B", str(self.fixture_factory / "bin/factory.py"), "audit-native-call",
+                      "--preparation", positive["receipt_path"], "--thread-id", session_id, "--call-id", call_id]
+        environment = {**os.environ, "CODEX_HOME": str(codex_home)}
+        audited = subprocess.run(audit_args, cwd=self.app, env=environment, capture_output=True, text=True, timeout=15)
+        self.assertEqual(audited.returncode, 0, audited.stderr + audited.stdout)
+        original_audit = json.loads(audited.stdout)
+        self.assertTrue(original_audit["observable_arguments_match"])
+        if opaque:
+            self.assertIsNone(original_audit["arguments_match"])
+            self.assertEqual(original_audit["plaintext_attestation"], "unavailable")
+            self.assertIsNotNone(original_audit["hook_binding"])
+        else:
+            self.assertTrue(original_audit["arguments_match"])
+        self.assertEqual(original_audit["status"], "matching_reported_launch")
+        self.assertEqual(original_audit["caller_acceptance"], "not_performed")
+        self.assertNotIn(body, audited.stdout)
 
         unused = prepare()
         self.assertEqual(unused["source_binding"],

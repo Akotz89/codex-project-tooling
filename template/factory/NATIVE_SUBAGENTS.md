@@ -178,9 +178,16 @@ The caller must then:
    `reasoning_effort` and `fork_turns:none`. For hook-covered launches consume the
    complete persisted `native_request` verbatim, including its carrier task name
    and original message; do not append a preparation marker.
-   Record the actual tool arguments and returned worker identity in a separate
-   caller-owned consumption record tied to `preparation_id` and receipt identity.
-3. If sending or observing launch is uncertain, record uncertainty and reconcile
+   Do not replace task_name with a readable label, shorten the carrier, reword the
+   message, omit fields or reconstruct the packet from the chosen pair.
+   Record the native thread UUID and original tool call ID, then run the
+   authoritative audit below before claiming exact consumption. A caller-written
+   argument/handle record alone does not prove what the tool received.
+3. After an explicit `native_capability_expired` refusal, first confirm that no
+   child was created. Refresh metadata from the current native tool schema once,
+   prepare a new packet and dispatch its exact `native_request` within the existing
+   60-second window. An audit of an expired packet never authorizes replay.
+   If sending or observing launch is uncertain, record uncertainty and reconcile
    the actual native worker's liveness. Never blind-redispatch. Preparation alone
    is neither proof of launch nor authority to duplicate it.
 4. Bind the terminal result and useful produced evidence to the actual handle.
@@ -364,3 +371,63 @@ actual unprepared denial plus next necessary assessed rewrite/handle/useful
 result for each used native path. Missing enforcement evidence is an incident or
 coverage gap. Source tests do not establish universal technical fail-closed
 enforcement.
+
+## Audit the original native call
+
+From the actual bound caller project's Git root, invoke the existing shared entry:
+
+~~~sh
+project-factory audit-native-call --preparation work/actual-task/jev-32lowercasehexcharacters.json --thread-id actual-canonical-thread-uuid --call-id actual-native-call-id
+~~~
+
+The existing usage collector resolves only that exact thread through current
+`CODEX_HOME/state_5.sqlite` in read-only mode. It requires the authoritative state
+row's cwd and the owned rollout's first session_meta identity/cwd to match the
+bound caller project. Only a safe original rollout below that Codex home's
+sessions or archived_sessions is accepted. Caller-supplied transcript paths and
+self-reported consumption receipts cannot substitute for these original records.
+The audit strictly decodes bounded JSON envelopes to select the decoded call ID,
+including escaped identities. It examines argument/output contents only for the
+requested call, with no semantic inspection or retention of unrelated contents.
+Oversized, duplicate-key, incomplete or concurrently changed source records refuse.
+It refuses ambiguous, missing or malformed evidence and never dispatches or writes preparation, reservation or
+result files. Its fixed JSON result contains source/record/argument hashes,
+matching status and mismatched field names; it withholds task/message/output
+contents and arbitrary exception text. The reported handle is retained as a
+SHA-256 identity hash, separately from terminal result and caller acceptance.
+
+Exit 0 means the original result reports a supported worker handle and either
+all original plaintext arguments match the private packet or the readable
+carrier/model/effort/fork fields match with consistent existing V2 PRE/POST hook
+evidence for the opaque stored message. Opaque success requires matching original
+thread/call, project/task/preparation, native transport, canonical hook argument
+hashes, observed message bytes and reported handle. Missing or inconsistent
+private hook records leave opaque launch evidence unverified. The audit never
+creates, changes or replays hook records. `observable_arguments_match` describes
+the fields that can be compared; `arguments_match` stays null and
+`plaintext_attestation` stays unavailable for opaque messages. It does not
+establish effective model/effort, terminal success or useful-result acceptance.
+Mismatch, explicit native refusal, absent result and unverified evidence exit
+nonzero. An opaque message is never listed as mismatched merely because its hash
+differs from the declared plaintext. A changed readable task_name remains a
+proven mismatch; an expired native refusal remains a refusal without requiring
+invented hook evidence. `fresh_at_call` reports whether the preparation was fresh at the original
+call timestamp. Historical evidence may remain valid after expiry; the result
+always sets `replay_authorized:false`. Declared plaintext hashes, actual stored
+message hashes, raw original argument/record hashes, and canonical hook hashes
+remain separate. Compact normalized audit argument hashes use a different
+serialization from the hook's `SHA256(json.dumps(args, sort_keys=True).encode())`
+with its default whitespace and ASCII escaping. Matching observed opaque bytes
+never establishes plaintext equality or useful-result acceptance.
+
+Wait on an existing collaboration worker using the current supported native
+`collaboration.wait_agent` arguments, such as `{"timeout_ms":30000}`. That tool
+has no `target` argument. Use `list_agents` for live worker inventory, reconcile
+uncertain sends against the existing worker, and bind its useful terminal result
+to the original caller's acceptance before recording success.
+
+Historical auditing retains the current bound source and policy checks. A recorded
+packet must remain compatible with that current binding; validation failure returns
+`current_binding_unverified`. There is no historical source or policy bypass.
+`preparation_sha256` hashes the exact safely read private preparation file bytes,
+including its whitespace, separately from normalized argument hashes.

@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
+import base64
+import contextlib
 import hashlib
 import json
 import os
+if os.name == "posix":
+    import fcntl
 import re
 import sys
+import sqlite3
+import stat
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -692,7 +698,317 @@ def desc_ref(event: dict) -> dict:
     return {"result_receipt": desc.get("path"), "sha256": desc.get("sha256")}
 
 
+
+class NativeAuditRefusal(ValueError):
+    """Only stable, locally selected reason codes cross the audit boundary."""
+
+
+def _audit_require(condition, reason):
+    if not condition:
+        raise NativeAuditRefusal(reason)
+
+
+def _audit_hash(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                     ensure_ascii=False).encode("utf8")).hexdigest()
+
+
+def _audit_json(raw):
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            _audit_require(key not in result, "duplicate_json_key")
+            result[key] = value
+        return result
+    return json.loads(raw, object_pairs_hook=unique)
+
+
+def _audit_stamp(info):
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _audit_private_json(root, locator):
+    from .jev_prepared_bridge import private_json, MAX_CONTEXT
+    path, _ = private_json(root, locator)
+    before = path.stat()
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as stream:
+        opened = os.fstat(stream.fileno())
+        _audit_require(_audit_stamp(before) == _audit_stamp(opened)
+                       and stat.S_ISREG(opened.st_mode) and not opened.st_mode & 0o077
+                       and opened.st_nlink == 1 and opened.st_uid == os.getuid()
+                       and opened.st_size <= MAX_CONTEXT, "private_evidence_changed")
+        raw = stream.read(opened.st_size + 1)
+        _audit_require(_audit_stamp(opened) == _audit_stamp(os.fstat(stream.fileno()))
+                       and len(raw) == opened.st_size, "private_evidence_changed")
+    data = _audit_json(raw)
+    _audit_require(isinstance(data, dict), "private_evidence_invalid")
+    return path, data, raw
+
+
+def _audit_owned(path, base):
+    path = Path(path)
+    _audit_require(path.is_absolute() and path.is_relative_to(base), "unsafe_source_path")
+    _audit_require(path.resolve(strict=True) == path, "unsafe_source_path")
+    for component in (path, *path.parents):
+        _audit_require(not component.is_symlink(), "unsafe_source_path")
+        if component == base:
+            break
+    info = path.stat()
+    _audit_require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+                   and info.st_uid == os.getuid() and not info.st_mode & 0o022,
+                   "unsafe_source_file")
+    return info
+
+
+def _audit_original_records(root, thread_id, call_id):
+    """Decode bounded envelopes for identity; examine only requested arguments/results."""
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").absolute()
+    database = home / "state_5.sqlite"
+    _audit_owned(database, home)
+    with contextlib.closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as connection:
+        connection.execute("PRAGMA query_only=ON")
+        rows = connection.execute("SELECT rollout_path, cwd FROM threads WHERE id = ?", (thread_id,)).fetchall()
+    _audit_require(len(rows) == 1, "thread_resolution_unverified")
+    rollout, cwd = rows[0]
+    _audit_require(isinstance(cwd, str) and Path(cwd).is_absolute()
+                   and Path(cwd).resolve() == root, "thread_cwd_mismatch")
+    _audit_require(isinstance(rollout, str), "unsafe_source_path")
+    path = Path(rollout)
+    bases = [home / "sessions", home / "archived_sessions"]
+    bases = [base for base in bases if path.is_relative_to(base)]
+    _audit_require(len(bases) == 1, "unsafe_source_path")
+    before = _audit_owned(path, bases[0])
+    _audit_require(path.name.startswith("rollout-") and path.name.endswith("-" + thread_id + ".jsonl"),
+                   "source_filename_mismatch")
+    calls, outputs = [], []
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as stream:
+        opened = os.fstat(stream.fileno())
+        _audit_require(_audit_stamp(opened) == _audit_stamp(before), "source_identity_changed")
+        header = stream.readline(min(opened.st_size, 1048577))
+        _audit_require(len(header) <= 1048576 and header.endswith(b"\n"), "session_metadata_invalid")
+        meta = _audit_json(header)
+        payload = meta.get("payload", {})
+        _audit_require(meta.get("type") == "session_meta" and isinstance(payload, dict)
+                       and payload.get("id") == thread_id
+                       and payload.get("session_id", thread_id) == thread_id
+                       and isinstance(payload.get("cwd"), str) and Path(payload["cwd"]).is_absolute()
+                       and Path(payload["cwd"]).resolve() == root, "session_metadata_mismatch")
+        remaining = opened.st_size - len(header)
+        position = 1
+        while remaining > 0:
+            raw = stream.readline(min(remaining, 1048577))
+            remaining -= len(raw)
+            position += 1
+            _audit_require(bool(raw), "source_identity_changed")
+            _audit_require(len(raw) <= 1048576 and raw.endswith(b"\n"), "source_record_invalid")
+            # Decode envelope identity even when JSON escapes the call ID. Never parse
+            # unrelated argument/output strings or retain unrelated envelopes.
+            row = _audit_json(raw)
+            _audit_require(isinstance(row, dict), "source_record_invalid")
+            data = row.get("payload", {})
+            if not isinstance(data, dict) or data.get("call_id") != call_id:
+                continue
+            if row.get("type") != "response_item":
+                continue
+            record = (row, data, hashlib.sha256(raw).hexdigest(), position)
+            if data.get("type") == "function_call":
+                calls.append(record)
+            elif data.get("type") == "function_call_output":
+                outputs.append(record)
+            else:
+                raise NativeAuditRefusal("requested_record_invalid")
+        after = os.fstat(stream.fileno())
+        _audit_require(_audit_stamp(opened) == _audit_stamp(after)
+                       and _audit_stamp(path.stat()) == _audit_stamp(opened), "source_identity_changed")
+    _audit_require(len(calls) == 1, "call_missing_or_duplicate")
+    _audit_require(len(outputs) <= 1, "result_duplicate")
+    if outputs:
+        _audit_require(outputs[0][3] > calls[0][3], "result_precedes_call")
+    identity = {"source_path_sha256": hashlib.sha256(str(path).encode()).hexdigest(),
+                "session_meta_sha256": hashlib.sha256(header).hexdigest(),
+                "call_record_sha256": calls[0][2],
+                "result_record_sha256": outputs[0][2] if outputs else None}
+    return calls[0], outputs[0] if outputs else None, identity
+
+
+def _audit_opaque_message(message):
+    """Recognize the stored token shape only; this is not decryption or authentication."""
+    if not isinstance(message, str) or not re.fullmatch(r"gAAAA[A-Za-z0-9_-]+={0,2}", message):
+        return False
+    try:
+        raw = base64.b64decode(message, altchars=b"-_", validate=True)
+        return len(raw) >= 73 and raw[0] == 128 and (len(raw) - 57) % 16 == 0
+    except ValueError:
+        return False
+
+
+def _audit_opaque_hook_binding(root, path, prepared, thread_id, call_id, actual, handle):
+    from .jev_prepared_bridge import _identifier
+    from .native_hook import native_caller_mapping
+    try:
+        consume_path, consume, consume_raw = _audit_private_json(root, str(path.with_suffix(".consume.json")))
+        result_path, post, post_raw = _audit_private_json(root, str(path.with_suffix(".result.json")))
+    except FileNotFoundError:
+        raise NativeAuditRefusal("hook_evidence_missing") from None
+    identity = consume.get("identity")
+    _audit_require(isinstance(identity, dict) and set(identity) == {"session_id", "turn_id", "tool_use_id"}
+                   and identity.get("session_id") == thread_id and identity.get("tool_use_id") == call_id
+                   and _identifier(identity.get("turn_id")) and post.get("identity") == identity,
+                   "hook_identity_mismatch")
+    pair = prepared.get("spawn_agent")
+    declared = prepared.get("native_dispatch")
+    arguments_hash = hashlib.sha256(json.dumps(actual, sort_keys=True).encode()).hexdigest()
+    message_hash = hashlib.sha256(actual["message"].encode()).hexdigest()
+    _audit_require(consume.get("schema") == "CPI414NATIVECONSUMPTIONV2"
+                   and post.get("schema") == "CPI414NATIVERESULTV2"
+                   and consume.get("status") == "pending_native_result"
+                   and post.get("status") == "native_handle_observed"
+                   and consume.get("preparation_id") == prepared.get("preparation_id") == post.get("preparation_id")
+                   and consume.get("task_id") == prepared.get("task_id")
+                   and consume.get("project_binding") == prepared.get("project_binding")
+                   and consume.get("prepared_caller_id") == prepared.get("caller_id")
+                   and consume.get("caller_mapping") == native_caller_mapping(prepared, thread_id)
+                   and consume.get("native_transport") == prepared.get("native_transport")
+                   and consume.get("native_transport") is not None
+                   and consume.get("declared_task") == declared == post.get("declared_task")
+                   and isinstance(declared, dict)
+                   and consume.get("declared_message_sha256") == declared.get("message_sha256")
+                   and consume.get("prepared_pair") == pair
+                   and consume.get("requested_pair") == pair
+                   and consume.get("plaintext_attestation") == post.get("plaintext_attestation") == "unavailable"
+                   and consume.get("observed_message_sha256") == message_hash == post.get("observed_post_message_sha256")
+                   and consume.get("observed_pre_arguments_sha256") == arguments_hash
+                   and consume.get("applied_arguments_sha256") == arguments_hash == post.get("observed_post_arguments_sha256")
+                   and isinstance(handle, str) and post.get("native_handle") == handle,
+                   "hook_binding_mismatch")
+    return {"consume_sha256": hashlib.sha256(consume_raw).hexdigest(), "result_sha256": hashlib.sha256(post_raw).hexdigest(),
+            "canonical_arguments_sha256": arguments_hash, "observed_message_sha256": message_hash}
+
+
+def audit_native_call(root: Path, preparation: str, thread_id: str, call_id: str) -> dict:
+    """Retrospective original-call evidence only. Never reserve, persist, retry or dispatch."""
+    from .consumer import shared_root
+    from .native_hook import ALLOWED_ARGS, TOOLS, REFUSAL_REASONS, native_result_handle, validate
+    result = {"schema": "CPI414NATIVECALLAUDITV1", "status": "unverified", "reason": None,
+              "thread_id": None, "call_id": None, "source": None,
+              "preparation_sha256": None, "expected_arguments_sha256": None,
+              "actual_arguments_sha256": None, "original_arguments_sha256": None,
+              "actual_hook_arguments_sha256": None, "expected_message_sha256": None,
+              "actual_message_sha256": None, "arguments_match": None, "mismatched_fields": [],
+              "observable_arguments_match": None, "plaintext_attestation": "unverified",
+              "message_representation": "unverified", "hook_binding": None,
+              "fresh_at_call": None, "replay_authorized": False,
+              "native_result": "unverified", "refusal_reason": None,
+              "reported_handle_sha256": None, "terminal_result": "unverified",
+              "caller_acceptance": "not_performed", "observed_model": None,
+              "observed_effort": None, "worker_usage": None}
+    try:
+        _audit_require(os.name == "posix", "unsupported_platform")
+        _audit_require(isinstance(thread_id, str) and str(uuid.UUID(thread_id)) == thread_id,
+                       "thread_identity_invalid")
+        _audit_require(isinstance(call_id, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,200}", call_id),
+                       "call_identity_invalid")
+        result.update(thread_id=thread_id, call_id=call_id)
+        root = shared_root(Path(root).resolve(strict=True))
+        path, prepared, preparation_raw = _audit_private_json(root, preparation)
+        result["preparation_sha256"] = hashlib.sha256(preparation_raw).hexdigest()
+        expected = prepared.get("native_request")
+        _audit_require(isinstance(expected, dict) and set(expected) == ALLOWED_ARGS,
+                       "preparation_packet_invalid")
+        # Reuse the hook's full private/project/source/caller/carrier policy without TTL replay.
+        event = {"cwd": str(root), "session_id": thread_id, "turn_id": "audit-turn",
+                 "tool_use_id": call_id, "tool_name": "collaboration.spawn_agent", "tool_input": expected}
+        try:
+            validated = validate(event, root, fresh=False)
+        except Exception:
+            raise NativeAuditRefusal("current_binding_unverified") from None
+        _audit_require(validated[3] == path, "preparation_locator_mismatch")
+        call, output, identity = _audit_original_records(root, thread_id, call_id)
+        result["source"] = identity
+        data = call[1]
+        _audit_require(data.get("name") in TOOLS, "call_tool_mismatch")
+        actual = _audit_json(data["arguments"]) if isinstance(data.get("arguments"), str) else data.get("arguments")
+        _audit_require(isinstance(actual, dict) and not set(actual) - ALLOWED_ARGS
+                       and isinstance(actual.get("message"), str), "call_arguments_invalid")
+        result["original_arguments_sha256"] = (hashlib.sha256(data["arguments"].encode()).hexdigest()
+            if isinstance(data.get("arguments"), str) else None)
+        result["actual_hook_arguments_sha256"] = hashlib.sha256(json.dumps(actual, sort_keys=True).encode()).hexdigest()
+        opaque = _audit_opaque_message(actual["message"]) and actual["message"] != expected["message"]
+        compared_fields = ALLOWED_ARGS - {"message"} if opaque else ALLOWED_ARGS
+        result.update(expected_arguments_sha256=_audit_hash(expected), actual_arguments_sha256=_audit_hash(actual),
+                      expected_message_sha256=hashlib.sha256(expected["message"].encode()).hexdigest(),
+                      actual_message_sha256=hashlib.sha256(actual["message"].encode()).hexdigest(),
+                      mismatched_fields=sorted(key for key in compared_fields if actual.get(key) != expected.get(key)),
+                      plaintext_attestation="unavailable" if opaque else "exact" if actual["message"] == expected["message"] else "mismatch",
+                      message_representation="opaque_token" if opaque else "plaintext")
+        result["observable_arguments_match"] = not result["mismatched_fields"] and set(actual) == set(expected)
+        result["arguments_match"] = None if opaque else result["observable_arguments_match"]
+        if not result["observable_arguments_match"]:
+            result.update(status="argument_mismatch", reason="exact_consumption_refused")
+        timestamp = datetime.fromisoformat(call[0]["timestamp"].replace("Z", "+00:00"))
+        _audit_require(timestamp.tzinfo is not None, "call_timestamp_invalid")
+        captured, expires = prepared.get("capability_captured_at"), prepared.get("capability_expires_at")
+        _audit_require(isinstance(captured, (float, int)) and not isinstance(captured, bool)
+                       and expires == captured + 60, "preparation_timestamp_invalid")
+        result["fresh_at_call"] = 0 <= timestamp.timestamp() - captured <= 60
+        handle = None
+        if output is None:
+            result["native_result"] = "missing_result"
+        else:
+            response = output[1].get("output")
+            _audit_require(isinstance(response, str), "result_invalid")
+            try:
+                decoded = _audit_json(response)
+            except json.JSONDecodeError:
+                decoded = None
+            handle = native_result_handle(decoded)
+            if handle:
+                result.update(native_result="reported_handle", reported_handle_sha256=hashlib.sha256(handle.encode()).hexdigest())
+            elif decoded is None:
+                codes = REFUSAL_REASONS + ["native_dispatch_already_reserved", "native_receipt_missing",
+                                          "native_private_io_refused", "native_validation_refused"]
+                pattern = "(?:" + "|".join(codes) + ")"
+                reason = re.fullmatch(pattern, response.strip()) or re.search(
+                    r"Native worker (?:preparation|policy input|command) refused[: ]+(" + pattern + r")\b", response)
+                _audit_require(reason is not None, "result_unrecognized")
+                result.update(native_result="native_refused", refusal_reason=reason.group(1) if reason.lastindex else reason.group(0))
+            else:
+                raise NativeAuditRefusal("result_unrecognized")
+        if not result["observable_arguments_match"]:
+            result.update(status="argument_mismatch", reason="exact_consumption_refused")
+        elif result["native_result"] == "reported_handle":
+            if opaque:
+                result["hook_binding"] = _audit_opaque_hook_binding(root, path, prepared, thread_id, call_id, actual, handle)
+            result.update(status="matching_reported_launch", reason=None)
+        else:
+            result.update(status="matching_without_launch", reason=result["native_result"])
+    except NativeAuditRefusal as error:
+        if result["status"] != "argument_mismatch":
+            result.update(status="unverified", reason=str(error))
+    except Exception:
+        if result["status"] != "argument_mismatch":
+            result.update(status="unverified", reason="evidence_validation_refused")
+    return result
+
+
+def audit_native_cli(root: Path, args: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="project-factory audit-native-call",
+        description="Audit one original native call read-only; never authorizes replay or caller acceptance.")
+    parser.add_argument("--preparation", required=True)
+    parser.add_argument("--thread-id", required=True)
+    parser.add_argument("--call-id", required=True)
+    options = parser.parse_args(args)
+    result = audit_native_call(root, options.preparation, options.thread_id, options.call_id)
+    print(json.dumps(result, sort_keys=True))
+    return 0 if result["status"] == "matching_reported_launch" else 1
+
+
 def main() -> int:
+    if sys.argv[1:2] == ["audit-native-call"]:
+        from .consumer import project_root
+        return audit_native_cli(project_root(), sys.argv[2:])
     parser = argparse.ArgumentParser()
     parser.add_argument("--event")
     parser.add_argument("--source")

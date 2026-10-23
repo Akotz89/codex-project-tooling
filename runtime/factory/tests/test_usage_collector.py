@@ -1,4 +1,5 @@
 import hashlib
+import contextlib
 import json
 import os
 import subprocess
@@ -55,6 +56,391 @@ def future_manifest(stream):
             "baseline": {"device": stat.st_dev, "inode": stat.st_ino,
                          "observed_size": stat.st_size,
                          "header_sha256": hashlib.sha256(header).hexdigest()}}
+
+
+class NativeCallAuditTests(unittest.TestCase):
+    def setUp(self):
+        import sqlite3
+        from factory import native_hook
+        self.hook = native_hook
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT / "work/factory-tests/collector")
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.root = self.base / "project"
+        self.root.mkdir()
+        self.home = self.base / "codex"
+        self.home.mkdir()
+        self.thread = "019a1234-1234-7123-8123-123456789abc"
+        self.call = "call_original"
+        self.preparation = self.root / ("work/task/jev-" + "a" * 32 + ".json")
+        self.preparation.parent.mkdir(parents=True)
+        self.packet = {"task_name": "cpi414_carrier", "message": "private original task",
+                       "model": "gpt-6-luna", "reasoning_effort": "high", "fork_turns": "none"}
+        self.prepared = {"native_request": self.packet, "capability_captured_at": 1792454400,
+                         "capability_expires_at": 1792454460}
+        self.write_preparation()
+        self.rollout = self.home / "sessions/2026/10/20" / ("rollout-date-" + self.thread + ".jsonl")
+        self.rollout.parent.mkdir(parents=True)
+        self.database = self.home / "state_5.sqlite"
+        with contextlib.closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute("CREATE TABLE threads (id TEXT, rollout_path TEXT, cwd TEXT)")
+            connection.execute("INSERT INTO threads VALUES (?, ?, ?)",
+                               (self.thread, str(self.rollout), str(self.root)))
+        self.meta = {"type": "session_meta", "payload": {"id": self.thread, "cwd": str(self.root)}}
+        self.function = {"type": "response_item", "timestamp": "2026-10-20T00:00:30Z",
+                         "payload": {"type": "function_call", "call_id": self.call,
+                                     "name": "collaboration.spawn_agent", "arguments": json.dumps(self.packet)}}
+        self.output = {"type": "response_item", "payload": {"type": "function_call_output", "call_id": self.call,
+                                                          "output": json.dumps({"task_name": "/root/worker"})}}
+        self.write_rollout()
+        self.env = patch.dict(os.environ, {"CODEX_HOME": str(self.home)})
+        self.env.start(); self.addCleanup(self.env.stop)
+        from factory import consumer
+        self.shared = patch.object(consumer, "shared_root", side_effect=lambda p: p)
+        self.shared.start(); self.addCleanup(self.shared.stop)
+        self.validation = patch.object(self.hook, "validate", return_value=(None, None, None, self.preparation, None, None))
+        self.validator = self.validation.start(); self.addCleanup(self.validation.stop)
+
+    def write_preparation(self):
+        self.preparation.write_text(json.dumps(self.prepared))
+        self.preparation.chmod(0o600)
+
+    def write_rollout(self, rows=None):
+        self.rollout.write_text("")
+        for row in rows if rows is not None else [self.meta, self.function, self.output]:
+            line(self.rollout, row)
+
+    def audit(self):
+        return _collector.audit_native_call(self.root, str(self.preparation), self.thread, self.call)
+
+    def test_original_match_is_retrospective_and_read_only(self):
+        before = {p: p.read_bytes() for p in [self.preparation, self.rollout, self.database]}
+        result = self.audit()
+        self.assertEqual(result["status"], "matching_reported_launch")
+        self.assertTrue(result["fresh_at_call"])
+        self.assertFalse(result["replay_authorized"])
+        self.assertEqual(result["caller_acceptance"], "not_performed")
+        self.assertEqual(result["terminal_result"], "unverified")
+        self.assertEqual(result["reported_handle_sha256"], hashlib.sha256(b"/root/worker").hexdigest())
+        self.assertNotIn("private original", json.dumps(result))
+        self.assertEqual(before, {p: p.read_bytes() for p in before})
+        self.validator.assert_called_once()
+        self.assertEqual(self.validator.call_args.kwargs, {"fresh": False})
+
+    def test_incident_actual_arguments_override_fabricated_consumption(self):
+        actual = dict(self.packet, task_name="changed_task", message="changed private task")
+        self.function["payload"]["arguments"] = json.dumps(actual)
+        self.output["payload"]["output"] = "Native worker preparation refused: native_plaintext_marker_required"
+        self.write_rollout()
+        self.preparation.with_suffix(".consume.json").write_text(json.dumps({"arguments": self.packet}))
+        result = self.audit()
+        self.assertEqual(result["status"], "argument_mismatch")
+        self.assertEqual(result["mismatched_fields"], ["message", "task_name"])
+        self.assertEqual(result["native_result"], "native_refused")
+        self.assertNotIn("changed private", json.dumps(result))
+
+    def test_matching_expired_refusal_and_historical_reported_launch(self):
+        self.function["timestamp"] = "2026-10-20T00:02:00Z"
+        self.output["payload"]["output"] = "Native worker preparation refused: native_capability_expired"
+        self.write_rollout()
+        result = self.audit()
+        self.assertEqual(result["status"], "matching_without_launch")
+        self.assertFalse(result["fresh_at_call"])
+        self.assertEqual(result["refusal_reason"], "native_capability_expired")
+        self.output["payload"]["output"] = json.dumps({"agent_id": "worker-123"})
+        self.write_rollout()
+        result = self.audit()
+        self.assertEqual(result["status"], "matching_reported_launch")
+        self.assertFalse(result["fresh_at_call"])
+        self.assertFalse(result["replay_authorized"])
+
+    def test_missing_duplicate_and_malformed_records_refuse(self):
+        for rows, reason in [([self.meta, self.function], "missing_result"),
+                             ([self.meta, self.function, self.function, self.output], "call_missing_or_duplicate"),
+                             ([self.meta, self.function, self.output, self.output], "result_duplicate"),
+                             ([self.meta, self.output, self.function], "result_precedes_call"),
+                             ([self.meta, self.output], "call_missing_or_duplicate"),
+                             ([self.function, self.output], "session_metadata_mismatch")]:
+            with self.subTest(reason=reason):
+                self.write_rollout(rows)
+                result = self.audit()
+                self.assertNotEqual(result["status"], "matching_reported_launch")
+                self.assertEqual(result["reason"], reason)
+        self.function["payload"]["arguments"] = "malformed private text"
+        self.write_rollout()
+        self.assertEqual(self.audit()["reason"], "evidence_validation_refused")
+
+    def test_identity_path_and_binding_refuse(self):
+        import sqlite3
+        for field, value, reason in [("cwd", str(self.base), "thread_cwd_mismatch"),
+                                     ("rollout_path", str(self.preparation), "unsafe_source_path")]:
+            with self.subTest(field=field):
+                with contextlib.closing(sqlite3.connect(self.database)) as connection, connection:
+                    connection.execute("UPDATE threads SET " + field + " = ?", (value,))
+                self.assertEqual(self.audit()["reason"], reason)
+                with contextlib.closing(sqlite3.connect(self.database)) as connection, connection:
+                    connection.execute("UPDATE threads SET cwd=?, rollout_path=?", (str(self.root), str(self.rollout)))
+        self.meta["payload"]["id"] = "foreign-thread"
+        self.write_rollout()
+        self.assertEqual(self.audit()["reason"], "session_metadata_mismatch")
+        self.meta["payload"]["id"] = self.thread
+        self.write_rollout()
+        retained = self.rollout.with_suffix(".retained")
+        self.rollout.rename(retained)
+        self.rollout.symlink_to(retained)
+        self.assertEqual(self.audit()["reason"], "unsafe_source_path")
+        self.rollout.unlink(); retained.rename(self.rollout)
+        self.validator.side_effect = ValueError("private exception content")
+        result = self.audit()
+        self.assertEqual(result["reason"], "current_binding_unverified")
+        self.assertNotIn("private exception", json.dumps(result))
+
+    def test_malformed_packet_result_and_wrong_session_cwd_refuse(self):
+        self.prepared["native_request"] = {"message": "private incomplete packet"}
+        self.write_preparation()
+        self.assertEqual(self.audit()["reason"], "preparation_packet_invalid")
+        self.prepared["native_request"] = self.packet
+        self.write_preparation()
+        for response in ("unrecognized private output", json.dumps({"agent_id": "one", "agentId": "two"}),
+                         "native_capability_expired native_caller_mismatch"):
+            with self.subTest(response_sha256=hashlib.sha256(response.encode()).hexdigest()):
+                self.output["payload"]["output"] = response
+                self.write_rollout()
+                result = self.audit()
+                self.assertEqual(result["status"], "unverified")
+                self.assertIsNone(result["reported_handle_sha256"])
+                self.assertNotIn("private output", json.dumps(result))
+        self.meta["payload"]["cwd"] = str(self.base)
+        self.write_rollout()
+        self.assertEqual(self.audit()["reason"], "session_metadata_mismatch")
+
+    def test_preparation_hash_is_exact_private_file_bytes(self):
+        raw = json.dumps(self.prepared, indent=3).encode() + b"\n\n"
+        self.preparation.write_bytes(raw)
+        self.assertEqual(self.audit()["preparation_sha256"], hashlib.sha256(raw).hexdigest())
+
+    def test_changed_pair_and_fork_cli_refuse(self):
+        import io
+        for field, value in [("model", "gpt-6.1-sol"), ("reasoning_effort", "max"), ("fork_turns", "all")]:
+            with self.subTest(field=field):
+                self.function["payload"]["arguments"] = json.dumps(dict(self.packet, **{field:value}))
+                self.write_rollout()
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    code = _collector.audit_native_cli(self.root,["--preparation",str(self.preparation),
+                        "--thread-id",self.thread,"--call-id",self.call])
+                self.assertEqual(code,1)
+                self.assertEqual(json.loads(output.getvalue())["mismatched_fields"],[field])
+
+    def test_unrelated_envelopes_do_not_change_exact_selected_hashes(self):
+        unrelated_call = {"type":"response_item","payload":{"type":"function_call","call_id":"another_call",
+                           "name":"unrelated","arguments":"unparsed invalid JSON private arguments"}}
+        unrelated_output = {"type":"response_item","payload":{"type":"function_call_output","call_id":"another_call",
+                             "output":"unparsed private output native_capability_expired"}}
+        self.write_rollout([self.meta,unrelated_call,self.function,unrelated_output,self.output,unrelated_call])
+        result=self.audit()
+        self.assertEqual(result["status"],"matching_reported_launch")
+        for field, row in [("call_record_sha256",self.function),("result_record_sha256",self.output)]:
+            self.assertEqual(result["source"][field],hashlib.sha256(json.dumps(row).encode()+b"\n").hexdigest())
+        self.assertEqual(result["reported_handle_sha256"],hashlib.sha256(b"/root/worker").hexdigest())
+        self.assertNotIn("unparsed private",json.dumps(result))
+
+    def test_escaped_duplicate_identity_and_oversized_duplicate_refuse(self):
+        escaped=json.dumps(self.function).replace(self.call,"\\u0063all_original").encode()+b"\n"
+        with self.rollout.open("ab") as stream: stream.write(escaped)
+        self.assertEqual(self.audit()["reason"],"call_missing_or_duplicate")
+        self.write_rollout()
+        duplicate=dict(self.function,padding="x"*1048576)
+        with self.rollout.open("ab") as stream: stream.write(json.dumps(duplicate).encode()+b"\n")
+        self.assertEqual(self.audit()["reason"],"source_record_invalid")
+
+    def test_duplicate_json_keys_refuse_at_every_decoding_boundary(self):
+        original=self.rollout.read_bytes()
+        cases=[(self.preparation, b'{"native_request":{},'+self.preparation.read_bytes()[1:]),
+               (self.rollout, original.replace(b'"type": "session_meta"',b'"type":"session_meta","type":"session_meta"',1)),
+               (self.rollout, original.replace(b'"call_id": "call_original"',b'"call_id":"call_original","call_id":"call_original"',1))]
+        for path, raw in cases:
+            with self.subTest(path_kind="preparation" if path==self.preparation else "rollout"):
+                self.write_preparation();self.rollout.write_bytes(original);path.write_bytes(raw)
+                self.assertEqual(self.audit()["reason"],"duplicate_json_key")
+        self.write_preparation()
+        self.function["payload"]["arguments"]='{"task_name":"one",'+json.dumps(self.packet)[1:]
+        self.write_rollout()
+        self.assertEqual(self.audit()["reason"],"duplicate_json_key")
+        self.function["payload"]["arguments"]=json.dumps(self.packet)
+        self.output["payload"]["output"]='{"task_name":"/root/one","task_name":"/root/two"}'
+        self.write_rollout()
+        self.assertEqual(self.audit()["reason"],"duplicate_json_key")
+
+    def test_concurrent_append_and_same_size_rewrite_refuse(self):
+        original=self.rollout.read_bytes()
+        real_fstat=os.fstat
+        inode=self.rollout.stat().st_ino
+        for mutation in ("append","rewrite"):
+            self.rollout.write_bytes(original)
+            seen=0
+            def changing_stat(fd):
+                nonlocal seen
+                info=real_fstat(fd)
+                if info.st_ino==inode:
+                    seen+=1
+                    if seen==2:
+                        if mutation=="append":
+                            with self.rollout.open("ab") as stream:stream.write(b"\n")
+                        else:
+                            changed=original.replace(b"private original task",b"PRIVATE original task")
+                            self.assertEqual(len(changed),len(original))
+                            self.rollout.write_bytes(changed)
+                        info=real_fstat(fd)
+                return info
+            with self.subTest(mutation=mutation),patch.object(_collector.os,"fstat",side_effect=changing_stat):
+                self.assertEqual(self.audit()["reason"],"source_identity_changed")
+
+    def test_partial_tail_completion_during_scan_cannot_cross_snapshot(self):
+        partial=self.rollout.read_bytes().rstrip(b"\n")
+        self.rollout.write_bytes(partial)
+        tail_start=partial.rfind(b"\n")+1
+        real_fdopen=os.fdopen
+        outer=self
+        class AppendOnTail:
+            def __init__(self,stream):self.stream=stream
+            def __enter__(self):self.stream.__enter__();return self
+            def __exit__(self,*args):return self.stream.__exit__(*args)
+            def fileno(self):return self.stream.fileno()
+            def readline(self,size):
+                if self.stream.tell()==tail_start:
+                    outer.assertEqual(size,len(partial)-tail_start)
+                    with outer.rollout.open("ab") as stream:stream.write(b"\n")
+                return self.stream.readline(size)
+        def fdopen(fd,*args,**kwargs):
+            stream=real_fdopen(fd,*args,**kwargs)
+            return AppendOnTail(stream) if os.fstat(fd).st_ino==self.rollout.stat().st_ino else stream
+        with patch.object(_collector.os,"fdopen",side_effect=fdopen):
+            result=self.audit()
+        self.assertEqual(result["status"],"unverified")
+        self.assertEqual(result["reason"],"source_record_invalid")
+
+    def test_supported_nickname_is_not_a_refusal_and_mismatch_survives_unknowns(self):
+        self.output["payload"]["output"]=json.dumps({"task_name":"/root/worker","nickname":"native_capability_expired"})
+        self.write_rollout()
+        self.assertEqual(self.audit()["status"],"matching_reported_launch")
+        self.function["payload"]["arguments"]=json.dumps(dict(self.packet,task_name="changed_task"))
+        self.output["payload"]["output"]="unknown private output"
+        self.write_rollout()
+        result=self.audit()
+        self.assertEqual(result["status"],"argument_mismatch")
+        self.assertEqual(result["native_result"],"unverified")
+        self.function["timestamp"]="malformed"
+        self.write_rollout()
+        result=self.audit()
+        self.assertEqual(result["status"],"argument_mismatch")
+        self.assertEqual(result["mismatched_fields"],["task_name"])
+        self.assertIsNone(result["fresh_at_call"])
+
+    def opaque_records(self):
+        import base64
+        self.actual = dict(self.packet, message=base64.urlsafe_b64encode(b"\x80" + b"\0" * 8 + b"x" * 64).decode())
+        self.function["payload"]["arguments"] = json.dumps(self.actual)
+        self.prepared.update(preparation_id=self.preparation.stem, task_id="task:opaque", caller_id=self.thread,
+            capability_provenance="caller_supplied_tool_metadata", receipt={"capability_tool": "collaboration.spawn_agent"},
+            project_binding={"root": str(self.root)}, spawn_agent={k:self.packet[k] for k in ("model", "reasoning_effort", "fork_turns")},
+            native_dispatch={"task_name":"declared_task", "message_sha256":hashlib.sha256(self.packet["message"].encode()).hexdigest()},
+            native_transport={"schema":"CPI414NATIVETRANSPORTV1", "task_name":self.packet["task_name"]})
+        self.write_preparation()
+        arg_hash = hashlib.sha256(json.dumps(self.actual, sort_keys=True).encode()).hexdigest()
+        msg_hash = hashlib.sha256(self.actual["message"].encode()).hexdigest()
+        identity={"session_id":self.thread, "tool_use_id":self.call, "turn_id":"turn:actual"}
+        self.consume = {"schema":"CPI414NATIVECONSUMPTIONV2", "status":"pending_native_result", "identity":identity,
+            "preparation_id":self.prepared["preparation_id"], "task_id":self.prepared["task_id"],
+            "project_binding":self.prepared["project_binding"], "prepared_caller_id":self.thread,
+            "caller_mapping":"exact_session_uuid", "native_transport":self.prepared["native_transport"],
+            "declared_task":self.prepared["native_dispatch"], "declared_message_sha256":self.prepared["native_dispatch"]["message_sha256"],
+            "prepared_pair":self.prepared["spawn_agent"], "requested_pair":self.prepared["spawn_agent"],
+            "plaintext_attestation":"unavailable", "observed_message_sha256":msg_hash,
+            "observed_pre_arguments_sha256":arg_hash, "applied_arguments_sha256":arg_hash}
+        self.post = {"schema":"CPI414NATIVERESULTV2", "status":"native_handle_observed", "identity":identity,
+            "preparation_id":self.prepared["preparation_id"], "declared_task":self.prepared["native_dispatch"],
+            "plaintext_attestation":"unavailable", "observed_post_message_sha256":msg_hash,
+            "observed_post_arguments_sha256":arg_hash, "native_handle":"/root/worker"}
+        self.write_hook_records()
+        self.write_rollout()
+
+    def write_hook_records(self):
+        for suffix, data in [(".consume.json", self.consume), (".result.json", self.post)]:
+            path = self.preparation.with_suffix(suffix)
+            path.write_text(json.dumps(data, sort_keys=True) + "\n")
+            path.chmod(0o600)
+
+    def test_opaque_original_requires_exact_existing_hook_binding_without_plaintext_claim(self):
+        self.opaque_records()
+        paths=[self.preparation, self.preparation.with_suffix(".consume.json"),self.preparation.with_suffix(".result.json")]
+        before={p:p.read_bytes() for p in paths}
+        result=self.audit()
+        self.assertEqual(result["status"], "matching_reported_launch")
+        self.assertTrue(result["observable_arguments_match"])
+        self.assertIsNone(result["arguments_match"])
+        self.assertEqual(result["plaintext_attestation"], "unavailable")
+        self.assertEqual(result["caller_acceptance"], "not_performed")
+        self.assertNotEqual(result["expected_message_sha256"], result["actual_message_sha256"])
+        self.assertEqual(result["hook_binding"]["canonical_arguments_sha256"], result["actual_hook_arguments_sha256"])
+        self.assertNotEqual(result["actual_arguments_sha256"], result["actual_hook_arguments_sha256"])
+        self.assertEqual(result["hook_binding"]["consume_sha256"], hashlib.sha256(before[paths[1]]).hexdigest())
+        self.assertEqual(before,{p:p.read_bytes() for p in paths})
+        self.assertNotIn(self.actual["message"],json.dumps(result))
+
+    def test_opaque_incident_and_expired_refusal_need_no_fabricated_hook_records(self):
+        self.opaque_records()
+        self.preparation.with_suffix(".consume.json").unlink()
+        self.preparation.with_suffix(".result.json").unlink()
+        self.actual["task_name"]="changed_task"
+        self.function["payload"]["arguments"]=json.dumps(self.actual)
+        self.output["payload"]["output"]="native_plaintext_marker_required"
+        self.write_rollout()
+        result=self.audit()
+        self.assertEqual(result["status"],"argument_mismatch")
+        self.assertEqual(result["mismatched_fields"],["task_name"])
+        self.assertEqual(result["plaintext_attestation"],"unavailable")
+        self.actual["task_name"]=self.packet["task_name"]
+        self.function["payload"]["arguments"]=json.dumps(self.actual)
+        self.output["payload"]["output"]="native_capability_expired"
+        self.write_rollout()
+        result=self.audit()
+        self.assertEqual(result["status"],"matching_without_launch")
+        self.assertEqual(result["refusal_reason"],"native_capability_expired")
+        self.assertIsNone(result["arguments_match"])
+
+    def test_opaque_missing_tampered_and_foreign_hook_bindings_refuse(self):
+        self.opaque_records()
+        self.preparation.with_suffix(".result.json").unlink()
+        self.assertEqual(self.audit()["reason"], "hook_evidence_missing")
+        for section, field, value in [("consume","project_binding",{"root":"foreign"}),
+                ("consume","task_id","foreign"),("consume","preparation_id","foreign"),
+                ("consume","native_transport",{}),("consume","observed_message_sha256","wrong"),
+                ("consume","applied_arguments_sha256","wrong"),
+                ("post","observed_post_arguments_sha256","wrong"),("post","native_handle","/root/foreign"),
+                ("post","identity",{"session_id":self.thread,"tool_use_id":"foreign","turn_id":"turn:actual"})]:
+            with self.subTest(section=section,field=field):
+                self.opaque_records()
+                record=self.consume if section=="consume" else self.post
+                record[field]=value
+                self.write_hook_records()
+                result=self.audit()
+                self.assertEqual(result["status"],"unverified")
+                self.assertIsNone(result["hook_binding"])
+
+    def test_cli_reports_only_matching_launch_as_success(self):
+        import contextlib
+        import io
+        for refusal, status in [(False, 0), (True, 1)]:
+            if refusal:
+                self.output["payload"]["output"] = "native_capability_expired"
+                self.write_rollout()
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = _collector.audit_native_cli(self.root, ["--preparation", str(self.preparation),
+                      "--thread-id", self.thread, "--call-id", self.call])
+            self.assertEqual(code, status)
+            self.assertEqual(json.loads(output.getvalue())["arguments_match"], True)
 
 
 class UsageCollectorTests(unittest.TestCase):

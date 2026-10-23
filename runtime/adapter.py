@@ -17,12 +17,13 @@ ENTRIES = (
     "factory/tests/test_usage_collector.py",
 )
 DEPENDENCIES = {
-    "consumer": ("jev_router", "runtime_host", "jev_prepared_bridge", "native_hook"),
+    "consumer": ("jev_router", "runtime_host", "jev_prepared_bridge", "native_hook", "usage_collector"),
     "jev_prepared_bridge": ("jev_router", "consumer"),
+    "usage_collector": ("consumer", "jev_prepared_bridge", "native_hook"),
     "native_hook": ("consumer", "jev_prepared_bridge", "jev_router"),
     "runtime_host": ("runtime_process", "runtime_resource"),
     "test_dispatch_shape": ("consumer", "jev_prepared_bridge", "jev_router"),
-    "test_usage_collector": ("usage_collector",),
+    "test_usage_collector": ("usage_collector", "native_hook", "consumer"),
 }
 
 
