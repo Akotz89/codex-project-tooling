@@ -1,0 +1,2732 @@
+diff --git a/hindsight-integrations/coding-agents/src/core/chat.test.ts b/hindsight-integrations/coding-agents/src/core/chat.test.ts
+index 8fe5792c..89e1567b 100644
+--- a/hindsight-integrations/coding-agents/src/core/chat.test.ts
++++ b/hindsight-integrations/coding-agents/src/core/chat.test.ts
+@@ -419,12 +419,25 @@ describe("retainLiveSession — incremental write-back", () => {
+ 
+     // A budget that fits the replay and nothing after it: the new tail stays buffered for the next
+     // write-back instead of overrunning the deadline the host kills the hook at.
+-    await retainLiveSession(client, "s1", turns(6), "2026-01-01T00:00:00Z", "codex", {
++    const partial = await retainLiveSession(client, "s1", turns(6), "2026-01-01T00:00:00Z", "codex", {
+       cursors,
+       retryUntil: Date.now(),
+     });
++    const buffered = cursors.read("s1")?.pending ?? [];
+     expect(retain).toHaveBeenCalledTimes(3);
+-    expect(cursors.read("s1")?.pending).toHaveLength(1);
++    expect(buffered).toHaveLength(1);
++    expect(partial).toMatchObject({
++      status: "accepted_pending",
++      reason: "submission_deferred",
++      submitted: true,
++      pendingCount: partial.operationIds.length,
++      bufferedOperationIds: [buffered[0].operationId],
++      deferReason: "host_budget",
++    });
++    expect(partial.operationIds).toContain(buffered[0].operationId);
++    expect(partial.operationIds).toContain(retain.mock.calls[2][5].operationId);
++    expect(partial.operationIds.length).toBeGreaterThan(buffered.length);
++    expect(partial.pendingCount).toBe(partial.operationIds.length);
+ 
+     await write(client, turns(6), cursors);
+     expect(retain).toHaveBeenCalledTimes(4);
+@@ -480,11 +493,18 @@ describe("retainLiveSession — incremental write-back", () => {
+     );
+   });
+ 
+-  it("replaces (never appends) when no cursor store is supplied", async () => {
++  it("replaces without a cursor while retaining the submitted operation identity", async () => {
+     const { retain, client } = stubClient();
+-    await retainLiveSession(client, "s1", turns(2), "2026-01-01T00:00:00Z", "codex");
++    const outcome = await retainLiveSession(client, "s1", turns(2), "2026-01-01T00:00:00Z", "codex");
++    const operationId = retain.mock.calls[0][5].operationId as string;
+     await retainLiveSession(client, "s1", turns(5), "2026-01-01T00:00:00Z", "codex");
+     expect(retain.mock.calls.map((c) => c[5].updateMode)).toEqual([undefined, undefined]);
++    expect(outcome).toMatchObject({
++      status: "accepted_pending",
++      submitted: true,
++      operationIds: [operationId],
++      pendingCount: 1,
++    });
+   });
+ 
+   it("serialises overlapping write-backs so neither appends a slice the other already sent", async () => {
+diff --git a/hindsight-integrations/coding-agents/src/core/chat.ts b/hindsight-integrations/coding-agents/src/core/chat.ts
+index 8d60c723..ecf82299 100644
+--- a/hindsight-integrations/coding-agents/src/core/chat.ts
++++ b/hindsight-integrations/coding-agents/src/core/chat.ts
+@@ -9,6 +9,7 @@ import {
+   advancePaths,
+   fingerprintTurns,
+   MAX_CURSOR_OPS,
++  pendingReplayable,
+   planRetain,
+   type RetainCursor,
+   type RetainCursorStore,
+@@ -140,28 +141,47 @@ const LOST_OP_STATUSES = new Set(["failed", "cancelled", "error"]);
+ async function settleOps(
+   client: HindsightClient,
+   cursor: RetainCursor
+-): Promise<{ cursor: RetainCursor; ops: string[] }> {
++): Promise<{
++  cursor: RetainCursor;
++  ops: string[];
++  status: "completed" | "accepted_pending" | "failed" | "unknown";
++}> {
+   const ops = cursor.ops ?? [];
+   const statuses = await Promise.all(
+     ops.map(async (id) => {
+       try {
+-        const r = await client.req(
+-          "GET",
+-          client.bankUrl(`/operations/${encodeURIComponent(id)}`),
+-          undefined,
+-          [],
+-          OP_CHECK_TIMEOUT_MS
+-        );
+-        if (r.status === 404) return "not_found"; // pruned: nothing left to learn
++        const r = await client.req("GET", client.bankUrl("/operations/" + encodeURIComponent(id)), undefined, [], OP_CHECK_TIMEOUT_MS);
++        if (r.status === 404) {
++          try {
++            await r.body?.cancel();
++          } catch {
++            // A pruned operation stays unknown even when its response stream cannot be released.
++          }
++          return "unknown";
++        }
+         return String(((await r.json()) as { status?: unknown }).status ?? "").toLowerCase();
+       } catch {
+-        return "";
++        return "unknown";
+       }
+     })
+   );
+-  const lost = statuses.some((s) => LOST_OP_STATUSES.has(s));
+-  const open = ops.filter((_, i) => !["completed", "not_found"].includes(statuses[i]));
+-  return { cursor: lost ? { ...cursor, dirty: true } : cursor, ops: lost ? [] : open };
++  const failed = statuses.some((s) => LOST_OP_STATUSES.has(s));
++  const knownStatuses = ["completed", "pending", "accepted", "running", "processing", "failed", "cancelled", "error"];
++  const unknown = statuses.some((s) => s === "unknown" || !knownStatuses.includes(s));
++  const pending = statuses.some((s) => ["pending", "accepted", "running", "processing"].includes(s));
++  const open = ops.filter((_, i) => !["completed", "failed", "cancelled", "error"].includes(statuses[i]));
++  const settledCursor = {
++    ...cursor,
++    ...(failed ? { dirty: true } : {}),
++    ...(open.length ? { ops: open } : { ops: undefined }),
++  };
++  return {
++    cursor: settledCursor,
++    // A failed operation dirties the cursor and triggers a replace when there is source content,
++    // but unrelated unknown operations remain live until that replace can rebuild the document.
++    ops: open,
++    status: failed ? "failed" : unknown ? "unknown" : pending ? "accepted_pending" : "completed",
++  };
+ }
+ 
+ /** Retry window for a caller that did not supply one — a long-lived host with no external clock. */
+@@ -221,17 +241,20 @@ async function submitWithRetry(
+  */
+ const writeBacks = new WeakMap<RetainCursorStore, Map<string, Promise<void>>>();
+ 
+-function serialize(
++function serialize<T>(
+   cursors: RetainCursorStore,
+   sessionId: string,
+-  write: () => Promise<void>
+-): Promise<void> {
++  write: () => Promise<T>
++): Promise<T> {
+   const perSession = writeBacks.get(cursors) ?? new Map<string, Promise<void>>();
+   writeBacks.set(cursors, perSession);
+   // Chain off the previous write-back whether it succeeded or failed — a failure leaves its payload
+   // buffered on the cursor (or the cursor dirty), which the next call needs to see before it plans.
+   const next = (perSession.get(sessionId) ?? Promise.resolve()).then(write, write);
+-  const tail = next.catch(() => {});
++  const tail = next.then(
++    () => undefined,
++    () => undefined
++  );
+   perSession.set(sessionId, tail);
+   // Drop the entry once it is settled AND still the tail, so a host that outlives many sessions
+   // (opencode runs for days) doesn't accumulate one resolved promise per session id forever.
+@@ -267,6 +290,39 @@ export const DEFAULT_RETAIN_CONTEXT =
+  * (renderSessionJsonl) whose tool activity is compacted into `role:"action"` turns
+  * (see core/transcript*.ts).
+  */
++export interface RetainWriteOutcome {
++  status: "skipped" | "accepted_pending" | "completed" | "failed" | "unknown";
++  reason: string;
++  operationIds: string[];
++  pendingCount: number;
++  submitted: boolean;
++  /** Outcome of operations checked before this invocation submitted its own write. */
++  priorOperationStatus?: "accepted_pending" | "completed" | "failed" | "unknown";
++  /** Entries still buffered after a partial flush, distinct from accepted operation IDs. */
++  bufferedOperationIds?: string[];
++  deferReason?: "host_budget";
++}
++
++function retainWriteOutcome(
++  status: RetainWriteOutcome["status"],
++  reason: string,
++  operationIds: string[] = [],
++  submitted = false,
++  priorOperationStatus?: RetainWriteOutcome["priorOperationStatus"],
++  details: { pendingCount?: number; bufferedOperationIds?: string[]; deferReason?: "host_budget" } = {}
++): RetainWriteOutcome {
++  return {
++    status,
++    reason,
++    operationIds,
++    pendingCount: details.pendingCount ?? operationIds.length,
++    submitted,
++    ...(priorOperationStatus ? { priorOperationStatus } : {}),
++    ...(details.bufferedOperationIds?.length ? { bufferedOperationIds: details.bufferedOperationIds } : {}),
++    ...(details.deferReason ? { deferReason: details.deferReason } : {}),
++  };
++}
++
+ export async function retainLiveSession(
+   client: HindsightClient,
+   sessionId: string,
+@@ -280,7 +336,7 @@ export async function retainLiveSession(
+     /** The transcript file the turns came from, when there is one — see RetainCursor.paths. */
+     transcriptPath?: string;
+   } = {}
+-): Promise<void> {
++): Promise<RetainWriteOutcome> {
+   const cursors = opts.cursors;
+   if (!cursors)
+     return writeSession(
+@@ -321,20 +377,70 @@ async function writeSession(
+   /** Absolute time this write-back may keep retrying until; the caller owns its own clock. */
+   retryUntil = Date.now() + DEFAULT_RETRY_WINDOW_MS,
+   transcriptPath?: string
+-): Promise<void> {
+-  if (!turns.length) return;
++): Promise<RetainWriteOutcome> {
+   const refId = `conversation:${sessionId}`;
+   let cursor = cursors?.read(sessionId);
+-  // A "yes" is remembered on the cursor: hook harnesses run a fresh process per Stop, so without it
+-  // every turn re-asked, and one slow or failed probe turned that turn's append into a full replace
+-  // (#4560). A "no" is not remembered — the server can be upgraded mid-session.
+-  const probed = Boolean(cursors) && cursor?.appendSupported !== true;
++  const pendingIds = (value: RetainCursor | undefined) => value?.pending?.map((entry) => entry.operationId) ?? [];
++  const allKnownIds = (value: RetainCursor | undefined) => [...new Set([...(value?.ops ?? []), ...pendingIds(value)])];
++  const bankChanged = Boolean(cursor && cursor.bank !== client.bank);
++
++  // A cursor belongs to one bank. Check this before capability probes, operation checks, or replay
++  // so the old bank's operation IDs and bytes never cross through the new bank's client.
++  if (turns.length === 0 && bankChanged) {
++    const operationIds = allKnownIds(cursor);
++    return retainWriteOutcome("unknown", "bank_mismatch", operationIds, false, "unknown", {
++      pendingCount: operationIds.length,
++    });
++  }
++
++  // Empty source cannot rebuild an uncertain replace. Keep its original cursor and buffered bytes.
++  if (turns.length === 0 && cursor?.dirty) {
++    const operationIds = allKnownIds(cursor);
++    return retainWriteOutcome("unknown", "prior_operation_unconfirmed", operationIds, false, "unknown", {
++      pendingCount: operationIds.length,
++    });
++  }
++
++  // Empty source can replay only the exact durable outbox and only while its original append
++  // capability and dedupe-safety window still hold. Otherwise return before settling IDs or writing.
++  const emptyReplay = turns.length === 0 && Boolean(cursor?.pending?.length);
++  if (emptyReplay && (cursor?.appendSupported !== true || !pendingReplayable(cursor, Date.now()))) {
++    const operationIds = allKnownIds(cursor);
++    return retainWriteOutcome("unknown", "pending_replay_deferred", operationIds, false, "unknown", {
++      pendingCount: operationIds.length,
++    });
++  }
++  if (turns.length === 0 && !cursor?.pending?.length && !cursor?.ops?.length) {
++    return retainWriteOutcome("skipped", "no_new_content");
++  }
++
++  // Empty replay never probes; only cached append capability can authorize it.
++  const probed =
++    turns.length > 0 &&
++    Boolean(cursors) &&
++    (bankChanged || cursor?.appendSupported !== true);
+   const appendSupported =
+-    Boolean(cursors) && (cursor?.appendSupported === true || (await supportsAppend(client)));
+-  // Only an append can build on a lost write; a replace already re-sends everything.
+-  let ops: string[] = [];
+-  if (appendSupported && cursor?.ops?.length && !cursor.dirty)
+-    ({ cursor, ops } = await settleOps(client, cursor));
++    (!bankChanged && cursor?.appendSupported === true) ||
++    (probed && (await supportsAppend(client)));
++  // Preserve IDs when status cannot be checked or the client has moved banks.
++  let ops: string[] = bankChanged ? [] : (cursor?.ops ?? []);
++  let settlement: "completed" | "accepted_pending" | "failed" | "unknown" | undefined;
++  if (!bankChanged && cursor?.ops?.length && !cursor.dirty && (appendSupported || turns.length === 0)) {
++    const settled = await settleOps(client, cursor);
++    ({ cursor, ops } = settled);
++    settlement = settled.status;
++    // A failed operation cannot be repaired without source turns. Leave the original cursor/outbox
++    // and IDs in place so a later non-empty Stop can perform a safe replace.
++    if (turns.length === 0 && settled.status === "failed") {
++      // Persist only the confirmed settlement facts. Unknown IDs and any outbox bytes remain for
++      // the next source-backed Stop; the dirty marker prevents an empty replace from erasing them.
++      cursors?.write(sessionId, cursor);
++      const operationIds = allKnownIds(cursor);
++      return retainWriteOutcome("failed", "prior_operation_failed", operationIds, false, "failed", {
++        pendingCount: operationIds.length,
++      });
++    }
++  }
+   const plan = planRetain(turns, cursor, {
+     appendSupported,
+     bank: client.bank,
+@@ -346,8 +452,9 @@ async function writeSession(
+   // Which files the document holds after this write-back. A replace rebuilds it from THIS file
+   // alone, so it forgets the others — which is what lets the file it dropped be appended back as a
+   // segment on its next hook, rather than replacing again.
+-  const paths =
+-    plan.mode === "replace"
++  const paths = emptyReplay
++    ? cursor?.paths
++    : plan.mode === "replace"
+       ? transcriptPath
+         ? [transcriptPath]
+         : undefined
+@@ -355,8 +462,24 @@ async function writeSession(
+   // Appends built but never confirmed. A replace rewrites the whole document from the same
+   // transcript, so it SUBSUMES them; on every other path they go out first, oldest first, before
+   // anything new — the document only ever grows in transcript order.
+-  const outbox = plan.mode === "replace" ? [] : (cursor?.pending ?? []);
+-  if (plan.mode === "skip" && !outbox.length) return;
++  const outbox = plan.mode === "replace" && !emptyReplay ? [] : (cursor?.pending ?? []);
++  if (plan.mode === "skip" && !outbox.length) {
++    if (cursors && cursor) {
++      const { ops: _settledOps, ...settled } = cursor;
++      cursors.write(sessionId, ops.length ? { ...settled, ops } : settled);
++    }
++    // Without a status check, stored IDs prove only an earlier submission, not that it is still
++    // pending. Preserve them and report uncertainty rather than upgrading history to pending.
++    const status = settlement ?? (cursor?.dirty || ops.length ? "unknown" : "skipped");
++    const reasons: Record<typeof status, string> = {
++      completed: "prior_operation_completed",
++      failed: "prior_operation_failed",
++      unknown: "prior_operation_unconfirmed",
++      accepted_pending: "operation_pending",
++      skipped: "no_new_content",
++    };
++    return retainWriteOutcome(status, reasons[status], ops);
++  }
+ 
+   /** Identity of ONE payload: a resubmission of the same bytes is collapsed server-side into the
+    *  original operation instead of extracting (or appending) twice. */
+@@ -396,16 +519,24 @@ async function writeSession(
+ 
+   // The position the cursor reaches once everything below has been applied. On a "skip" this is
+   // exactly where the cursor already is: skip means the transcript ends at cursor.turns.
+-  const next = {
+-    turns: turns.length,
+-    fingerprint: fingerprintTurns(turns, turns.length),
+-    bank: client.bank,
+-    ...(paths ? { paths } : {}),
+-    ...(appendSupported ? { appendSupported: true } : {}),
+-  };
++  const next = emptyReplay && cursor
++    ? {
++        turns: cursor.turns,
++        fingerprint: cursor.fingerprint,
++        bank: cursor.bank,
++        ...(cursor.paths ? { paths: cursor.paths } : {}),
++        ...(cursor.appendSupported === true ? { appendSupported: true } : {}),
++      }
++    : {
++        turns: turns.length,
++        fingerprint: fingerprintTurns(turns, turns.length),
++        bank: client.bank,
++        ...(paths ? { paths } : {}),
++        ...(appendSupported ? { appendSupported: true } : {}),
++      };
+   /** `next` plus the ops to check on the next write-back, with `id` newly accepted. */
+   const accepted = (id?: string) => {
+-    if (id) ops = [...ops, id].slice(-MAX_CURSOR_OPS);
++    if (id) ops = [...new Set([...ops, id])].slice(-MAX_CURSOR_OPS);
+     return ops.length ? { ...next, ops } : next;
+   };
+   // Still ours to retry only while the cursor holds the claim we write below.
+@@ -424,8 +555,15 @@ async function writeSession(
+     const operationId = opId("replace", content);
+     await submitWithRetry(() => submit(content, operationId, false), stillOurs, retryUntil);
+     ops = []; // the replace re-sends every turn, so nothing older can still lose any
+-    cursors?.write(sessionId, accepted(operationId));
+-    return;
++    const confirmedPosition = accepted(operationId); // evaluate even without an optional cursor store
++    cursors?.write(sessionId, confirmedPosition);
++    return retainWriteOutcome(
++      "accepted_pending",
++      "submission_accepted",
++      confirmedPosition.ops ?? [],
++      true,
++      settlement
++    );
+   }
+ 
+   const queue = [...outbox];
+@@ -450,7 +588,18 @@ async function writeSession(
+     // by its host at `retryUntil` (retain-hook's hostDeadline), and a flush that overruns it buys
+     // nothing. The first entry always goes out, so a chronically short budget still makes progress;
+     // whatever is left is already durable, so the next write-back sends it.
+-    if (i > 0 && Date.now() + REQUEST_BUDGET_MS > retryUntil) return;
++    if (i > 0 && Date.now() + REQUEST_BUDGET_MS > retryUntil) {
++      const stillBuffered = queue.slice(i).map((pending) => pending.operationId);
++      const operationIds = [...new Set([...ops, ...stillBuffered])];
++      return retainWriteOutcome(
++        "accepted_pending",
++        "submission_deferred",
++        operationIds,
++        true,
++        settlement,
++        { pendingCount: operationIds.length, bufferedOperationIds: stillBuffered, deferReason: "host_budget" }
++      );
++    }
+     const entry = queue[i];
+     await submitWithRetry(
+       () => submit(entry.content, entry.operationId, true),
+@@ -463,4 +612,5 @@ async function writeSession(
+     const done = accepted(entry.operationId);
+     cursors?.write(sessionId, remaining.length ? { ...done, pending: remaining } : done);
+   }
++  return retainWriteOutcome("accepted_pending", "submission_accepted", ops, true, settlement);
+ }
+diff --git a/hindsight-integrations/coding-agents/src/core/diag.test.ts b/hindsight-integrations/coding-agents/src/core/diag.test.ts
+index f5cabd3c..a4857e33 100644
+--- a/hindsight-integrations/coding-agents/src/core/diag.test.ts
++++ b/hindsight-integrations/coding-agents/src/core/diag.test.ts
+@@ -2,7 +2,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+ import { tmpdir } from "node:os";
+ import { join } from "node:path";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+-import { parseHookEvent } from "./diag";
++import { memoryLifecycle, parseHookEvent } from "./diag";
+ 
+ describe("parseHookEvent", () => {
+   let dir: string;
+@@ -39,6 +39,20 @@ describe("parseHookEvent", () => {
+     ]);
+   });
+ 
++  it("writes a correlated content-free lifecycle record and drops unsafe identifiers", () => {
++    memoryLifecycle({ harness: "codex", stage: "stop", status: "accepted_pending", reason: "submission_accepted", session: "session-1", bank: "Acme Setup and WoW", operationIds: ["12345678-1234-1234-1234-123456789abc"], pendingCount: 1, submitted: true, priorOperationStatus: "failed", bufferedOperationIds: ["abcdefab-cdef-abcd-efab-cdefabcdefab"], deferReason: "host_budget" });
++    memoryLifecycle({ harness: "codex", stage: "stop", status: "completed", reason: "prior_operation_completed", bank: "Acme Setup and WoW" });
++    memoryLifecycle({ harness: "codex", stage: "prompt", status: "failed", reason: "reflect failed with raw prompt", session: "raw session text", bank: "/private/path" });
++    const rows = readFileSync(diagFile, "utf8").trim().split(String.fromCharCode(10)).map((line) => JSON.parse(line));
++    expect(rows[0]).toMatchObject({ event: "memory_lifecycle", stage: "stop", status: "accepted_pending", session: "session-1", bank: expect.stringMatching(/^sha256:[a-f0-9]{16}$/), pendingCount: 1, submitted: true, priorOperationStatus: "failed", bufferedOperationIds: ["abcdefab-cdef-abcd-efab-cdefabcdefab"], deferReason: "host_budget" });
++    expect(rows[1]).toMatchObject({ status: "completed", bank: rows[0].bank });
++    expect(rows[0].operationIds).toHaveLength(1);
++    expect(rows[2]).toMatchObject({ stage: "prompt", status: "failed", reason: "unspecified" });
++    expect(rows[2]).not.toHaveProperty("session");
++    expect(rows[2]).toMatchObject({ bank: expect.stringMatching(/^sha256:[a-f0-9]{16}$/) });
++    expect(JSON.stringify(rows)).not.toContain("raw prompt");
++  });
++
+   it("treats empty input as no event, without a diag record", () => {
+     expect(parseHookEvent("cursor-cli", "")).toBeNull();
+     expect(existsSync(diagFile)).toBe(false);
+diff --git a/hindsight-integrations/coding-agents/src/core/diag.ts b/hindsight-integrations/coding-agents/src/core/diag.ts
+index 1016616d..9326cc28 100644
+--- a/hindsight-integrations/coding-agents/src/core/diag.ts
++++ b/hindsight-integrations/coding-agents/src/core/diag.ts
+@@ -7,6 +7,7 @@
+  * hook (UserPromptSubmit, Stop, and future ones like SessionStart) can depend on it without
+  * reaching into another hook's module.
+  */
++import { createHash } from "node:crypto";
+ import { readFileSync } from "node:fs";
+ import { join } from "node:path";
+ import { appendLogLine, log, logsDir } from "./log";
+@@ -28,6 +29,54 @@ export function diag(harness: string, event: string, extra: Record<string, unkno
+   }
+ }
+ 
++export type MemoryLifecycleStage = "startup" | "prompt" | "stop";
++export type MemoryLifecycleStatus =
++  | "success"
++  | "degraded"
++  | "skipped"
++  | "failed"
++  | "accepted_pending"
++  | "completed"
++  | "unknown";
++
++/** Content-free terminal status for one memory lifecycle boundary. */
++export function memoryLifecycle(args: {
++  harness: string;
++  stage: MemoryLifecycleStage;
++  status: MemoryLifecycleStatus;
++  reason: string;
++  session?: string;
++  bank?: string;
++  ms?: number;
++  source?: "reflect" | "pages" | "observations" | "cached" | "none";
++  operationIds?: string[];
++  pendingCount?: number;
++  submitted?: boolean;
++  priorOperationStatus?: "accepted_pending" | "completed" | "failed" | "unknown";
++  bufferedOperationIds?: string[];
++  deferReason?: "host_budget";
++}): void {
++  const safeId = (v: string | undefined) =>
++    v && v.length <= 160 && /^[a-zA-Z0-9:_-]+$/.test(v) ? v : undefined;
++  const bankId = safeId(args.bank);
++  const bankCorrelation = bankId ?? (args.bank ? "sha256:" + createHash("sha256").update(args.bank).digest("hex").slice(0, 16) : undefined);
++  diag(args.harness, "memory_lifecycle", {
++    stage: args.stage, status: args.status, reason: /^[a-zA-Z0-9_-]{1,48}$/.test(args.reason) ? args.reason : "unspecified",
++    ...(safeId(args.session) ? { session: safeId(args.session) } : {}),
++    ...(bankCorrelation ? { bank: bankCorrelation } : {}),
++    ...(Number.isFinite(args.ms) ? { ms: Math.max(0, Math.round(args.ms!)) } : {}),
++    ...(args.source ? { source: args.source } : {}),
++    ...(args.operationIds?.length ? { operationIds: args.operationIds.filter((id) => /^[a-f0-9-]{16,64}$/i.test(id)).slice(0, 8) } : {}),
++    ...(Number.isFinite(args.pendingCount) ? { pendingCount: Math.max(0, Math.round(args.pendingCount!)) } : {}),
++    ...(typeof args.submitted === "boolean" ? { submitted: args.submitted } : {}),
++    ...(args.priorOperationStatus ? { priorOperationStatus: args.priorOperationStatus } : {}),
++    ...(args.bufferedOperationIds?.length
++      ? { bufferedOperationIds: args.bufferedOperationIds.filter((id) => /^[a-f0-9-]{16,64}$/i.test(id)).slice(0, 8) }
++      : {}),
++    ...(args.deferReason === "host_budget" ? { deferReason: args.deferReason } : {}),
++  });
++}
++
+ /**
+  * Parse a hook's stdin event. Null for no input, and for input that is not a JSON object — the
+  * latter is recorded in the diag file, since the hook then exits 0 having done nothing.
+diff --git a/hindsight-integrations/coding-agents/src/core/hindsight.test.ts b/hindsight-integrations/coding-agents/src/core/hindsight.test.ts
+index 9cc50173..518239be 100644
+--- a/hindsight-integrations/coding-agents/src/core/hindsight.test.ts
++++ b/hindsight-integrations/coding-agents/src/core/hindsight.test.ts
+@@ -8,6 +8,7 @@ import {
+   DEFAULT_MAX_PARALLEL_RETAINS,
+   DEFAULT_OBSERVATION_SCOPES,
+   HindsightClient,
++  HindsightHttpError,
+   ReflectError,
+   retryAfterMs,
+ } from "./hindsight";
+@@ -491,6 +492,83 @@ describe("HindsightClient credential refresh", () => {
+     expect(calls).toHaveLength(1);
+   });
+ 
++  it.each([400, 401, 403])("preserves HTTP %s status without retaining the response body", async (status) => {
++    const secretBody = "private response body that must not enter diagnostics";
++    const client = new HindsightClient({ apiUrl: "http://x", bank: "b" });
++    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse(status, { detail: secretBody })));
++
++    let caught: unknown;
++    try {
++      await client.req("POST", "http://x/retain");
++    } catch (error) {
++      caught = error;
++    }
++
++    expect(caught).toBeInstanceOf(HindsightHttpError);
++    expect(caught).toMatchObject({ status });
++    expect((caught as Error).message).not.toContain(secretBody);
++  });
++
++  it.each([false, true])(
++    "cancels unread HTTP error bodies and preserves the typed status when cleanup fails (%s)",
++    async (cleanupFails) => {
++      const secretBody = "private response body that must not enter diagnostics";
++      const cancel = vi.fn(async () => {
++        if (cleanupFails) throw new Error(secretBody);
++      });
++      const body = new ReadableStream<Uint8Array>({
++        start(controller) {
++          controller.enqueue(new TextEncoder().encode(secretBody));
++        },
++        cancel,
++      });
++      const client = new HindsightClient({ apiUrl: "http://x", bank: "b" });
++      vi.stubGlobal("fetch", vi.fn(async () => new Response(body, { status: 403 })));
++
++      let caught: unknown;
++      try {
++        await client.req("POST", "http://x/retain");
++      } catch (error) {
++        caught = error;
++      }
++
++      expect(cancel).toHaveBeenCalledOnce();
++      expect(caught).toBeInstanceOf(HindsightHttpError);
++      expect(caught).toMatchObject({ status: 403 });
++      expect((caught as Error).message).not.toContain(secretBody);
++      expect(String(caught)).not.toContain(secretBody);
++    }
++  );
++
++  it("rejects and cancels a 404 response from retain even though req preserves 404 for readers", async () => {
++    const secretBody = "private missing-resource response";
++    const client = new HindsightClient({ apiUrl: "http://x", bank: "b" });
++    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse(404, {})));
++
++    await expect(client.req("GET", "http://x/optional-read")).resolves.toMatchObject({ status: 404 });
++    // Retain must reject and cancel its own unread 404 response.
++    const retainCancel = vi.fn();
++    const retainBody = new ReadableStream<Uint8Array>({
++      start(controller) {
++        controller.enqueue(new TextEncoder().encode(secretBody));
++      },
++      cancel: retainCancel,
++    });
++    vi.stubGlobal("fetch", vi.fn(async () => new Response(retainBody, { status: 404 })));
++
++    let caught: unknown;
++    try {
++      await client.retain("content", "context", "doc", [], "strategy", { operationId: "op" });
++    } catch (error) {
++      caught = error;
++    }
++
++    expect(caught).toBeInstanceOf(HindsightHttpError);
++    expect(caught).toMatchObject({ status: 404 });
++    expect((caught as Error).message).not.toContain(secretBody);
++    expect(retainCancel).toHaveBeenCalledOnce();
++  });
++
+   it("keeps the last credential that worked when the provider throws", async () => {
+     const { calls } = server(() => "any");
+     const client = new HindsightClient({
+diff --git a/hindsight-integrations/coding-agents/src/core/hindsight.ts b/hindsight-integrations/coding-agents/src/core/hindsight.ts
+index f6ac73b8..9a126cec 100644
+--- a/hindsight-integrations/coding-agents/src/core/hindsight.ts
++++ b/hindsight-integrations/coding-agents/src/core/hindsight.ts
+@@ -252,6 +252,18 @@ export class ReflectError extends Error {
+   }
+ }
+ 
++/** HTTP rejection from the Hindsight API, retaining status for lifecycle classification only. */
++export class HindsightHttpError extends Error {
++  constructor(
++    method: string,
++    readonly status: number,
++    authHint = ""
++  ) {
++    super(`${method} request failed with HTTP ${status}${authHint}`);
++    this.name = "HindsightHttpError";
++  }
++}
++
+ export const DEFAULT_MAX_PARALLEL_RETAINS = 10;
+ /** Knowledge pages returned by one search — the hook's injection and the agent-facing
+  *  `hindsight_search_knowledge_pages` tool both get this, so tuning it moves both.
+@@ -490,10 +502,18 @@ export class HindsightClient {
+       await sleep(wait);
+       waited += wait;
+     }
+-    if (!r.ok && r.status !== 404 && !tolerate.includes(r.status))
+-      throw new Error(
+-        `${method} ${url} -> ${r.status} ${await r.text()}${this.authHint(r.status)}`
+-      );
++    if (!r.ok && r.status !== 404 && !tolerate.includes(r.status)) {
++      const error = new HindsightHttpError(method, r.status, this.authHint(r.status));
++      // Release an unread error response before throwing. Fetch implementations may keep the
++      // connection occupied until the body is consumed or cancelled; never let cleanup replace the
++      // typed status error or expose response content in diagnostics.
++      try {
++        await r.body?.cancel();
++      } catch {
++        // Preserve the original status and redacted error if stream cleanup itself fails.
++      }
++      throw error;
++    }
+     return r;
+   }
+ 
+@@ -524,6 +544,18 @@ export class HindsightClient {
+     const body: Record<string, unknown> = { items: [item], async: true };
+     if (opts.operationId) body.operation_id = opts.operationId;
+     const r = await this.req("POST", this.bankUrl("/memories"), body);
++    // req() deliberately returns 404 for read paths that treat a missing resource as empty. A
++    // retain POST cannot interpret that as accepted work: require a successful response before
++    // recording an operation, and release any unread error body without exposing it.
++    if (!r.ok) {
++      const error = new HindsightHttpError("POST", r.status, this.authHint(r.status));
++      try {
++        await r.body?.cancel();
++      } catch {
++        // Preserve the typed rejection if stream cleanup fails.
++      }
++      throw error;
++    }
+     try {
+       const j = (await r.json()) as { operation_id?: string };
+       if (j.operation_id) this.opIds.push(j.operation_id);
+diff --git a/hindsight-integrations/coding-agents/src/core/hook.test.ts b/hindsight-integrations/coding-agents/src/core/hook.test.ts
+index 98a832a5..a88ab1ef 100644
+--- a/hindsight-integrations/coding-agents/src/core/hook.test.ts
++++ b/hindsight-integrations/coding-agents/src/core/hook.test.ts
+@@ -5,15 +5,28 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import { resolveConfig } from "./config";
+ import { buildHookOutput, runHook } from "./hook";
+ import { diagFilePath } from "./diag";
++import { HOOK_HARNESSES } from "../harness/hook-lifecycle";
++import { deliverPendingContext, stashPendingContext } from "./session-cache";
+ import { ReflectError } from "./hindsight";
+ import { buildReflectQuery } from "./inject";
+ 
++let stdin = "";
++vi.mock("node:fs", async (importOriginal) => {
++  const actual = await importOriginal<typeof import("node:fs")>();
++  return {
++    ...actual,
++    readFileSync: (target: unknown, ...rest: unknown[]) =>
++      target === 0 ? stdin : (actual.readFileSync as (...a: unknown[]) => unknown)(target, ...rest),
++  };
++});
++
+ let root: string;
+ let cacheFile: string;
+ 
+ beforeEach(() => {
+   root = mkdtempSync(join(tmpdir(), "hs-hook-"));
+   cacheFile = join(root, "cache", "session.json");
++  stdin = "";
+ });
+ 
+ afterEach(() => {
+@@ -73,6 +86,7 @@ describe("buildHookOutput", () => {
+     });
+     expect(result.context).toContain("Automatically retrieved by Hindsight");
+     expect(result.context).toContain("REFLECT_ANSWER");
++    expect(result.lifecycle).toEqual({ status: "success", reason: "memory_injected", source: "reflect" });
+     expect(existsSync(cacheFile)).toBe(true);
+     const cached = JSON.parse(readFileSync(cacheFile, "utf8"));
+     expect(cached.turns).toBe(1);
+@@ -101,9 +115,20 @@ describe("buildHookOutput", () => {
+     // duplicate the same block); turn 2 carries no repeat.
+     expect(t1.context).toContain("REFLECT_ANSWER");
+     expect(t2.context ?? "").not.toContain("REFLECT_ANSWER");
++    expect(t2.lifecycle).toEqual({ status: "skipped", reason: "cached_memory", source: "cached" });
+     expect(JSON.parse(readFileSync(cacheFile, "utf8")).turns).toBe(2);
+   });
+ 
++  it("configured autoInject none skips retrieval and reports the configured choice", async () => {
++    const cfg = resolveConfig({ autoInject: "none" });
++    const client = makeClient();
++    const output = await buildHookOutput({ harness: "claude-code", prompt: MATCHING_PROMPT, cfg, client, cacheFile });
++    expect(client.reflect).not.toHaveBeenCalled();
++    expect(client.searchKnowledgePages).not.toHaveBeenCalled();
++    expect(client.recallObservations).not.toHaveBeenCalled();
++    expect(output.lifecycle).toEqual({ status: "skipped", reason: "auto_inject_disabled", source: "none" });
++  });
++
+   it("defers the first automatic reflect for a new bank, then reflects on prompt two", async () => {
+     mkdirSync(join(root, "cache"), { recursive: true });
+     writeFileSync(cacheFile, JSON.stringify({ deferInitialReflect: true }));
+@@ -164,8 +189,9 @@ describe("buildHookOutput", () => {
+     expect(client.reflect).toHaveBeenCalledTimes(2);
+     // Second failure exhausts the budget — now it IS cached, so a dead server costs 2 turns, not every turn.
+     expect(JSON.parse(readFileSync(cacheFile, "utf8")).reflectAnswer).toBe("");
+-    await buildHookOutput(args);
++    const exhausted = await buildHookOutput(args);
+     expect(client.reflect).toHaveBeenCalledTimes(2);
++    expect(exhausted.lifecycle).toEqual({ status: "degraded", reason: "memory_unavailable", source: "reflect" });
+   });
+ 
+   it("a permanent 4xx reflect is not retried on a later turn (#5207); 5xx/429 still are", async () => {
+@@ -179,8 +205,9 @@ describe("buildHookOutput", () => {
+     const t1 = await buildHookOutput({ ...args, client: permanent });
+     expect(t1.notice).toContain("no memory this turn");
+     expect(JSON.parse(readFileSync(cacheFile, "utf8")).reflectAnswer).toBe("");
+-    await buildHookOutput({ ...args, client: permanent });
++    const skipped = await buildHookOutput({ ...args, client: permanent });
+     expect(permanent.reflect).toHaveBeenCalledTimes(1);
++    expect(skipped.lifecycle).toEqual({ status: "degraded", reason: "memory_unavailable", source: "reflect" });
+ 
+     for (const status of [429, 503]) {
+       rmSync(cacheFile, { force: true });
+@@ -194,7 +221,22 @@ describe("buildHookOutput", () => {
+     }
+   });
+ 
+-  it("reflect_failed records the bank, the deadline, and the server's full error body", async () => {
++  it("a successful empty retry clears prior failure provenance and remains a legitimate no-match", async () => {
++    const cfg = resolveConfig({});
++    const client = makeClient({
++      reflect: vi.fn()
++        .mockRejectedValueOnce(new Error("temporary outage"))
++        .mockResolvedValueOnce(""),
++    });
++    const args = { harness: "claude-code", prompt: UNRELATED_PROMPT, cfg, client, cacheFile };
++    const failed = await buildHookOutput(args);
++    expect(failed.lifecycle).toMatchObject({ status: "degraded", reason: "memory_unavailable" });
++    const empty = await buildHookOutput(args);
++    expect(empty.lifecycle).toEqual({ status: "skipped", reason: "no_memory_match", source: "none" });
++    expect(JSON.parse(readFileSync(cacheFile, "utf8")).retrievalFailure).toBeUndefined();
++  });
++
++  it("reflect_failed keeps correlation while excluding server error content", async () => {
+     const diagFile = join(root, "diag.log");
+     vi.stubEnv("HINDSIGHT_DIAG_FILE", diagFile);
+     const body = `{"detail":"${"x".repeat(400)} upstream LLM rejected the turn"}`;
+@@ -221,8 +263,9 @@ describe("buildHookOutput", () => {
+       .find((entry) => entry.event === "reflect_failed");
+     expect(failed.bank).toBe("coding-agent::demo");
+     expect(failed.timeoutMs).toBe(20_000);
+-    // Past describeError's default 200-char cut, where the root cause usually sits.
+-    expect(failed.error).toContain("upstream LLM rejected the turn");
++    expect(failed.error).toBe("Error");
++    expect(JSON.stringify(failed)).not.toContain("upstream LLM rejected the turn");
++    expect(JSON.stringify(failed)).not.toContain(UNRELATED_PROMPT);
+   });
+ 
+   it("the notice fires on the turns reflect ran, and stops once the retries are spent", async () => {
+@@ -355,8 +398,8 @@ describe("buildHookOutput", () => {
+       expect(t1.context).toContain("<hindsight_memory>");
+       expect(t1.context).toContain("- Upload retries (kp-1): 200ms jitter window");
+       expect(t1.context).toContain("hindsight_read_knowledge_page");
+-      // The turn got memory, so it stays silent — the details live in the diag trail.
+-      expect(t1.notice).toBeUndefined();
++      expect(t1.lifecycle).toEqual({ status: "degraded", reason: "reflect_fallback", source: "pages" });
++      expect(t1.notice).toContain("reflection unavailable");
+ 
+       const t2 = await buildHookOutput(args);
+       expect(client.reflect).toHaveBeenCalledTimes(1);
+@@ -390,7 +433,8 @@ describe("buildHookOutput", () => {
+       });
+       expect(out.context).toContain("recalled from the bank");
+       expect(out.context).toContain("- Retries back off exponentially.\n- Tokens rotate daily.");
+-      expect(out.notice).toBeUndefined();
++      expect(out.lifecycle).toEqual({ status: "degraded", reason: "reflect_fallback", source: "observations" });
++      expect(out.notice).toContain("reflection unavailable");
+     });
+ 
+     it("a failing page search still falls through to observations", async () => {
+@@ -554,8 +598,25 @@ describe("buildHookOutput", () => {
+     expect(client.searchKnowledgePages).toHaveBeenCalledTimes(2);
+     // Budget spent — now it is cached, so a broken search costs 2 turns and then stops.
+     expect(JSON.parse(readFileSync(cacheFile, "utf8")).reflectAnswer).toBe("");
+-    await buildHookOutput(args);
++    const exhausted = await buildHookOutput(args);
+     expect(client.searchKnowledgePages).toHaveBeenCalledTimes(2);
++    expect(exhausted.lifecycle).toEqual({ status: "degraded", reason: "memory_unavailable", source: "pages" });
++  });
++
++  it("autoInject recall: exhausted retrieval failures stay explicitly unavailable on later prompts", async () => {
++    const cfg = resolveConfig({ autoInject: "recall" });
++    const client = makeClient({
++      recallObservations: vi.fn(async () => { throw new Error("recall unavailable"); }),
++    });
++    const args = { harness: "claude-code", prompt: MATCHING_PROMPT, cfg, client, cacheFile };
++    await buildHookOutput(args);
++    const exhausted = await buildHookOutput(args);
++    expect(client.recallObservations).toHaveBeenCalledTimes(2);
++    expect(exhausted.lifecycle).toEqual({ status: "degraded", reason: "memory_unavailable", source: "observations" });
++    expect(JSON.parse(readFileSync(cacheFile, "utf8")).retrievalFailure).toBe("observations");
++    const later = await buildHookOutput(args);
++    expect(client.recallObservations).toHaveBeenCalledTimes(2);
++    expect(later.lifecycle).toEqual({ status: "degraded", reason: "memory_unavailable", source: "observations" });
+   });
+ 
+   it("autoInject recall: an EMPTY result retries on a later prompt, within a bounded budget", async () => {
+@@ -620,6 +681,11 @@ describe("buildHookOutput", () => {
+     expect(client.searchKnowledgePages).not.toHaveBeenCalled();
+     expect(out.context).toContain("- Uploads retry 3 times.");
+     expect(out.context).not.toContain("synthesis was unavailable");
++    expect(out.lifecycle).toEqual({
++      status: "success",
++      reason: "memory_injected",
++      source: "observations",
++    });
+   });
+ 
+   it("autoInject recall: an EMPTY retrieval injects nothing and stays silent", async () => {
+@@ -842,7 +908,8 @@ describe("runHook anti-recursion guard", () => {
+     else process.env.HINDSIGHT_DISABLE_HOOKS = ORIGINAL;
+   });
+ 
+-  it("HINDSIGHT_DISABLE_HOOKS set -> returns immediately, never reads stdin or builds a client", async () => {
++  it("HINDSIGHT_DISABLE_HOOKS set -> records skipped without reading stdin or building a client", async () => {
++    vi.stubEnv("HINDSIGHT_DIAG_FILE", join(root, "diag.log"));
+     process.env.HINDSIGHT_DISABLE_HOOKS = "1";
+     const makeClient = vi.fn();
+     // No stdin is provided/mocked here — if the guard didn't return before `readFileSync(0, ...)`,
+@@ -850,5 +917,162 @@ describe("runHook anti-recursion guard", () => {
+     // alone without calling makeClient) proves the guard fired first.
+     await runHook({ harness: "claude-code", parse: () => ({}), emit: (c) => ({ c }) }, makeClient);
+     expect(makeClient).not.toHaveBeenCalled();
++    expect(readFileSync(join(root, "diag.log"), "utf8")).toContain('"reason":"hooks_disabled"');
++  });
++
++  const eventSpec = (overrides: Record<string, unknown> = {}) => ({
++    harness: "claude-code",
++    parse: (event: Record<string, unknown>) => ({
++      prompt: event.prompt as string,
++      cwd: event.cwd as string,
++      sessionId: event.session_id as string,
++    }),
++    emit: (context: string) => ({ context }),
++    ...overrides,
++  });
++
++  it("records missing and filtered events without building a client", async () => {
++    vi.stubEnv("HINDSIGHT_DIAG_FILE", join(root, "diag.log"));
++    const make = vi.fn();
++    stdin = "";
++    await runHook(eventSpec(), make);
++    stdin = JSON.stringify({ prompt: "hello", cwd: root, session_id: "filtered-session" });
++    await runHook(eventSpec({ accept: () => false }), make);
++    expect(make).not.toHaveBeenCalled();
++    const rows = readFileSync(join(root, "diag.log"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
++    expect(rows).toEqual(expect.arrayContaining([
++      expect.objectContaining({ event: "memory_lifecycle", status: "unknown", reason: "event_missing" }),
++      expect.objectContaining({ event: "memory_lifecycle", status: "skipped", reason: "event_filtered" }),
++    ]));
++  });
++
++  it("records an empty prompt as skipped without building a client", async () => {
++    vi.stubEnv("HINDSIGHT_DIAG_FILE", join(root, "diag.log"));
++    stdin = JSON.stringify({ prompt: "   ", cwd: root, session_id: "empty-session" });
++    const make = vi.fn();
++    await runHook(eventSpec(), make);
++    expect(make).not.toHaveBeenCalled();
++    expect(readFileSync(join(root, "diag.log"), "utf8")).toContain('"reason":"empty_prompt"');
++  });
++
++  it("records the terminal prompt lifecycle only after stdout handoff", async () => {
++    vi.stubEnv("HINDSIGHT_DIAG_FILE", join(root, "diag.log"));
++    stdin = JSON.stringify({ prompt: "hello", cwd: root, session_id: "handoff-session" });
++    const write = vi.spyOn(process.stdout, "write").mockImplementation(() => {
++      const rows = existsSync(join(root, "diag.log"))
++        ? readFileSync(join(root, "diag.log"), "utf8").split(String.fromCharCode(10)).filter(Boolean).map((line) => JSON.parse(line))
++        : [];
++      expect(rows.some((row) => row.event === "memory_lifecycle" && row.stage === "prompt")).toBe(false);
++      return true;
++    });
++    try {
++      await runHook(eventSpec(), () => makeClient());
++    } finally {
++      write.mockRestore();
++    }
++    const rows = readFileSync(join(root, "diag.log"), "utf8").split(String.fromCharCode(10)).filter(Boolean).map((line) => JSON.parse(line));
++    expect(rows.some((row) => row.event === "memory_lifecycle" && row.stage === "prompt")).toBe(true);
++  });
++
++  it("handoff throws produce only a failed terminal prompt outcome", async () => {
++    vi.stubEnv("HINDSIGHT_DIAG_FILE", join(root, "diag.log"));
++    stdin = JSON.stringify({ prompt: "hello", cwd: root, session_id: "handoff-failed" });
++    await expect(runHook(eventSpec({ emit: () => { throw new Error("local emit failure"); } }), () => makeClient())).rejects.toThrow("local emit failure");
++    const rows = readFileSync(join(root, "diag.log"), "utf8").split(String.fromCharCode(10)).filter(Boolean).map((line) => JSON.parse(line));
++    const terminal = rows.filter((row) => row.event === "memory_lifecycle" && row.stage === "prompt");
++    expect(terminal).toHaveLength(1);
++    expect(terminal[0]).toMatchObject({ status: "failed", reason: "hook_setup_failed" });
++  });
++
++  it("reports unexpected prompt setup errors and preserves the original throw", async () => {
++    vi.stubEnv("HINDSIGHT_DIAG_FILE", join(root, "diag.log"));
++    stdin = JSON.stringify({ session_id: "parse-session" });
++    const make = vi.fn();
++    await expect(runHook(eventSpec({ parse: () => { throw new Error("private prompt text"); } }), make))
++      .rejects.toThrow("private prompt text");
++    expect(make).not.toHaveBeenCalled();
++    const row = JSON.parse(readFileSync(join(root, "diag.log"), "utf8").trim());
++    expect(row).toMatchObject({
++      event: "memory_lifecycle",
++      stage: "prompt",
++      status: "failed",
++      reason: "hook_setup_failed",
++    });
++    expect(JSON.stringify(row)).not.toContain("private prompt text");
++  });
++});
++
++
++describe("deferred tool context custody", () => {
++  beforeEach(() => {
++    vi.stubEnv("TMPDIR", root);
++    vi.stubEnv("HINDSIGHT_AUTO_SEED", "false");
++    vi.stubEnv("HINDSIGHT_AUTO_UPDATE", "false");
++    vi.stubEnv("HINDSIGHT_DIAG_FILE", join(root, "diag.log"));
++  });
++  const spec = HOOK_HARNESSES["grok-build"].prompt;
++  const pendingPath = () => join(root, "hindsight-grok-build", "deferred.pending");
++  const terminal = () => readFileSync(join(root, "diag.log"), "utf8").trim().split("\n")
++    .map((line) => JSON.parse(line)).filter((row) => row.event === "memory_lifecycle");
++  const toolEvent = () => { stdin = JSON.stringify({ sessionId: "deferred", hookEventName: "post_tool_use" }); };
++
++  it("reports a real failed deferred prompt write without a success terminal or clearing earlier context", async () => {
++    stashPendingContext("grok-build", "deferred", "earlier context");
++    // A directory at the atomic writer's temp path produces a real EISDIR write failure.
++    mkdirSync(`${pendingPath()}.${process.pid}.tmp`);
++    stdin = JSON.stringify({ sessionId: "deferred", cwd: root, prompt: "hello" });
++    await expect(runHook(spec, () => makeClient())).rejects.toThrow();
++    expect(readFileSync(pendingPath(), "utf8")).toBe("earlier context");
++    expect(terminal()).toEqual([expect.objectContaining({ status: "failed" })]);
++  });
++
++  it.each(["emit", "serialize", "stdout"])("recovers a failed tool %s for a later invocation without overwriting a new stash", async (failure) => {
++    stashPendingContext("grok-build", "deferred", "original context");
++    toolEvent();
++    const failingSpec = { ...spec, toolHook: { ...spec.toolHook!, emit: () => {
++      stashPendingContext("grok-build", "deferred", "newer context");
++      if (failure === "emit") throw new Error("emit failed");
++      if (failure === "serialize") { const circular: { self?: unknown } = {}; circular.self = circular; return circular; }
++      return { context: "original context" };
++    } } };
++    const write = vi.spyOn(process.stdout, "write").mockImplementation(() => { throw new Error("stdout failed"); });
++    try { await expect(runHook(failingSpec)).rejects.toThrow(); }
++    finally { write.mockRestore(); }
++    expect(terminal()).toEqual([expect.objectContaining({ status: "failed" })]);
++    expect(readFileSync(pendingPath(), "utf8")).toBe("newer context");
++    const emitted: string[] = [];
++    const retryWrite = vi.spyOn(process.stdout, "write").mockImplementation((body) => {
++      emitted.push(JSON.parse(String(body)).hookSpecificOutput.additionalContext);
++      return true;
++    });
++    try {
++      await runHook(spec);
++      await runHook(spec);
++      await runHook(spec);
++    } finally { retryWrite.mockRestore(); }
++    expect(emitted).toEqual(["original context", "newer context"]);
++    expect(terminal().map((row) => row.reason)).toEqual([
++      "hook_setup_failed", "pending_context_delivered", "pending_context_delivered", "no_pending_context",
++    ]);
++    expect(existsSync(pendingPath())).toBe(false);
++  });
++
++  it("allows only one consumer while a claim is being delivered and consumes after local success", async () => {
++    stashPendingContext("grok-build", "deferred", "single block");
++    toolEvent();
++    let competing: Promise<void> | undefined;
++    const outputs: string[] = [];
++    const write = vi.spyOn(process.stdout, "write").mockImplementation((body) => { outputs.push(String(body)); return true; });
++    try {
++      await runHook({ ...spec, toolHook: { ...spec.toolHook!, emit: (context) => {
++        competing = runHook(spec);
++        return spec.toolHook!.emit(context);
++      } } });
++      await competing;
++      await runHook(spec);
++    } finally { write.mockRestore(); }
++    expect(outputs).toHaveLength(1);
++    expect(outputs[0]).toContain("single block");
++    expect(deliverPendingContext("grok-build", "deferred", () => { throw new Error("already consumed"); })).toBe(false);
+   });
+ });
+diff --git a/hindsight-integrations/coding-agents/src/core/hook.ts b/hindsight-integrations/coding-agents/src/core/hook.ts
+index 57ea0899..b87efcc1 100644
+--- a/hindsight-integrations/coding-agents/src/core/hook.ts
++++ b/hindsight-integrations/coding-agents/src/core/hook.ts
+@@ -25,8 +25,8 @@ import { existsSync } from "node:fs";
+ import { deriveBankIdOrSkip } from "./bank";
+ import type { Config } from "./config";
+ import { applyBankConfig, loadConfig } from "./config";
+-import { diag, diagFilePath, readHookEvent } from "./diag";
+-import { describeError, log, setLogLevel } from "./log";
++import { diag, diagFilePath, memoryLifecycle, readHookEvent } from "./diag";
++import { log, setLogLevel } from "./log";
+ import { startBackgroundSeed } from "./seed";
+ import type { ClientOpts } from "./hindsight";
+ import { HindsightClient, ReflectError } from "./hindsight";
+@@ -46,7 +46,7 @@ import {
+   sessionCacheFile,
+   sessionRootDir,
+   stashPendingContext,
+-  takePendingContext,
++  deliverPendingContext,
+   writeSessionCache,
+   type SessionCache,
+ } from "./session-cache";
+@@ -161,7 +161,7 @@ async function injectPages(
+     diag(harness, event, { ms: Date.now() - t0, count: hits.length });
+     return hits.length ? formatPageFallback(hits, lead) : null;
+   } catch (e) {
+-    diag(harness, `${event}_failed`, { ms: Date.now() - t0, error: describeError(e) });
++    diag(harness, `${event}_failed`, { ms: Date.now() - t0, error: (e instanceof Error ? e.name : "Error") });
+     return undefined;
+   }
+ }
+@@ -183,7 +183,7 @@ async function injectRecall(
+     diag(harness, event, { ms: Date.now() - t0, count: observations.length });
+     return observations.length ? formatRecallFallback(observations, lead) : null;
+   } catch (e) {
+-    diag(harness, `${event}_failed`, { ms: Date.now() - t0, error: describeError(e) });
++    diag(harness, `${event}_failed`, { ms: Date.now() - t0, error: (e instanceof Error ? e.name : "Error") });
+     return undefined;
+   }
+ }
+@@ -200,17 +200,15 @@ async function reflectFallback(
+   prompt: string,
+   client: HookClient,
+   timeoutMs: number
+-): Promise<string | null | undefined> {
++): Promise<{ body: string | null | undefined; source?: "pages" | "observations" }> {
+   // Page search and recall share ONE retrieval budget after reflect fails, rather than each
+   // spending a full injectTimeoutMs and doubling the time added to the host's hook window.
+   const deadline = Date.now() + timeoutMs;
+   const remaining = () => Math.max(deadline - Date.now(), 1);
+-  return (
+-    (await injectPages(harness, prompt, client, remaining(), "reflect_fallback_pages")) ??
+-    // Event name predates the `injectRecall` rename and is kept: it is a logged contract that
+-    // other tools read, so renaming it would silently break them.
+-    (await injectRecall(harness, prompt, client, remaining(), "reflect_fallback_observations"))
+-  );
++  const pages = await injectPages(harness, prompt, client, remaining(), "reflect_fallback_pages");
++  if (pages !== null && pages !== undefined) return { body: pages, source: "pages" };
++  const observations = await injectRecall(harness, prompt, client, remaining(), "reflect_fallback_observations");
++  return { body: observations, source: observations ? "observations" : pages === null ? "pages" : undefined };
+ }
+ 
+ export interface HookOutput {
+@@ -223,6 +221,7 @@ export interface HookOutput {
+    *  SessionStart preamble from this too, so a turn can no longer be told both "no pages yet" and
+    *  a list of pages in the same context (#4607). Empty also signals a bank the engine never built. */
+   pages: PageRef[];
++  lifecycle: { status: "success" | "degraded" | "skipped" | "failed"; reason: string; source: "reflect" | "pages" | "observations" | "cached" | "none" };
+ }
+ 
+ /**
+@@ -248,6 +247,7 @@ export async function buildHookOutput(args: {
+   // cached as `reflectAnswer` (the field name predates the other sources).
+   let reflectAnswer = cached.reflectAnswer;
+   let reflectAttempts = cached.reflectAttempts ?? 0;
++  let retrievalFailure = cached.retrievalFailure;
+   let reflectRanThisTurn = false;
+   // Set by whichever source actually FAILED — reflect's catch, or a pages/recall helper returning
+   // undefined. An empty answer is not a failure: a source can legitimately have nothing to say on a
+@@ -256,11 +256,12 @@ export async function buildHookOutput(args: {
+   let reflectFailed = false;
+   // Set when reflect timed out / 5xx'd and a retrieval-only fallback supplied the memory instead.
+   let fallback: string | null | undefined;
++  let fallbackSource: "pages" | "observations" | undefined;
+   const deferInitialReflect = cached.deferInitialReflect === true;
+   if (deferInitialReflect) {
+     // A new bank has no useful history yet. Do not burn the once-per-session synthesis on prompt
+     // one; this marker is deliberately consumed below so prompt two remains eligible to reflect.
+-    diag(harness, "reflect_deferred_new_bank", { query: prompt.slice(0, 80) });
++    diag(harness, "reflect_deferred_new_bank");
+   } else if (cfg.autoInject === "pages" && reflectAnswer === undefined) {
+     reflectRanThisTurn = true;
+     reflectAttempts++;
+@@ -275,7 +276,8 @@ export async function buildHookOutput(args: {
+     // `undefined` is the search FAILING, distinct from `null` (it ran, nothing matched). These
+     // modes stayed silent on a failure while reflect announced one — the same turn looked healthy
+     // whether memory was unavailable or simply had nothing to say.
+-    if (got === undefined) reflectFailed = true;
++    if (got === undefined) { reflectFailed = true; retrievalFailure = "pages"; }
++    else retrievalFailure = undefined;
+     reflectAnswer = resolveInjection(got, reflectAttempts);
+   } else if (cfg.autoInject === "recall" && reflectAnswer === undefined) {
+     reflectRanThisTurn = true;
+@@ -288,7 +290,8 @@ export async function buildHookOutput(args: {
+       "inject_recall",
+       RECALL_INJECT_LEAD
+     );
+-    if (got === undefined) reflectFailed = true; // see the pages branch above
++    if (got === undefined) { reflectFailed = true; retrievalFailure = "observations"; } // see the pages branch above
++    else retrievalFailure = undefined;
+     reflectAnswer = resolveInjection(got, reflectAttempts);
+   } else if (cfg.autoInject === "reflect" && reflectAnswer === undefined) {
+     reflectRanThisTurn = true;
+@@ -306,13 +309,10 @@ export async function buildHookOutput(args: {
+         budget: "low",
+         timeoutMs,
+       });
++      retrievalFailure = undefined;
+       diag(harness, reflectAnswer ? "reflect_ok" : "reflect_empty", {
+         ms: Date.now() - t0,
+         chars: reflectAnswer.length,
+-        query: prompt.slice(0, 80),
+-        // Verbatim injected synthesis — the ONLY durable record of what the agent actually saw
+-        // (post-mortems otherwise depend on the harness happening to persist hook context).
+-        answer: reflectAnswer.slice(0, 8000),
+       });
+     } catch (e) {
+       // A failure is RETRYABLE, not an answer — `resolveInjection` leaves it unresolved until the
+@@ -326,21 +326,22 @@ export async function buildHookOutput(args: {
+           ? ""
+           : resolveInjection(undefined, reflectAttempts);
+       reflectFailed = true;
++      retrievalFailure = "reflect";
+       log.warn(harness, "reflect failed — session runs without memory", {
+-        error: describeError(e),
++        error: (e instanceof Error ? e.name : "Error"),
+       });
+       diag(harness, "reflect_failed", {
+         ms: Date.now() - t0,
+         bank: client.bank,
+         timeoutMs,
+-        // Wider than describeError's default: the server's error body is the useful part.
+-        error: describeError(e, 1500),
+-        query: prompt.slice(0, 80),
++        error: e instanceof Error ? e.name : "Error",
+       });
+       if (e instanceof ReflectError && e.fallbackEligible) {
+-        fallback = await reflectFallback(harness, prompt, client, cfg.injectTimeoutMs);
++        const recovered = await reflectFallback(harness, prompt, client, cfg.injectTimeoutMs);
++        fallback = recovered.body;
++        fallbackSource = recovered.source;
+         // The fallback body is cached exactly like a reflect answer: injected once, not retried.
+-        if (fallback) reflectAnswer = fallback;
++        if (fallback) { reflectAnswer = fallback; retrievalFailure = undefined; }
+       }
+     }
+   }
+@@ -348,6 +349,7 @@ export async function buildHookOutput(args: {
+   // ── knowledge-page roster (ids + titles only): refreshed on the cadence ────────
+   const cadence = cfg.pageRefreshEveryTurns;
+   const stale = !cached.pages || (cadence > 0 && turns - cached.pages.atTurn >= cadence);
++  let pagesDegraded = false;
+   let pages = cached.pages?.list ?? [];
+   if (stale) {
+     const t0 = Date.now();
+@@ -355,12 +357,13 @@ export async function buildHookOutput(args: {
+       pages = parsePageList(await client.listPages());
+       diag(harness, "pages_ok", { ms: Date.now() - t0, count: pages.length });
+     } catch (e) {
++      pagesDegraded = true;
+       diag(
+         harness,
+         client.knowledgePagesSupported === false ? "knowledge_pages_unavailable" : "pages_failed",
+         {
+           ms: Date.now() - t0,
+-          error: describeError(e),
++          error: e instanceof Error ? e.name : "Error",
+         }
+       );
+     }
+@@ -370,6 +373,7 @@ export async function buildHookOutput(args: {
+     turns,
+     reflectAnswer,
+     reflectAttempts,
++    retrievalFailure,
+     pages: { atTurn: stale ? turns : (cached.pages?.atTurn ?? turns), list: pages },
+   } satisfies SessionCache);
+ 
+@@ -399,9 +403,7 @@ export async function buildHookOutput(args: {
+   // knowledge is pulled via the hindsight_search_knowledge_pages tool, a visible tool call.
+   let notice: string | undefined;
+   if (fallback) {
+-    // Silent: the session still got memory, just not a synthesis. The notice used to say which
+-    // source answered and point at the diag file, but that read as an error on a turn that
+-    // worked; reflect_failed + reflect_fallback_* in the diag trail carry the details.
++    notice = brandWord() + " · reflection unavailable; using related " + (fallbackSource ?? "memory") + " instead";
+   } else if (reflectRanThisTurn && reflectAnswer) {
+     const q = prompt.replace(/\s+/g, " ").trim();
+     const excerpt = q.length > 48 ? `${q.slice(0, 48)}…` : q;
+@@ -421,35 +423,91 @@ export async function buildHookOutput(args: {
+     notice = `${brandWord()} · no memory this turn — see ${diagFilePath()}`;
+   }
+ 
+-  return { context: kept.length ? kept.join("\n\n") : undefined, notice, pages };
++  const cachedFailureSource = cfg.autoInject === "recall" ? "observations" : cfg.autoInject;
++  const cachedUnavailable = reflectAnswer === "" && retrievalFailure === cachedFailureSource;
++  const unavailable = reflectFailed || cachedUnavailable;
++  const lifecycle = fallback ? { status: "degraded" as const, reason: "reflect_fallback", source: (fallbackSource ?? "none") as "reflect" | "pages" | "observations" | "cached" | "none" } : unavailable || pagesDegraded ? { status: "degraded" as const, reason: unavailable ? "memory_unavailable" : "page_roster_unavailable", source: unavailable ? (retrievalFailure ?? "none") as "reflect" | "pages" | "observations" | "cached" | "none" : "cached" as const } : reflectRanThisTurn && reflectAnswer ? { status: "success" as const, reason: "memory_injected", source: cfg.autoInject === "reflect" ? "reflect" as const : cfg.autoInject === "pages" ? "pages" as const : "observations" as const } : reflectAnswer ? { status: "skipped" as const, reason: "cached_memory", source: "cached" as const } : { status: "skipped" as const, reason: cfg.autoInject === "none" ? "auto_inject_disabled" : deferInitialReflect ? "new_bank_warmup" : "no_memory_match", source: "none" as const };
++  return { context: kept.length ? kept.join("\n\n") : undefined, notice, pages, lifecycle };
+ }
+ 
+ /** Run one hook invocation: stdin event in, (maybe) an injection object on stdout. */
+ export async function runHook(
+   spec: HookSpec,
+   makeClient: (opts: ClientOpts) => HookClient = (o) => new HindsightClient(o)
++): Promise<void> {
++  const lifecycleStarted = Date.now();
++  let sessionId: string | undefined;
++  let bankId: string | undefined;
++  try {
++    await runHookImpl(spec, makeClient, lifecycleStarted, (session, bank) => {
++      sessionId = session;
++      bankId = bank;
++    });
++  } catch (error) {
++    try {
++      memoryLifecycle({
++        harness: spec.harness,
++        stage: "prompt",
++        status: "failed",
++        reason: "hook_setup_failed",
++        session: sessionId,
++        bank: bankId,
++        ms: Date.now() - lifecycleStarted,
++      });
++    } catch {
++      // Preserve the original host-facing error if diagnostics themselves fail.
++    }
++    throw error;
++  }
++}
++
++async function runHookImpl(
++  spec: HookSpec,
++  makeClient: (opts: ClientOpts) => HookClient,
++  lifecycleStarted: number,
++  correlate: (sessionId?: string, bankId?: string) => void
+ ): Promise<void> {
+   // Anti-recursion: the codebase survey's own headless session sets this so its hooks are a no-op.
+-  if (process.env.HINDSIGHT_DISABLE_HOOKS) return;
++  if (process.env.HINDSIGHT_DISABLE_HOOKS) {
++    memoryLifecycle({ harness: spec.harness, stage: "prompt", status: "skipped", reason: "hooks_disabled" });
++    return;
++  }
+ 
+   const ev = readHookEvent(spec.harness);
+-  if (!ev) return;
+-  if (spec.accept && !spec.accept(ev)) return;
++  if (!ev) {
++    memoryLifecycle({ harness: spec.harness, stage: "prompt", status: "unknown", reason: "event_missing" });
++    return;
++  }
++  if (spec.accept && !spec.accept(ev)) {
++    memoryLifecycle({ harness: spec.harness, stage: "prompt", status: "skipped", reason: "event_filtered" });
++    return;
++  }
+   const { prompt: rawPrompt, cwd: rawCwd, sessionId } = spec.parse(ev);
++  correlate(sessionId);
+   if (spec.toolHook?.accept(ev)) {
+     // Runs on every tool call, so it does nothing but hand over what a prompt hook stashed.
+-    const pending = sessionId ? takePendingContext(spec.harness, sessionId) : undefined;
+-    if (pending) process.stdout.write(JSON.stringify(spec.toolHook.emit(pending)));
++    const toolHook = spec.toolHook;
++    const pending = sessionId ? deliverPendingContext(spec.harness, sessionId, (context) => {
++      process.stdout.write(JSON.stringify(toolHook.emit(context)));
++    }) : false;
++    memoryLifecycle({ harness: spec.harness, stage: "prompt", status: pending ? "success" : "skipped", reason: pending ? "pending_context_delivered" : "no_pending_context", session: sessionId, ms: Date.now() - lifecycleStarted });
++    return;
++  }
++  if (spec.requireCwd && !rawCwd) {
++    memoryLifecycle({ harness: spec.harness, stage: "prompt", status: "skipped", reason: "cwd_missing", session: sessionId });
+     return;
+   }
+-  if (spec.requireCwd && !rawCwd) return;
+   const cwd = rawCwd || process.cwd();
+   const prompt = (rawPrompt || "").trim();
+-  if (!prompt) return;
++  if (!prompt) {
++    memoryLifecycle({ harness: spec.harness, stage: "prompt", status: "skipped", reason: "empty_prompt", session: sessionId });
++    return;
++  }
+ 
+   let cfg = loadConfig({ harness: spec.harness });
+   setLogLevel(cfg.logLevel);
+   if (cfg.disabled) {
++    memoryLifecycle({ harness: spec.harness, stage: "prompt", status: "skipped", reason: "globally_disabled", session: sessionId });
+     log.debug(spec.harness, "hook skipped: disabled");
+     return;
+   }
+@@ -467,11 +525,13 @@ export async function runHook(
+ 
+   const sessionRoot = sessionRootDir(spec.harness, sessionId, cwd);
+   const derived = deriveBankIdOrSkip(cfg, cwd, spec.harness, sessionRoot);
+-  if (derived === null) return; // repository unidentifiable: stay silent rather than invent a bank
++  if (derived === null) { memoryLifecycle({ harness: spec.harness, stage: "prompt", status: "skipped", reason: "bank_unresolved", session: sessionId }); return; } // repository unidentifiable: stay silent rather than invent a bank
+   const resolved = applyBankConfig(cfg, derived, cwd);
+   cfg = resolved.cfg;
+   const bankId = resolved.bankId;
++  correlate(sessionId, bankId);
+   if (cfg.disabled) {
++    memoryLifecycle({ harness: spec.harness, stage: "prompt", status: "skipped", reason: "bank_disabled", session: sessionId, bank: bankId });
+     log.debug(spec.harness, "hook skipped: bank disabled via banks override", { bank: bankId });
+     return;
+   }
+@@ -511,4 +571,5 @@ export async function runHook(
+     context = undefined;
+   }
+   if (context || output.notice) out(context, output.notice);
++  memoryLifecycle({ harness: spec.harness, stage: "prompt", status: output.lifecycle.status, reason: output.lifecycle.reason, source: output.lifecycle.source, session: sessionId, bank: bankId, ms: Date.now() - lifecycleStarted });
+ }
+diff --git a/hindsight-integrations/coding-agents/src/core/retain-hook.test.ts b/hindsight-integrations/coding-agents/src/core/retain-hook.test.ts
+index 9a6a0882..8ebdb839 100644
+--- a/hindsight-integrations/coding-agents/src/core/retain-hook.test.ts
++++ b/hindsight-integrations/coding-agents/src/core/retain-hook.test.ts
+@@ -6,12 +6,20 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import { deriveBankId } from "./bank";
+ import type { TransportTurn } from "./chat";
+ import { type RawConfig, resolveConfig } from "./config";
+-import type { HindsightClient } from "./hindsight";
++import { HindsightClient } from "./hindsight";
+ import { buildRetain, runRetainHook } from "./retain-hook";
+-import { fingerprintTurns, memoryCursorStore, type RetainCursorStore } from "./retain-cursor";
++import {
++  fingerprintTurns,
++  memoryCursorStore,
++  PENDING_MAX_AGE_MS,
++  PENDING_MAX_BYTES,
++  type RetainCursorStore,
++} from "./retain-cursor";
+ import { readCodexTranscript } from "./transcript-codex";
+ import { dcodeAssistantText } from "./transcript-dcode";
+ import { memoryUsageCursorStore } from "./usage";
++import { fileCursorStore } from "./session-cache";
++import { readClaudeTranscript } from "./transcript";
+ 
+ /** The Stop event `runRetainHook` reads from fd 0; every other read stays real. */
+ let stdin = "";
+@@ -570,6 +578,168 @@ describe("buildRetain", () => {
+     expect(tags).toEqual(["source:chat", "harness:claude-code"]);
+   });
+ 
++  it("reports completed when the existing operation endpoint confirms completion on an empty Stop", async () => {
++    const cursors = memoryCursorStore();
++    const operationId = "9562d23d-c1c9-5f61-baf9-9edad9600553";
++    cursors.write("sess-complete", { turns: 0, fingerprint: fingerprintTurns([], 0), bank: "coding-agent::repo", appendSupported: true, ops: [operationId] });
++    const req = vi.fn(async () => new Response(JSON.stringify({ status: "completed" }), { status: 200 }));
++    const client = { bank: "coding-agent::repo", bankUrl: (path: string) => path, supportsAppendRetain: async () => true, req, retain: vi.fn() } as unknown as HindsightClient;
++    const outcome = await buildRetain({ harness: "codex", sessionId: "sess-complete", transcriptPath: file, client, cursors, readTranscript: () => [] });
++    expect(req).toHaveBeenCalledOnce();
++    expect(outcome).toMatchObject({ status: "completed", reason: "prior_operation_completed", pendingCount: 0 });
++    expect(outcome.submitted).toBe(false);
++    expect(cursors.read("sess-complete")?.ops).toBeUndefined();
++  });
++
++  it("cancels an unread real-client 404 operation response while keeping its ID unknown", async () => {
++    const cursors = memoryCursorStore();
++    const operationId = "8124a8d1-4a45-4964-a21d-813d3f4c69c1";
++    cursors.write("sess-status-404-stream", {
++      turns: 0,
++      fingerprint: fingerprintTurns([], 0),
++      bank: "coding-agent::repo",
++      appendSupported: true,
++      ops: [operationId],
++    });
++    const cancel = vi.fn();
++    const body = new ReadableStream<Uint8Array>({
++      start(controller) {
++        controller.enqueue(new TextEncoder().encode("private 404 body"));
++      },
++      cancel,
++    });
++    const client = new HindsightClient({ apiUrl: "http://hindsight.test", bank: "coding-agent::repo" });
++    vi.stubGlobal("fetch", vi.fn(async () => new Response(body, { status: 404 })));
++
++    const outcome = await buildRetain({
++      harness: "codex",
++      sessionId: "sess-status-404-stream",
++      transcriptPath: file,
++      client,
++      cursors,
++      readTranscript: () => [],
++    });
++
++    expect(cancel).toHaveBeenCalledOnce();
++    expect(outcome).toMatchObject({
++      status: "unknown",
++      reason: "prior_operation_unconfirmed",
++      operationIds: [operationId],
++      pendingCount: 1,
++    });
++    expect(cursors.read("sess-status-404-stream")?.ops).toEqual([operationId]);
++    expect(JSON.stringify(outcome)).not.toContain("private 404 body");
++  });
++
++  it.each([
++    { label: "pending", status: "pending", expected: "accepted_pending", reason: "operation_pending" },
++    { label: "failed", status: "failed", expected: "failed", reason: "prior_operation_failed" },
++    { label: "pruned", status: 404, expected: "unknown", reason: "prior_operation_unconfirmed" },
++    { label: "unrecognized", status: "mystery", expected: "unknown", reason: "prior_operation_unconfirmed" },
++  ])("keeps  operation status distinct from completion", async ({ status, expected, reason }) => {
++    const cursors = memoryCursorStore();
++    const operationId = "9562d23d-c1c9-5f61-baf9-9edad9600553";
++    cursors.write("sess-settle", { turns: 0, fingerprint: fingerprintTurns([], 0), bank: "coding-agent::repo", appendSupported: true, ops: [operationId] });
++    const response = status === 404 ? new Response("", { status: 404 }) : new Response(JSON.stringify({ status }), { status: 200 });
++    const req = vi.fn(async () => response);
++    const client = { bank: "coding-agent::repo", bankUrl: (path: string) => path, supportsAppendRetain: async () => true, req, retain: vi.fn() } as unknown as HindsightClient;
++    const outcome = await buildRetain({ harness: "codex", sessionId: "sess-settle", transcriptPath: file, client, cursors, readTranscript: () => [] });
++    expect(req).toHaveBeenCalledOnce();
++    expect(outcome).toMatchObject({ status: expected, reason });
++    if (expected === "unknown") expect(cursors.read("sess-settle")?.ops).toEqual([operationId]);
++    if (expected === "failed") expect(cursors.read("sess-settle")?.dirty).toBe(true);
++  });
++
++  it("preserves unknown IDs when an empty Stop settles mixed failed and 404 operations", async () => {
++    const cursors = memoryCursorStore();
++    const failedId = "9562d23d-c1c9-5f61-baf9-9edad9600553";
++    const unknownId = "8124a8d1-4a45-4964-a21d-813d3f4c69c1";
++    cursors.write("sess-mixed-settle", {
++      turns: 0,
++      fingerprint: fingerprintTurns([], 0),
++      bank: "coding-agent::repo",
++      appendSupported: true,
++      ops: [failedId, unknownId],
++    });
++    const req = vi.fn(async (_method: string, url: string) =>
++      url.endsWith(failedId)
++        ? new Response(JSON.stringify({ status: "failed" }), { status: 200 })
++        : new Response(null, { status: 404 })
++    );
++    const retain = vi.fn();
++    const client = {
++      bank: "coding-agent::repo",
++      bankUrl: (path: string) => path,
++      supportsAppendRetain: async () => true,
++      req,
++      retain,
++    } as unknown as HindsightClient;
++
++    const outcome = await buildRetain({
++      harness: "codex",
++      sessionId: "sess-mixed-settle",
++      transcriptPath: file,
++      client,
++      cursors,
++      readTranscript: () => [],
++    });
++
++    expect(req).toHaveBeenCalledTimes(2);
++    expect(retain).not.toHaveBeenCalled();
++    expect(outcome).toMatchObject({
++      status: "failed",
++      reason: "prior_operation_failed",
++      operationIds: [unknownId],
++      pendingCount: 1,
++    });
++    expect(cursors.read("sess-mixed-settle")).toMatchObject({
++      dirty: true,
++      ops: [unknownId],
++      turns: 0,
++    });
++  });
++
++  it("preserves unresolved IDs when append support is unavailable during an empty Stop", async () => {
++    const cursors = memoryCursorStore();
++    const operationId = "9562d23d-c1c9-5f61-baf9-9edad9600553";
++    const cursor = {
++      turns: 0,
++      fingerprint: fingerprintTurns([], 0),
++      bank: "coding-agent::repo",
++      ops: [operationId],
++    };
++    cursors.write("sess-no-append", cursor);
++    const req = vi.fn(async () => new Response(null, { status: 404 }));
++    const supportsAppendRetain = vi.fn(async () => false);
++    const retain = vi.fn();
++    const client = {
++      bank: "coding-agent::repo",
++      bankUrl: (path: string) => path,
++      supportsAppendRetain,
++      req,
++      retain,
++    } as unknown as HindsightClient;
++
++    const outcome = await buildRetain({
++      harness: "codex",
++      sessionId: "sess-no-append",
++      transcriptPath: file,
++      client,
++      cursors,
++      readTranscript: () => [],
++    });
++
++    expect(req).toHaveBeenCalledOnce();
++    expect(supportsAppendRetain).not.toHaveBeenCalled();
++    expect(retain).not.toHaveBeenCalled();
++    expect(outcome).toMatchObject({
++      status: "unknown",
++      reason: "prior_operation_unconfirmed",
++      operationIds: [operationId],
++    });
++    expect(cursors.read("sess-no-append")?.ops).toEqual([operationId]);
++  });
++
+   it("empty transcript -> no retain", async () => {
+     const lines = [
+       // isMeta line: dropped
+@@ -596,6 +766,34 @@ describe("buildRetain", () => {
+     expect(retainSpy).not.toHaveBeenCalled();
+   });
+ 
++  it("reports a permanent retain rejection as failed", async () => {
++    writeFileSync(file, JSON.stringify({ type: "user", timestamp: "2026-01-01T00:00:00Z", message: { role: "user", content: "hello" } }));
++    const error = Object.assign(new Error("rejected"), { status: 400 });
++    const client = { retain: vi.fn().mockRejectedValue(error) } as unknown as HindsightClient;
++    await expect(buildRetain({ harness: "claude-code", sessionId: "sess-rejected", transcriptPath: file, client })).resolves.toMatchObject({ status: "failed", reason: "write_rejected" });
++  });
++
++  it("classifies a real client 403 retain rejection as failed without copying its body", async () => {
++    const secretBody = "private server response";
++    const client = new HindsightClient({ apiUrl: "http://hindsight.test", bank: "coding-agent::repo" });
++    vi.spyOn(client, "supportsAppendRetain").mockResolvedValue(false);
++    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ detail: secretBody }), { status: 403 })));
++
++    const outcome = await buildRetain({
++      harness: "claude-code",
++      sessionId: "sess-http-rejected",
++      transcriptPath: file,
++      client,
++      cursors: memoryCursorStore(),
++      usageCursors: memoryUsageCursorStore(),
++      readTranscript: () => [{ role: "user", content: "a useful turn", timestamp: "2026-01-01T00:00:00Z" }],
++    });
++
++    expect(outcome).toMatchObject({ status: "failed", reason: "write_rejected" });
++    expect(JSON.stringify(outcome)).not.toContain(secretBody);
++    expect(JSON.stringify(outcome)).not.toContain("a useful turn");
++  });
++
+   it("fails open on retain error", async () => {
+     writeFileSync(
+       file,
+@@ -616,7 +814,7 @@ describe("buildRetain", () => {
+         transcriptPath: file,
+         client,
+       })
+-    ).resolves.toBeUndefined();
++    ).resolves.toMatchObject({ status: "unknown", reason: "outcome_unknown" });
+   });
+ });
+ 
+@@ -629,6 +827,7 @@ describe("runRetainHook anti-recursion guard", () => {
+   });
+ 
+   it("HINDSIGHT_DISABLE_HOOKS set -> returns immediately, never reads stdin or builds a client", async () => {
++    vi.stubEnv("HINDSIGHT_DIAG_FILE", join(root, "diag.log"));
+     process.env.HINDSIGHT_DISABLE_HOOKS = "1";
+     const makeClient = vi.fn();
+     // No stdin is provided/mocked here — if the guard didn't return before `readFileSync(0, ...)`,
+@@ -639,6 +838,7 @@ describe("runRetainHook anti-recursion guard", () => {
+       makeClient
+     );
+     expect(makeClient).not.toHaveBeenCalled();
++    expect(readFileSync(join(root, "diag.log"), "utf8")).toContain('"reason":"hooks_disabled"');
+   });
+ });
+ 
+@@ -652,7 +852,7 @@ describe("buildRetain — incremental write-back across Stop hooks", () => {
+ 
+   /** One Stop-hook invocation over the transcript as it stands. Each hook run is a fresh process in
+    *  production, so only the cursor store carries state between these calls. */
+-  const stop = async (client: HindsightClient, cursors: RetainCursorStore) =>
++  const stop = async (client: HindsightClient | undefined, cursors: RetainCursorStore) =>
+     buildRetain({
+       harness: "codex",
+       sessionId: "sess-append",
+@@ -668,7 +868,9 @@ describe("buildRetain — incremental write-back across Stop hooks", () => {
+       client: {
+         retain,
+         bank: "coding-agent::repo",
++        bankUrl: (path: string) => path,
+         supportsAppendRetain: async () => true,
++        req: vi.fn(async () => new Response(JSON.stringify({ status: "completed" }), { status: 200 })),
+       } as unknown as HindsightClient,
+     };
+   };
+@@ -697,8 +899,9 @@ describe("buildRetain — incremental write-back across Stop hooks", () => {
+     const { retain, client } = stubClient();
+     const cursors = memoryCursorStore();
+     writeFileSync(file, [line(0), line(1)].join("\n"));
+-    await stop(client, cursors);
+-    await stop(client, cursors);
++    const first = await stop(client, cursors);
++    const second = await stop(client, cursors);
++    expect(first.status).toBe("accepted_pending");
+     expect(retain).toHaveBeenCalledTimes(1);
+   });
+ 
+@@ -728,6 +931,180 @@ describe("buildRetain — incremental write-back across Stop hooks", () => {
+     expect(JSON.parse(rewritten[1])).toMatchObject({ content: "summary of the work so far" });
+   });
+ 
++  it("replays an eligible buffered append without resetting the cursor, then skips the full transcript", async () => {
++    const { retain, client } = stubClient();
++    const cursors = memoryCursorStore();
++    writeFileSync(file, [line(0), line(1)].join("\n"));
++    const originalTurns = readClaudeTranscript(file);
++    const original = {
++      turns: originalTurns.length,
++      fingerprint: fingerprintTurns(originalTurns, originalTurns.length),
++      bank: "coding-agent::repo",
++      paths: [file],
++      appendSupported: true,
++      pending: [{ content: JSON.stringify(originalTurns[1]), operationId: "pending-op", at: Date.now() }],
++    };
++    cursors.write("sess-append", original);
++    writeFileSync(file, "");
++
++    const outcome = await stop(client, cursors);
++    expect(outcome.status).toBe("accepted_pending");
++    expect(retain).toHaveBeenCalledTimes(1);
++    expect(retain.mock.calls[0][0]).toBe(original.pending[0].content);
++    expect(retain.mock.calls[0][5]).toMatchObject({ operationId: "pending-op", updateMode: "append" });
++    expect(cursors.read("sess-append")).toMatchObject({
++      turns: original.turns,
++      fingerprint: original.fingerprint,
++      paths: original.paths,
++      bank: original.bank,
++      appendSupported: true,
++    });
++    expect(cursors.read("sess-append")?.pending).toBeUndefined();
++
++    (client.req as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
++      new Response(JSON.stringify({ status: "completed" }), { status: 200 })
++    );
++    writeFileSync(file, [line(0), line(1)].join("\n"));
++    const next = await stop(client, cursors);
++    expect(next).toMatchObject({ status: "completed", reason: "prior_operation_completed" });
++    expect(retain).toHaveBeenCalledTimes(1);
++    expect(cursors.read("sess-append")).toMatchObject({
++      turns: original.turns,
++      fingerprint: original.fingerprint,
++      paths: original.paths,
++      bank: original.bank,
++    });
++  });
++
++  it("checks the bank before status settlement or replay and leaves the original cursor untouched", async () => {
++    const { retain, client } = stubClient();
++    const cursors = memoryCursorStore();
++    const cursor = {
++      turns: 0,
++      fingerprint: fingerprintTurns([], 0),
++      bank: "old-bank",
++      paths: [file],
++      appendSupported: true,
++      ops: ["0123456789abcdef0123456789abcdef"],
++      pending: [{ content: JSON.stringify({ role: "user", content: "private-buffer" }), operationId: "pending-op", at: Date.now() }],
++    };
++    cursors.write("sess-append", cursor);
++    writeFileSync(file, "");
++    const capability = vi.spyOn(client, "supportsAppendRetain");
++
++    const outcome = await stop(client, cursors);
++
++    expect(outcome).toMatchObject({
++      status: "unknown",
++      reason: "bank_mismatch",
++      operationIds: ["0123456789abcdef0123456789abcdef", "pending-op"],
++      pendingCount: 2,
++    });
++    expect(outcome.pendingCount).toBe(outcome.operationIds.length);
++    expect(capability).not.toHaveBeenCalled();
++    expect(client.req).not.toHaveBeenCalled();
++    expect(retain).not.toHaveBeenCalled();
++    expect(cursors.read("sess-append")).toEqual(cursor);
++  });
++
++  it.each(["expired", "oversized"] as const)("defers an %s empty replay without modifying its cursor", async (condition) => {
++    const { retain, client } = stubClient();
++    const cursors = memoryCursorStore();
++    const payload = condition === "expired" ? JSON.stringify({ role: "user", content: "old" }) : "x".repeat(PENDING_MAX_BYTES + 1);
++    const cursor = {
++      turns: 0,
++      fingerprint: fingerprintTurns([], 0),
++      bank: "coding-agent::repo",
++      paths: [file],
++      appendSupported: true,
++      pending: [{
++        content: payload,
++        operationId: "pending-op",
++        at: condition === "expired" ? Date.now() - PENDING_MAX_AGE_MS - 1 : Date.now(),
++      }],
++    };
++    cursors.write("sess-append", cursor);
++    writeFileSync(file, "");
++    const outcome = await stop(client, cursors);
++
++    expect(outcome).toMatchObject({
++      status: "unknown",
++      reason: "pending_replay_deferred",
++      operationIds: ["pending-op"],
++      pendingCount: 1,
++    });
++    expect(client.req).not.toHaveBeenCalled();
++    expect(retain).not.toHaveBeenCalled();
++    expect(cursors.read("sess-append")).toEqual(cursor);
++  });
++
++  it("defers a buffered replay as unknown when no client can submit it", async () => {
++    const cursors = memoryCursorStore();
++    const payload = JSON.stringify({ role: "user", content: "not yet submitted" });
++    const cursor = {
++      turns: 0,
++      fingerprint: fingerprintTurns([], 0),
++      bank: "coding-agent::repo",
++      paths: [file],
++      appendSupported: true,
++      pending: [{ content: payload, operationId: "deferred-op", at: Date.now() }],
++    };
++    cursors.write("sess-append", cursor);
++    writeFileSync(file, "");
++    const outcome = await stop(undefined, cursors);
++    expect(outcome).toMatchObject({
++      status: "unknown",
++      reason: "pending_replay_deferred",
++      operationIds: ["deferred-op"],
++      pendingCount: 1,
++    });
++    expect(cursors.read("sess-append")).toEqual(cursor);
++  });
++
++  it("keeps an operation unknown without a client after a prior 404 status check", async () => {
++    const { retain, client } = stubClient();
++    const cursors = memoryCursorStore();
++    writeFileSync(file, [line(0)].join("\n"));
++    await stop(client, cursors);
++    const operationId = cursors.read("sess-append")?.ops?.[0];
++    expect(operationId).toBeDefined();
++
++    (client.req as ReturnType<typeof vi.fn>).mockResolvedValueOnce(new Response(null, { status: 404 }));
++    const checked = await stop(client, cursors);
++    expect(checked.status).toBe("unknown");
++    expect(cursors.read("sess-append")?.ops).toContain(operationId);
++
++    writeFileSync(file, "");
++    const withoutClient = await stop(undefined, cursors);
++    expect(withoutClient).toMatchObject({
++      status: "unknown",
++      reason: "prior_operation_unconfirmed",
++      operationIds: [operationId],
++      pendingCount: 1,
++    });
++    expect(withoutClient.pendingCount).toBe(withoutClient.operationIds?.length);
++    expect(cursors.read("sess-append")?.ops).toContain(operationId);
++    expect(retain).toHaveBeenCalledTimes(1);
++  });
++
++  it("keeps a dirty write claim unknown when no transcript content can rebuild it", async () => {
++    const { retain, client } = stubClient();
++    const cursors = memoryCursorStore();
++    const dirty = {
++      turns: 1,
++      fingerprint: fingerprintTurns([{ role: "user", content: "lost turn" }], 1),
++      bank: "coding-agent::repo",
++      appendSupported: true,
++      dirty: true,
++    };
++    cursors.write("sess-append", dirty);
++    writeFileSync(file, "");
++    const outcome = await stop(client, cursors);
++    expect(outcome).toMatchObject({ status: "unknown", reason: "prior_operation_unconfirmed" });
++    expect(retain).not.toHaveBeenCalled();
++    expect(cursors.read("sess-append")).toEqual(dirty);
++  });
++
+   it("a failed write is not silently skipped by the next one — it is replayed", async () => {
+     const { retain, client } = stubClient();
+     const cursors = memoryCursorStore();
+@@ -808,6 +1185,237 @@ describe("runRetainHook honors retainSessions", () => {
+     return { retain, makeClient };
+   };
+ 
++  it("reports unexpected Stop setup errors and preserves the original throw", async () => {
++    const broken = {
++      ...spec,
++      parse: () => { throw new Error("private transcript path"); },
++    };
++    const makeClient = vi.fn();
++    await expect(runRetainHook(broken, makeClient)).rejects.toThrow("private transcript path");
++    expect(makeClient).not.toHaveBeenCalled();
++    const row = JSON.parse(readFileSync(join(root, "diag.log"), "utf8").trim().split("\n").at(-1)!);
++    expect(row).toMatchObject({
++      event: "memory_lifecycle",
++      stage: "stop",
++      status: "failed",
++      reason: "hook_setup_failed",
++    });
++    expect(JSON.stringify(row)).not.toContain("private transcript path");
++  });
++
++  it.each([
++    { response: () => new Response(JSON.stringify({ status: "failed" }), { status: 200 }), priorOperationStatus: "failed" },
++    { response: () => new Response(null, { status: 404 }), priorOperationStatus: "unknown" },
++  ] as const)("keeps prior settlement beside the accepted repair submission", async ({ response, priorOperationStatus }) => {
++    const sessionId = event().session_id;
++    const cursors = fileCursorStore(spec.harness);
++    const bankId = deriveBankId(resolveConfig(), root, spec.harness, root);
++    const initial = readClaudeTranscript(file);
++    const priorOperationId = "0123456789abcdef0123456789abcdef";
++    cursors.write(sessionId, {
++      turns: initial.length,
++      fingerprint: fingerprintTurns(initial, initial.length),
++      bank: bankId,
++      paths: [file],
++      appendSupported: true,
++      ops: [priorOperationId],
++    });
++    const appendedLine = JSON.stringify({
++      type: "user",
++      timestamp: "2026-01-01T00:00:01Z",
++      message: { role: "user", content: "and retain the follow-up" },
++    });
++    writeFileSync(file, readFileSync(file, "utf8") + String.fromCharCode(10) + appendedLine);
++    const retain = vi.fn().mockResolvedValue(undefined);
++    const req = vi.fn(response);
++    const makeClient = vi.fn(() => ({
++      retain,
++      supportsAppendRetain: async () => true,
++      bank: bankId,
++      bankUrl: (path: string) => path,
++      req,
++    })) as unknown as Parameters<typeof runRetainHook>[1];
++
++    try {
++      await runRetainHook(spec, makeClient);
++      expect(req).toHaveBeenCalledTimes(1);
++      expect(retain).toHaveBeenCalledTimes(1);
++      const rows = readFileSync(join(root, "diag.log"), "utf8").trim().split(String.fromCharCode(10)).map((line) => JSON.parse(line));
++      const lifecycle = rows.find((row) => row.event === "memory_lifecycle" && row.stage === "stop");
++      expect(lifecycle).toMatchObject({
++        status: "accepted_pending",
++        reason: "submission_accepted",
++        submitted: true,
++        priorOperationStatus,
++      });
++      if (priorOperationStatus === "unknown") expect(lifecycle.operationIds).toContain(priorOperationId);
++    } finally {
++      rmSync(join(tmpdir(), "hindsight-" + spec.harness, sessionId + ".retain.json"), { force: true });
++    }
++  });
++
++  it("preserves an unresolved operation in a mixed settlement on an empty public Stop", async () => {
++    const sessionId = event().session_id;
++    const cursors = fileCursorStore(spec.harness);
++    const bankId = deriveBankId(resolveConfig(), root, spec.harness, root);
++    const failedId = "9562d23d-c1c9-5f61-baf9-9edad9600553";
++    const unknownId = "8124a8d1-4a45-4964-a21d-813d3f4c69c1";
++    cursors.write(sessionId, {
++      turns: 0,
++      fingerprint: fingerprintTurns([], 0),
++      bank: bankId,
++      appendSupported: true,
++      ops: [failedId, unknownId],
++    });
++    writeFileSync(file, "");
++    const req = vi.fn(async (_method: string, url: string) =>
++      url.endsWith(failedId)
++        ? new Response(JSON.stringify({ status: "failed" }), { status: 200 })
++        : new Response(null, { status: 404 })
++    );
++    const retain = vi.fn();
++    const makeClient = vi.fn(() => ({
++      retain,
++      supportsAppendRetain: async () => true,
++      bank: bankId,
++      bankUrl: (path: string) => path,
++      req,
++    })) as unknown as Parameters<typeof runRetainHook>[1];
++
++    try {
++      await runRetainHook(spec, makeClient);
++      expect(req).toHaveBeenCalledTimes(2);
++      expect(retain).not.toHaveBeenCalled();
++      expect(cursors.read(sessionId)).toMatchObject({ dirty: true, turns: 0, ops: [unknownId] });
++      const rows = readFileSync(join(root, "diag.log"), "utf8").trim().split(String.fromCharCode(10)).map((line) => JSON.parse(line));
++      const lifecycle = rows.find((row) => row.event === "memory_lifecycle" && row.stage === "stop");
++      expect(lifecycle).toMatchObject({
++        status: "failed",
++        reason: "prior_operation_failed",
++        operationIds: [unknownId],
++        pendingCount: 1,
++        submitted: false,
++      });
++    } finally {
++      rmSync(join(tmpdir(), "hindsight-" + spec.harness, sessionId + ".retain.json"), { force: true });
++    }
++  });
++
++  it("a write-back opt-out precedes missing-locator replay and preserves pending bytes", async () => {
++    const sessionId = event().session_id;
++    const cursors = fileCursorStore(spec.harness);
++    const bankId = deriveBankId(resolveConfig(), root, spec.harness, root);
++    const original = {
++      turns: 0,
++      fingerprint: fingerprintTurns([], 0),
++      bank: bankId,
++      paths: [file],
++      appendSupported: true,
++      pending: [{ content: JSON.stringify({ role: "user", content: "keep while opted out" }), operationId: "opted-out-pending", at: Date.now() }],
++    };
++    rawConfig = { retainSessions: false };
++    cursors.write(sessionId, original);
++    stdin = JSON.stringify({ session_id: sessionId, cwd: root });
++    const makeClient = vi.fn();
++    try {
++      await runRetainHook(spec, makeClient as unknown as Parameters<typeof runRetainHook>[1]);
++      expect(makeClient).not.toHaveBeenCalled();
++      expect(cursors.read(sessionId)).toEqual(original);
++      const rows = readFileSync(join(root, "diag.log"), "utf8").trim().split(String.fromCharCode(10)).map((line) => JSON.parse(line));
++      expect(rows.at(-1)).toMatchObject({
++        event: "memory_lifecycle",
++        stage: "stop",
++        status: "unknown",
++        reason: "pending_replay_deferred",
++        bank: expect.any(String),
++      });
++    } finally {
++      rawConfig = {};
++      rmSync(join(tmpdir(), "hindsight-" + spec.harness, sessionId + ".retain.json"), { force: true });
++    }
++  });
++
++  it("runRetainHook replays only the exact durable outbox when the host omits transcript_path", async () => {
++    const sessionId = event().session_id;
++    const cursors = fileCursorStore(spec.harness);
++    const bankId = deriveBankId(resolveConfig({ serverMode: "self-hosted", apiUrl: "http://127.0.0.1:1" }), root, spec.harness, root);
++    const original = {
++      turns: 0,
++      fingerprint: fingerprintTurns([], 0),
++      bank: bankId,
++      paths: [file],
++      appendSupported: true,
++      pending: [{ content: JSON.stringify({ role: "user", content: "durable buffered turn" }), operationId: "missing-locator-op", at: Date.now() }],
++    };
++    cursors.write(sessionId, original);
++    stdin = JSON.stringify({ session_id: sessionId, cwd: root });
++    const retain = vi.fn().mockResolvedValue(undefined);
++    const req = vi.fn();
++    const makeClient = vi.fn(() => ({
++      retain,
++      supportsAppendRetain: async () => true,
++      bank: bankId,
++      bankUrl: (path: string) => path,
++      req,
++    })) as unknown as Parameters<typeof runRetainHook>[1];
++
++    try {
++      await runRetainHook(spec, makeClient);
++      expect(makeClient).toHaveBeenCalledTimes(1);
++      expect(retain).toHaveBeenCalledTimes(1);
++      expect(retain.mock.calls[0][0]).toBe(original.pending[0].content);
++      expect(retain.mock.calls[0][5]).toMatchObject({ operationId: "missing-locator-op", updateMode: "append" });
++      expect(req).not.toHaveBeenCalled();
++      expect(cursors.read(sessionId)).toMatchObject({
++        turns: original.turns,
++        fingerprint: original.fingerprint,
++        paths: original.paths,
++        bank: original.bank,
++        appendSupported: true,
++      });
++      expect(cursors.read(sessionId)?.pending).toBeUndefined();
++      const rows = readFileSync(join(root, "diag.log"), "utf8").trim().split(String.fromCharCode(10)).map((line) => JSON.parse(line));
++      expect(rows).toContainEqual(expect.objectContaining({
++        event: "memory_lifecycle",
++        stage: "stop",
++        status: "accepted_pending",
++        reason: "submission_accepted",
++        bank: expect.any(String),
++      }));
++    } finally {
++      rmSync(join(tmpdir(), "hindsight-" + spec.harness, sessionId + ".retain.json"), { force: true });
++    }
++  });
++
++  it.each(["dirty", "bank-mismatch"] as const)("missing transcript_path preserves %s cursor without an empty write", async (condition) => {
++    const sessionId = event().session_id;
++    const cursors = fileCursorStore(spec.harness);
++    const bankId = deriveBankId(resolveConfig({ serverMode: "self-hosted", apiUrl: "http://127.0.0.1:1" }), root, spec.harness, root);
++    const original = condition === "dirty"
++      ? { turns: 1, fingerprint: fingerprintTurns([{ role: "user", content: "unknown" }], 1), bank: bankId, appendSupported: true, dirty: true, ops: ["dirty-operation-123456"] }
++      : { turns: 0, fingerprint: fingerprintTurns([], 0), bank: "different-bank", paths: [file], appendSupported: true, pending: [{ content: JSON.stringify({ role: "user", content: "keep" }), operationId: "mismatch-op", at: Date.now() }] };
++    cursors.write(sessionId, original);
++    stdin = JSON.stringify({ session_id: sessionId, cwd: root });
++    const retain = vi.fn();
++    const req = vi.fn();
++    const makeClient = vi.fn(() => ({
++      retain,
++      supportsAppendRetain: async () => true,
++      bank: bankId,
++      bankUrl: (path: string) => path,
++      req,
++    })) as unknown as Parameters<typeof runRetainHook>[1];
++
++    try {
++      await runRetainHook(spec, makeClient);
++      expect(retain).not.toHaveBeenCalled();
++      expect(req).not.toHaveBeenCalled();
++      expect(cursors.read(sessionId)).toEqual(original);
++    } finally {
++      rmSync(join(tmpdir(), "hindsight-" + spec.harness, sessionId + ".retain.json"), { force: true });
++    }
++  });
++
+   it("writes the transcript back by default", async () => {
+     const { retain, makeClient } = stubClient();
+     await runRetainHook(spec, makeClient);
+@@ -858,6 +1466,14 @@ describe("runRetainHook honors retainSessions", () => {
+     const optedOut = stubClient();
+     await runRetainHook(spec, optedOut.makeClient);
+     expect(optedOut.retain).not.toHaveBeenCalled();
++    const diagnostics = readFileSync(join(root, "diag.log"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
++    expect(diagnostics).toContainEqual(expect.objectContaining({
++      event: "memory_lifecycle",
++      stage: "stop",
++      status: "skipped",
++      reason: "bank_disabled",
++      bank: expect.any(String),
++    }));
+ 
+     rawConfig = { banks: { "some-other-bank": { retainSessions: false } } };
+     const untouched = stubClient();
+@@ -865,6 +1481,23 @@ describe("runRetainHook honors retainSessions", () => {
+     expect(untouched.retain).toHaveBeenCalledTimes(1);
+   });
+ 
++  it("reports a bank-specific disabled override with its resolved bank", async () => {
++    const bankId = deriveBankId(resolveConfig(), root, spec.harness, root);
++    rawConfig = { banks: { [bankId]: { disabled: true } } };
++    const { retain, makeClient } = stubClient();
++    await runRetainHook(spec, makeClient);
++    expect(retain).not.toHaveBeenCalled();
++    expect(makeClient).not.toHaveBeenCalled();
++    const diagnostics = readFileSync(join(root, "diag.log"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
++    expect(diagnostics).toContainEqual(expect.objectContaining({
++      event: "memory_lifecycle",
++      stage: "stop",
++      status: "skipped",
++      reason: "bank_disabled",
++      bank: expect.any(String),
++    }));
++  });
++
+   it("a banks.<id> override turns write-back back on under a global opt-out", async () => {
+     const bankId = deriveBankId(resolveConfig(), root, spec.harness, root);
+     rawConfig = { retainSessions: false, banks: { [bankId]: { retainSessions: true } } };
+diff --git a/hindsight-integrations/coding-agents/src/core/retain-hook.ts b/hindsight-integrations/coding-agents/src/core/retain-hook.ts
+index 0507e5ec..e48a9034 100644
+--- a/hindsight-integrations/coding-agents/src/core/retain-hook.ts
++++ b/hindsight-integrations/coding-agents/src/core/retain-hook.ts
+@@ -17,8 +17,8 @@ import { deriveBankIdOrSkip } from "./bank";
+ import { retainLiveSession } from "./chat";
+ import { applyBankConfig, loadConfig } from "./config";
+ import { DAEMON_WAIT_RETAIN_MS, ensureDaemon } from "./daemon";
+-import { diag, readHookEvent } from "./diag";
+-import { describeError, log, setLogLevel } from "./log";
++import { diag, memoryLifecycle, readHookEvent } from "./diag";
++import { log, setLogLevel } from "./log";
+ import type { ClientOpts } from "./hindsight";
+ import { HindsightClient } from "./hindsight";
+ import type { RetainCursorStore } from "./retain-cursor";
+@@ -99,7 +99,7 @@ interface RetainClient {
+ export async function buildRetain(args: {
+   harness: string;
+   sessionId: string;
+-  transcriptPath: string;
++  transcriptPath?: string;
+   /** Absent when write-back is off: usage is still recorded, nothing is retained (#5391). */
+   client?: RetainClient;
+   readTranscript?: TranscriptReader;
+@@ -115,14 +115,23 @@ export async function buildRetain(args: {
+   bankId?: string;
+   /** Injectable for tests; defaults to the per-session temp file. */
+   usageCursors?: UsageCursorStore;
+-}): Promise<void> {
++}): Promise<{
++  status: "skipped" | "accepted_pending" | "completed" | "failed" | "unknown";
++  reason: string;
++  operationIds?: string[];
++  pendingCount?: number;
++  submitted?: boolean;
++  priorOperationStatus?: "accepted_pending" | "completed" | "failed" | "unknown";
++  bufferedOperationIds?: string[];
++  deferReason?: "host_budget";
++}> {
+   const { harness, sessionId, transcriptPath, client } = args;
+   const readTranscript = args.readTranscript ?? readClaudeTranscript;
+ 
+-  const turns = readTranscript(transcriptPath);
++  const turns = transcriptPath ? readTranscript(transcriptPath) : [];
+   // Decode BEFORE stripping/trimming: the raw field can be a serialized content-block list rather
+   // than prose (see LastMessageReader), and the injected-memory tags live inside its text blocks.
+-  const decoded = args.lastAssistantMessage
++  const decoded = transcriptPath && args.lastAssistantMessage
+     ? (args.readLastMessage ?? ((raw: string) => raw))(args.lastAssistantMessage)
+     : "";
+   const lastAssistantMessage = stripInjectedMemory(decoded).trim();
+@@ -138,9 +147,14 @@ export async function buildRetain(args: {
+       timestamp: new Date().toISOString(),
+     });
+   }
+-  if (turns.length === 0) return;
++  const cursorStore = args.cursors ?? fileCursorStore(harness);
++  const priorCursor = cursorStore.read(sessionId);
++  const previousOps = priorCursor?.ops ?? [];
++  const hasUnresolvedWrite =
++    Boolean(priorCursor?.dirty) || Boolean(priorCursor?.pending?.length) || previousOps.length > 0;
++  if (turns.length === 0 && !hasUnresolvedWrite) return { status: "skipped", reason: "no_new_content" };
+   // Stop fires once the reply is finished, so every turn in the transcript is complete.
+-  recordUsage({
++  if (turns.length > 0) recordUsage({
+     harness,
+     sessionId,
+     bankId: args.bankId ?? "",
+@@ -153,26 +167,43 @@ export async function buildRetain(args: {
+     reviseLastTurn: true,
+   });
+ 
+-  if (!client) return;
++  if (!client) {
++    if (priorCursor?.dirty || previousOps.length) {
++      const operationIds = [...new Set([...previousOps, ...(priorCursor?.pending ?? []).map((entry) => entry.operationId)])];
++      return { status: "unknown", reason: "prior_operation_unconfirmed", operationIds, pendingCount: operationIds.length };
++    }
++    if (priorCursor?.pending?.length) {
++      const operationIds = [...new Set(priorCursor.pending.map((entry) => entry.operationId))];
++      return {
++        status: "unknown",
++        reason: "pending_replay_deferred",
++        operationIds,
++        pendingCount: operationIds.length,
++      };
++    }
++    return { status: "skipped", reason: "writeback_disabled" };
++  }
+   const startTs = turns[0]?.timestamp ?? new Date().toISOString();
+   const t0 = Date.now();
+   try {
+-    await retainLiveSession(client as HindsightClient, sessionId, turns, startTs, harness, {
+-      cursors: args.cursors ?? fileCursorStore(harness),
++    const outcome = await retainLiveSession(client as HindsightClient, sessionId, turns, startTs, harness, {
++      cursors: cursorStore,
+       stamp: args.stamp,
+       retryUntil: args.retryUntil,
+       transcriptPath,
+     });
+-    diag(harness, "retain_ok", { ms: Date.now() - t0, turns: turns.length, session: sessionId });
++    if (outcome.submitted) diag(harness, "retain_ok", { ms: Date.now() - t0, turns: turns.length, session: sessionId });
++    return outcome;
+   } catch (e) {
+     log.warn(harness, "session write-back failed", {
+-      error: describeError(e),
+-    });
+-    diag(harness, "retain_failed", {
+-      ms: Date.now() - t0,
+-      error: describeError(e),
+-      session: sessionId,
++      error: e instanceof Error ? e.name : "Error",
+     });
++    diag(harness, "retain_failed", { ms: Date.now() - t0, error: e instanceof Error ? e.name : "Error", session: sessionId });
++    const code = e && typeof e === "object" && "status" in e ? Number((e as { status?: unknown }).status) : 0;
++    const rejected = code >= 400 && code < 500 && code !== 408 && code !== 429;
++    const current = cursorStore.read(sessionId);
++    const operationIds = [...new Set([...(current?.ops ?? []), ...(current?.pending ?? []).map((pending) => pending.operationId)])];
++    return { status: rejected ? "failed" : "unknown", reason: rejected ? "write_rejected" : "outcome_unknown", operationIds, pendingCount: operationIds.length };
+   }
+ }
+ 
+@@ -180,26 +211,62 @@ export async function buildRetain(args: {
+ export async function runRetainHook(
+   spec: RetainHookSpec,
+   makeClient: (opts: ClientOpts) => RetainClient = (o) => new HindsightClient(o)
++): Promise<void> {
++  const lifecycleStarted = Date.now();
++  let sessionId: string | undefined;
++  let bankId: string | undefined;
++  try {
++    await runRetainHookImpl(spec, makeClient, lifecycleStarted, (session, bank) => {
++      sessionId = session;
++      bankId = bank;
++    });
++  } catch (error) {
++    try {
++      memoryLifecycle({
++        harness: spec.harness,
++        stage: "stop",
++        status: "failed",
++        reason: "hook_setup_failed",
++        session: sessionId,
++        bank: bankId,
++        ms: Date.now() - lifecycleStarted,
++      });
++    } catch {
++      // Preserve the original host-facing error if diagnostics themselves fail.
++    }
++    throw error;
++  }
++}
++
++async function runRetainHookImpl(
++  spec: RetainHookSpec,
++  makeClient: (opts: ClientOpts) => RetainClient,
++  lifecycleStarted: number,
++  correlate: (sessionId?: string, bankId?: string) => void
+ ): Promise<void> {
+   // Anti-recursion: the codebase survey's own headless claude session (core/survey.ts) sets this
+   // so its hooks are a no-op — it must not retain its own survey session's transcript.
+-  if (process.env.HINDSIGHT_DISABLE_HOOKS) return;
++  if (process.env.HINDSIGHT_DISABLE_HOOKS) {
++    memoryLifecycle({ harness: spec.harness, stage: "stop", status: "skipped", reason: "hooks_disabled" });
++    return;
++  }
+   // The host started counting when it spawned us, which is near enough to now: everything above
+   // is synchronous. A margin keeps the kill from landing between our last wait and its response.
+   const hostDeadline = Date.now() + spec.hostTimeoutSec * 1000 - HOST_DEADLINE_MARGIN_MS;
+ 
+   const ev = readHookEvent(spec.harness);
+-  if (!ev) return;
+-  if (spec.accept && !spec.accept(ev)) return;
++  if (!ev) { memoryLifecycle({ harness: spec.harness, stage: "stop", status: "unknown", reason: "event_missing" }); return; }
++  if (spec.accept && !spec.accept(ev)) { memoryLifecycle({ harness: spec.harness, stage: "stop", status: "skipped", reason: "event_filtered" }); return; }
+   const parsed = spec.parse(ev);
+   const { sessionId, cwd: rawCwd, lastAssistantMessage } = parsed;
++  correlate(sessionId);
+   const cwd = rawCwd || process.cwd();
+   let transcriptPath = parsed.transcriptPath;
+   let readTranscript = spec.readTranscript;
+ 
+   let cfg = loadConfig({ harness: spec.harness });
+   setLogLevel(cfg.logLevel);
+-  if (cfg.disabled) return;
++  if (cfg.disabled) { memoryLifecycle({ harness: spec.harness, stage: "stop", status: "skipped", reason: "globally_disabled", session: sessionId, ms: Date.now() - lifecycleStarted }); return; }
+ 
+   // A journal harness closes the turn HERE, at the first point past the kill switch: the host's
+   // copy of the reply is ephemeral (ZCode deletes its Stop transcript the moment this hook
+@@ -215,17 +282,21 @@ export async function runRetainHook(
+     });
+   }
+ 
+-  if (!transcriptPath) return;
++  // A missing host locator is still a source-free reconciliation opportunity: the established
++  // cursor may contain an exact append outbox or operation IDs that can be settled safely. Do not
++  // invent a path or transcript; buildRetain receives an empty source and preserves cursor identity.
+ 
+   const sessionRoot = sessionRootDir(spec.harness, sessionId, cwd);
+   const derived = deriveBankIdOrSkip(cfg, cwd, spec.harness, sessionRoot);
+   // Skipping the write-back loses this session; retaining it into a guessed bank loses it AND
+   // pollutes the server with a bank nothing ever reads back (#3950).
+-  if (derived === null) return;
++  if (derived === null) { memoryLifecycle({ harness: spec.harness, stage: "stop", status: "skipped", reason: "bank_unresolved", session: sessionId, ms: Date.now() - lifecycleStarted }); return; }
++  const perBankRetentionOptOut = cfg.banks[derived]?.retainSessions === false;
+   const resolved = applyBankConfig(cfg, derived, cwd);
+   cfg = resolved.cfg;
+   const bankId = resolved.bankId;
+-  if (cfg.disabled) return; // per-bank opt-out (banks.<id> override)
++  correlate(sessionId, bankId);
++  if (cfg.disabled) { memoryLifecycle({ harness: spec.harness, stage: "stop", status: "skipped", reason: "bank_disabled", bank: bankId, session: sessionId, ms: Date.now() - lifecycleStarted }); return; }
+   // Checked only HERE, after the bank is resolved, so a `banks.<id>` section can turn write-back
+   // back on for one repo under a global `retainSessions: false` (and vice versa). Before the
+   // daemon start below: a session that writes nothing has no reason to bring a server up. It still
+@@ -249,7 +320,7 @@ export async function runRetainHook(
+     });
+   }
+ 
+-  await buildRetain({
++  const outcome = await buildRetain({
+     harness: spec.harness,
+     sessionId: sessionId || "no-session",
+     transcriptPath,
+@@ -267,4 +338,13 @@ export async function runRetainHook(
+       sessionId: sessionId || "no-session",
+     }),
+   });
++  memoryLifecycle({
++    harness: spec.harness,
++    stage: "stop",
++    ...outcome,
++    ...(perBankRetentionOptOut ? { reason: "bank_disabled" } : {}),
++    session: sessionId,
++    bank: bankId,
++    ms: Date.now() - lifecycleStarted,
++  });
+ }
+diff --git a/hindsight-integrations/coding-agents/src/core/session-cache.test.ts b/hindsight-integrations/coding-agents/src/core/session-cache.test.ts
+index 0ccc716d..4be5eec2 100644
+--- a/hindsight-integrations/coding-agents/src/core/session-cache.test.ts
++++ b/hindsight-integrations/coding-agents/src/core/session-cache.test.ts
+@@ -1,7 +1,12 @@
+-import { rmSync } from "node:fs";
++import { randomUUID } from "node:crypto";
++import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
+ import { afterEach, describe, expect, it } from "vitest";
+ import {
+   fileCursorStore,
++  deliverPendingContext,
++  stashPendingContext,
+   readSessionCache,
+   sessionCacheFile,
+   sessionRootDir,
+@@ -118,3 +123,59 @@ describe("sessionRootDir", () => {
+     expect(sessionRootDir(HARNESS, "", "/work/one")).toBe("/work/one");
+   });
+ });
++
++
++describe("pending context filesystem failures", () => {
++  it("does not overwrite an unreadable existing pending block", () => {
++    const harness = `pending-unreadable-${process.pid}`;
++    const path = sessionCacheFile(harness, "s1").replace(/\.json$/, ".pending");
++    mkdirSync(path, { recursive: true });
++    try {
++      expect(() => stashPendingContext(harness, "s1", "replacement")).toThrow();
++      expect(() => deliverPendingContext(harness, "s1", () => {})).toThrow();
++      // The failed read moved the original directory into retry custody; it was not deleted.
++      expect(() => deliverPendingContext(harness, "s1", () => {})).toThrow();
++    } finally { rmSync(join(tmpdir(), `hindsight-${harness}`), { recursive: true, force: true }); }
++  });
++});
++
++
++describe("pending retry session identity", () => {
++  it("leaves overlapping sessions' ordinary files byte-identical and undelivered while consuming a generated retry once", () => {
++    const harness = `pending-session-identity-${process.pid}`;
++    const directory = join(tmpdir(), `hindsight-${harness}`);
++    mkdirSync(directory, { recursive: true });
++    const protectedFiles = new Map<string, Buffer>();
++    const uuid = randomUUID();
++    for (const session of ["foo.pending.retry.bar", `foo.pending.retry.${uuid}`]) {
++      for (const extension of ["pending", "json", "root", "retain.json", "usage.json"]) {
++        const file = join(directory, `${session}.${extension}`);
++        const bytes = Buffer.from(`private other session: ${session} / ${extension}\n`);
++        protectedFiles.set(file, bytes);
++      }
++    }
++    // Neither a prefix match, a non-v4 UUID, nor a valid UUID with extra bytes is generated format.
++    for (const suffix of ["fixture", uuid + ".extra", uuid + "\n", uuid.slice(0, 14) + "1" + uuid.slice(15)]) {
++      protectedFiles.set(join(directory, `foo.pending.retry.${suffix}`), Buffer.from(`foreign ${suffix}`));
++    }
++    for (const [file, bytes] of protectedFiles) writeFileSync(file, bytes);
++    try {
++      const unexpected = () => { throw new Error("foreign session was delivered"); };
++      expect(deliverPendingContext(harness, "foo", unexpected)).toBe(false);
++      stashPendingContext(harness, "foo", "owned retry context");
++      expect(() => deliverPendingContext(harness, "foo", () => { throw new Error("retry me"); })).toThrow("retry me");
++      const ownRetry = readdirSync(directory).filter((name) => !protectedFiles.has(join(directory, name)));
++      expect(ownRetry).toHaveLength(1);
++      expect(ownRetry[0]).toMatch(/^foo\.pending\.retry\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
++      const delivered: string[] = [];
++      expect(deliverPendingContext(harness, "foo", (context) => {
++        expect(deliverPendingContext(harness, "foo", unexpected)).toBe(false);
++        delivered.push(context);
++      })).toBe(true);
++      expect(delivered).toEqual(["owned retry context"]);
++      expect(deliverPendingContext(harness, "foo", unexpected)).toBe(false);
++      expect(readdirSync(directory).sort()).toEqual([...protectedFiles.keys()].map((file) => file.slice(directory.length + 1)).sort());
++      for (const [file, bytes] of protectedFiles) expect(readFileSync(file)).toEqual(bytes);
++    } finally { rmSync(directory, { recursive: true, force: true }); }
++  });
++});
+diff --git a/hindsight-integrations/coding-agents/src/core/session-cache.ts b/hindsight-integrations/coding-agents/src/core/session-cache.ts
+index efe1ce82..fbee86bd 100644
+--- a/hindsight-integrations/coding-agents/src/core/session-cache.ts
++++ b/hindsight-integrations/coding-agents/src/core/session-cache.ts
+@@ -1,4 +1,5 @@
+-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
++import { randomUUID } from "node:crypto";
++import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+ import { tmpdir } from "node:os";
+ import { dirname, join } from "node:path";
+ import type { PageRef } from "./knowledge-injection";
+@@ -16,6 +17,8 @@ export interface SessionCache {
+    *  HOOK_INJECT_ATTEMPTS). Named for reflect like `reflectAnswer` above, whose name also predates
+    *  the other two sources. */
+   reflectAttempts?: number;
++  /** Last failed automatic retrieval source; distinguishes exhausted/unavailable from a valid empty match. */
++  retrievalFailure?: "reflect" | "pages" | "observations";
+   /** SessionStart saw a new/empty bank; consume this on prompt one, then allow reflect. */
+   deferInitialReflect?: boolean;
+   pages?: { atTurn: number; list: PageRef[] };
+@@ -79,30 +82,66 @@ export function stashPendingContext(harness: string, sessionId: string, context:
+   let existing = "";
+   try {
+     existing = readFileSync(path, "utf8");
+-  } catch {
+-    /* nothing pending yet */
++  } catch (error) {
++    // An unreadable pending block is not an empty one: never overwrite it.
++    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+   }
+   if (existing.includes(context)) return;
+-  try {
+-    writeFileAtomic(path, existing ? `${existing}\n\n${context}` : context);
+-  } catch {
+-    /* best-effort, like the session cache */
+-  }
++  // Callers may discard their context only after this completes. Failed storage must reach their
++  // existing failed lifecycle path, rather than report a successful deferred handoff.
++  writeFileAtomic(path, existing ? `${existing}\n\n${context}` : context);
+ }
+ 
+-/** Claim and clear the session's pending context. The rename is the claim: tool hooks can run in
+- *  parallel, and only the one whose rename succeeds delivers the block. */
+-export function takePendingContext(harness: string, sessionId: string): string | undefined {
++/** Deliver one pending block under an atomic claim. Keep its bytes until the synchronous local
++ * emit/serialization/stdout handoff completes. A failed handoff moves the claim to a unique retry
++ * file, never over the pending file a new prompt may already have written. Retry files are claimed
++ * by rename too, so simultaneous tool hooks cannot deliver the same block. This does not certify
++ * host consumption or recover claims from a killed process. */
++export function deliverPendingContext(
++  harness: string,
++  sessionId: string,
++  deliver: (context: string) => void
++): boolean {
+   const path = pendingContextFile(harness, sessionId);
+-  const claimed = `${path}.${process.pid}.claim`;
++  let retries: string[];
+   try {
+-    renameSync(path, claimed);
+-    return readFileSync(claimed, "utf8") || undefined;
+-  } catch {
+-    return undefined;
+-  } finally {
+-    rmSync(claimed, { force: true });
++    const prefix = `${sessionId}.pending.retry.`;
++    retries = readdirSync(dirname(path))
++      .filter((name) => {
++        if (!name.startsWith(prefix)) return false;
++        const suffix = name.slice(prefix.length);
++        // Match only the complete v4 UUID we generate. Another session may legally start with
++        // this prefix; its ordinary state files (or a UUID plus trailing parts) are never retries.
++        return suffix.length === 36 && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(suffix);
++      })
++      .sort()
++      .map((name) => join(dirname(path), name));
++  } catch (error) {
++    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
++    throw error;
++  }
++  for (const ready of [...retries, path]) {
++    const claimed = `${path}.${randomUUID()}.claim`;
++    try {
++      renameSync(ready, claimed);
++    } catch (error) {
++      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; // another hook won
++      throw error;
++    }
++    try {
++      const context = readFileSync(claimed, "utf8");
++      if (context) deliver(context);
++    } catch (error) {
++      // If storage itself also fails here, leave the claim intact and fail truthfully. Never
++      // delete undelivered bytes or overwrite a newer stash to hide the recovery failure.
++      renameSync(claimed, `${path}.retry.${randomUUID()}`);
++      throw error;
++    }
++    // A cleanup failure after delivery must not requeue an already emitted block.
++    rmSync(claimed);
++    return true;
+   }
++  return false;
+ }
+ 
+ /** The session root's own file, deliberately NOT the shared session cache — see sessionRootDir. */
+diff --git a/hindsight-integrations/coding-agents/src/core/session-start.test.ts b/hindsight-integrations/coding-agents/src/core/session-start.test.ts
+index a47ba489..d7fbb6a3 100644
+--- a/hindsight-integrations/coding-agents/src/core/session-start.test.ts
++++ b/hindsight-integrations/coding-agents/src/core/session-start.test.ts
+@@ -1,6 +1,6 @@
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import { execFileSync } from "node:child_process";
+-import { mkdtempSync, rmSync } from "node:fs";
++import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+ import { tmpdir } from "node:os";
+ import { join } from "node:path";
+ import { buildSessionStartContext, runSessionStartHook } from "./session-start";
+@@ -381,6 +381,7 @@ describe("buildSessionStartContext", () => {
+     expect(out.additionalContext).toContain("deliberately NOT listed here");
+     // banner shows on EVERY session now; non-cold paths use the "remembering" wording
+     expect(out.systemMessage).toContain("is tracking the decisions");
++    expect(out.lifecycle).toEqual({ status: "degraded", reason: "bank_read_failed" });
+   });
+ 
+   it("listPages rejects -> fail-open: empty-state preamble, seed still starts, note still visible (cold repo)", async () => {
+@@ -407,6 +408,7 @@ describe("buildSessionStartContext", () => {
+     expect(out.additionalContext).not.toContain("(p1)");
+     // The background-learning note is still user-visible.
+     expect(out.systemMessage).toContain("is learning");
++    expect(out.lifecycle).toEqual({ status: "degraded", reason: "pages_read_failed" });
+   });
+ 
+   it("autoSeed:false -> skips the whole seed branch (no listDocumentIds call), roster preamble only", async () => {
+@@ -435,6 +437,80 @@ describe("buildSessionStartContext", () => {
+   });
+ });
+ 
++describe("runSessionStartHook terminal handoff", () => {
++  let repo: string;
++  beforeEach(() => {
++    repo = mkdtempSync(join(tmpdir(), "hs-ss-handoff-"));
++    execFileSync("git", ["init", "-q", repo]);
++    rawConfig = { autoSeed: false, autoUpdate: false };
++  });
++  afterEach(() => {
++    rawConfig = undefined;
++    rmSync(repo, { recursive: true, force: true });
++    vi.unstubAllEnvs();
++  });
++
++  const spec = (emit: (output: import("./session-start").SessionStartOutput) => unknown) => ({
++    harness: "claude-code",
++    parse: (event: Record<string, unknown>) => ({ cwd: event.cwd as string, sessionId: event.session_id as string }),
++    emit,
++  });
++
++  it("announces actual source degradation and records terminal lifecycle after stdout", async () => {
++    const diagPath = join(repo, "diag.log");
++    vi.stubEnv("HINDSIGHT_DIAG_FILE", diagPath);
++    stdin = JSON.stringify({ cwd: repo, session_id: "startup-handoff" });
++    const write = vi.spyOn(process.stdout, "write").mockImplementation(() => {
++      const rows = readFileSync(diagPath, "utf8").split(String.fromCharCode(10)).filter(Boolean).map((line) => JSON.parse(line));
++      expect(rows.some((row) => row.event === "memory_lifecycle" && row.stage === "startup")).toBe(false);
++      return true;
++    });
++    let emitted: import("./session-start").SessionStartOutput | undefined;
++    try {
++      await runSessionStartHook(spec((output) => { emitted = output; return output; }), () => ({
++        listPages: async () => { throw new Error("pages unavailable"); },
++      }) as never);
++    } finally {
++      write.mockRestore();
++    }
++    expect(emitted?.additionalContext).toContain("<hindsight_knowledge>");
++    expect(emitted?.systemMessage).toContain("memory unavailable (pages_read_failed)");
++    const rows = readFileSync(diagPath, "utf8").split(String.fromCharCode(10)).filter(Boolean).map((line) => JSON.parse(line));
++    expect(rows.filter((row) => row.event === "memory_lifecycle" && row.stage === "startup")).toHaveLength(1);
++    expect(rows.at(-1)).toMatchObject({ event: "memory_lifecycle", stage: "startup", status: "degraded", reason: "pages_read_failed" });
++  });
++
++  it("reports a real deferred startup write failure without a context-ready success", async () => {
++    vi.stubEnv("TMPDIR", repo);
++    vi.stubEnv("HINDSIGHT_DIAG_FILE", join(repo, "diag-deferred.log"));
++    const pending = join(repo, "hindsight-grok-build", "startup-deferred.pending");
++    mkdirSync(`${pending}.${process.pid}.tmp`, { recursive: true });
++    stdin = JSON.stringify({ cwd: repo, sessionId: "startup-deferred" });
++    const emit = vi.fn((output) => output);
++    await runSessionStartHook({ ...HOOK_HARNESSES["grok-build"].sessionStart, emit }, () => ({
++      listPages: async () => ({ items: [] }),
++    }) as never);
++    expect(emit).not.toHaveBeenCalled();
++    expect(existsSync(pending)).toBe(false);
++    const rows = readFileSync(join(repo, "diag-deferred.log"), "utf8").trim().split("\n")
++      .map((line) => JSON.parse(line)).filter((row) => row.event === "memory_lifecycle");
++    expect(rows).toEqual([expect.objectContaining({ stage: "startup", status: "failed" })]);
++  });
++
++  it("an emit failure records failed without an earlier success event", async () => {
++    const diagPath = join(repo, "diag-failed.log");
++    vi.stubEnv("HINDSIGHT_DIAG_FILE", diagPath);
++    stdin = JSON.stringify({ cwd: repo, session_id: "startup-failed" });
++    await runSessionStartHook(spec(() => { throw new Error("local emit failure"); }), () => ({
++      listPages: async () => ({ items: [] }),
++    }) as never);
++    const rows = readFileSync(diagPath, "utf8").split(String.fromCharCode(10)).filter(Boolean).map((line) => JSON.parse(line));
++    const terminal = rows.filter((row) => row.event === "memory_lifecycle" && row.stage === "startup");
++    expect(terminal).toHaveLength(1);
++    expect(terminal[0]).toMatchObject({ status: "failed", reason: "Error" });
++  });
++});
++
+ describe("runSessionStartHook anti-recursion guard", () => {
+   const ORIGINAL = process.env.HINDSIGHT_DISABLE_HOOKS;
+ 
+diff --git a/hindsight-integrations/coding-agents/src/core/session-start.ts b/hindsight-integrations/coding-agents/src/core/session-start.ts
+index 5cc323be..ac135d85 100644
+--- a/hindsight-integrations/coding-agents/src/core/session-start.ts
++++ b/hindsight-integrations/coding-agents/src/core/session-start.ts
+@@ -31,7 +31,7 @@ import { DAEMON_WAIT_SESSION_START_MS, ensureDaemon } from "./daemon";
+ import type { Config } from "./config";
+ import { deriveBankIdOrSkip } from "./bank";
+ import { brandWord } from "./brand";
+-import { diag, readHookEvent } from "./diag";
++import { diag, memoryLifecycle, readHookEvent } from "./diag";
+ import { setLogLevel } from "./log";
+ import { parsePageList, buildKnowledgePreamble, type PageRef } from "./knowledge-injection";
+ import type { ClientOpts, RetainOpts } from "./hindsight";
+@@ -133,6 +133,7 @@ export interface SessionStartOutput {
+   additionalContext?: string;
+   /** Internal lifecycle signal: defer one auto-reflect while a new bank gains useful content. */
+   deferInitialReflect?: boolean;
++  lifecycle?: { status: "success" | "degraded"; reason: string };
+ }
+ 
+ /** Host-specific adapter for the shared SessionStart core. Claude and Codex use the
+@@ -183,6 +184,7 @@ export async function buildSessionStartContext(args: {
+   let cold: boolean | undefined; // undefined = not checked (autoSeed off / non-git / unreachable)
+   let gitDocIds: Set<string> | undefined; // the cold-check's doc set, reused by the banner's git note
+   let bankEmpty = false; // true only when the server confirmed the bank holds no documents
++  let degradationReason: string | undefined;
+   const harness = args.harness ?? "claude-code";
+   const hasGit = args.hasGit ?? hasGitHistory;
+   const startSeed = args.startSeed ?? startBackgroundSeed;
+@@ -239,6 +241,7 @@ export async function buildSessionStartContext(args: {
+           docIds = await client.listDocumentIds("source:git", "all_strict");
+         } catch {
+           docIds = undefined; // server unreachable: transient — do nothing, try again next session
++          degradationReason = "bank_read_failed";
+         }
+ 
+         // No git documents is not the whole story: under `gitIngest: "none"` none are ever
+@@ -344,6 +347,7 @@ export async function buildSessionStartContext(args: {
+   try {
+     pages = parsePageList(await client.listPages());
+   } catch {
++    degradationReason ??= client.knowledgePagesSupported === false ? "pages_unsupported" : "pages_read_failed";
+     if (client.knowledgePagesSupported === false) {
+       diag(harness, "knowledge_pages_unavailable", { bank: bankId });
+     }
+@@ -385,7 +389,7 @@ export async function buildSessionStartContext(args: {
+   // ALWAYS record the session start (warm sessions used to log nothing — undebuggable).
+   diag(harness, "session_start", { bank: bankId, cold, pages: pages.length, ms: Date.now() - t0 });
+ 
+-  return { systemMessage, additionalContext, deferInitialReflect };
++  return { systemMessage, additionalContext, deferInitialReflect, lifecycle: degradationReason ? { status: "degraded", reason: degradationReason } : { status: "success", reason: "context_ready" } };
+ }
+ 
+ /** Run one SessionStart hook invocation: stdin event in, (maybe) an additionalContext object on stdout. */
+@@ -395,23 +399,27 @@ export async function runSessionStartHook(
+ ): Promise<void> {
+   // Anti-recursion: the codebase survey's own headless claude session (core/survey.ts) sets this
+   // so its hooks are a no-op — it must not re-seed/re-survey its own survey session.
+-  if (process.env.HINDSIGHT_DISABLE_HOOKS) return;
++  const lifecycleStarted = Date.now();
++  let lifecycleSession: string | undefined;
++  let lifecycleBank: string | undefined;
++  if (process.env.HINDSIGHT_DISABLE_HOOKS) { memoryLifecycle({ harness: spec.harness, stage: "startup", status: "skipped", reason: "hooks_disabled" }); return; }
+ 
+   // Whole-body try/catch (unlike runHook/runRetainHook, which only guard individual steps): a
+   // throw here happens during session bootstrap, before the agent has done anything — more
+   // disruptive than a failure mid-prompt — so nothing in this function may ever escape it.
+   try {
+     const ev = readHookEvent(spec.harness);
+-    if (!ev) return;
+-    if (spec.accept && !spec.accept(ev)) return;
++    if (!ev) { memoryLifecycle({ harness: spec.harness, stage: "startup", status: "unknown", reason: "event_missing", ms: Date.now() - lifecycleStarted }); return; }
++    if (spec.accept && !spec.accept(ev)) { memoryLifecycle({ harness: spec.harness, stage: "startup", status: "skipped", reason: "event_filtered", ms: Date.now() - lifecycleStarted }); return; }
+     const { harness } = spec;
+     const { cwd: rawCwd, sessionId } = spec.parse(ev);
++    lifecycleSession = sessionId;
+     const cwd = rawCwd || process.cwd();
+ 
+     let cfg = loadConfig({ harness });
+     setLogLevel(cfg.logLevel);
+     syncCompanionSkill(harness); // keep the installed skill current with the package version
+-    if (cfg.disabled) return;
++    if (cfg.disabled) { memoryLifecycle({ harness, stage: "startup", status: "skipped", reason: "globally_disabled", session: sessionId, ms: Date.now() - lifecycleStarted }); return; }
+     // …and keep the package itself current. AFTER the disabled check, unlike the skill sync above:
+     // `disabled` means an inert plugin, and a network call plus a background npm install is not
+     // inert. It also keeps the two harness families symmetric — the plugin hosts never construct a
+@@ -423,11 +431,12 @@ export async function runSessionStartHook(
+     // same bank however far the agent navigates (#3563).
+     const sessionRoot = sessionRootDir(harness, sessionId, cwd);
+     const derived = deriveBankIdOrSkip(cfg, cwd, harness, sessionRoot);
+-    if (derived === null) return; // repository unidentifiable: no bank, no seed, no injection
++    if (derived === null) { memoryLifecycle({ harness, stage: "startup", status: "skipped", reason: "bank_unresolved", session: sessionId, ms: Date.now() - lifecycleStarted }); return; } // repository unidentifiable: no bank, no seed, no injection
+     const resolved = applyBankConfig(cfg, derived, cwd);
+     cfg = resolved.cfg;
+     const bankId = resolved.bankId;
+-    if (cfg.disabled) return; // per-bank opt-out (banks.<id> override)
++    lifecycleBank = bankId;
++    if (cfg.disabled) { memoryLifecycle({ harness, stage: "startup", status: "skipped", reason: "bank_disabled", session: sessionId, bank: bankId, ms: Date.now() - lifecycleStarted }); return; } // per-bank opt-out (banks.<id> override)
+     // Memory is live HERE — the one point where registering the host's per-repo MCP access is
+     // correct: the caller of an opt-out repo must not gain a config file it never asked for.
+     const mcpHint = spec.ensureMcpRegistration?.(cwd);
+@@ -455,12 +464,21 @@ export async function runSessionStartHook(
+       stashPendingContext(harness, sessionId, out.additionalContext);
+       out.additionalContext = undefined;
+     }
++    // An always-present tool guide is not evidence that live memory was available. Surface the
++    // actual source probe outcome in the user-visible banner while preserving the host's context.
++    if (out.lifecycle?.status === "degraded") {
++      const reason = out.lifecycle?.status === "degraded" ? out.lifecycle.reason : "context_unavailable";
++      out.systemMessage = ((out.systemMessage ?? "") + " · memory unavailable (" + reason + "); memory tools remain available").trim();
++    }
+     // The lifecycle computes one host-neutral output; the registry owns each host's wire schema.
+     const payload = spec.emit(out);
+     if (out.systemMessage || out.additionalContext) {
+       process.stdout.write(JSON.stringify(payload));
+     }
+-  } catch {
++    // Terminal only after local serialization/emit/stdout (or pending-context stash) succeeds.
++    if (out.lifecycle) memoryLifecycle({ harness, stage: "startup", ...out.lifecycle, session: sessionId, bank: bankId, ms: Date.now() - lifecycleStarted });
++  } catch (e) {
++    memoryLifecycle({ harness: spec.harness, stage: "startup", status: "failed", reason: e instanceof Error ? (e.name || "exception") : "exception", session: lifecycleSession, bank: lifecycleBank, ms: Date.now() - lifecycleStarted });
+     /* SessionStart must never throw and break the session */
+   }
+ }

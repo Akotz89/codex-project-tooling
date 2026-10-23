@@ -1,0 +1,140 @@
+{
+  "source_commit": "16df02aeeadb45d2cb7298b52f9785bc49544484",
+  "source_subtree": "hindsight-docs",
+  "purpose": "registered coding-agent roster tests",
+  "file_count": 22,
+  "files": [
+    {
+      "path": "hindsight-docs/src/lib/coding-agent-harnesses.ts",
+      "sha256": "563e664890b27471f9319f2519dc2fe23d87df0a4605d7e791d615c37cf9a721",
+      "mode": "0o644",
+      "size": 3893
+    },
+    {
+      "path": "hindsight-docs/static/img/harness/antigravity-cli.png",
+      "sha256": "8f0b95d2d21dbf930b4d100e2fdc4505673e900a731aa56ea633a4b59c312799",
+      "mode": "0o644",
+      "size": 16849
+    },
+    {
+      "path": "hindsight-docs/static/img/harness/claude-code.png",
+      "sha256": "dcc58271920750441afd420268045addb593ee01e68b4e05a13f7eface7e65d3",
+      "mode": "0o644",
+      "size": 62828
+    },
+    {
+      "path": "hindsight-docs/static/img/harness/cline-cli.svg",
+      "sha256": "e0c910df8071215ee5353d6fbfa75a50ebf588dde8b5b0b778482625b293f713",
+      "mode": "0o644",
+      "size": 1049
+    },
+    {
+      "path": "hindsight-docs/static/img/harness/codebuddy.png",
+      "sha256": "9e41bda57d6b8cb759f8c21c0f06e30de2cf5eff3eb2fd668ee2ed393a6b8e24",
+      "mode": "0o644",
+      "size": 28663
+    },
+    {
+      "path": "hindsight-docs/static/img/harness/codex.svg",
+      "sha256": "b93fa7942be639a1dae60194ff12141145d7d9fd59581582d6ff23335755f19c",
+      "mode": "0o644",
+      "size": 1978
+    },
+    {
+      "path": "hindsight-docs/static/img/harness/copilot-cli.svg",
+      "sha256": "eeafb3c2f333e04ccf7d031ae215f7adafaed4c6352556b0bf79496e048bcdd7",
+      "mode": "0o644",
+      "size": 1689
+    },
+    {
+      "path": "hindsight-docs/static/img/harness/cursor-cli.svg",
+      "sha256": "4723e6409967135b81e7a7b1a675cec410a848bd551448f96c2aa5f30a5cbe8d",
+      "mode": "0o644",
+      "size": 936
+    },
+    {
+      "path": "hindsight-docs/static/img/harness/dcode.svg",
+      "sha256": "71f580272710c6a4d6fb1014ae869313907b39bae3bb363157ca625dff5bd106",
+      "mode": "0o644",
+      "size": 722
+    },
+    {
+      "path": "hindsight-docs/static/img/harness/devin-cli.svg",
+      "sha256": "9752a548016ea8480b1f9d66f2be3538090c2bca708b0dc94ba4606405911efc",
+      "mode": "0o644",
+      "size": 3260
+    },
+    {
+      "path": "hindsight-docs/static/img/harness/dsh.svg",
+      "sha256": "9e983b4f649c25c6ca0623a50be1a6e705fd8f49f756638b980fa13b40575ab6",
+      "mode": "0o644",
+      "size": 3634
+    },
+    {
+      "path": "hindsight-docs/static/img/harness/factory-droid.svg",
+      "sha256": "4eb1ff0d0d7f1136b44b766e1513fa4b8e9caec48e59949c7333fdf59ee2947f",
+      "mode": "0o644",
+      "size": 2001
+    },
+    {
+      "path": "hindsight-docs/static/img/harness/grok-build.svg",
+      "sha256": "23d7fe913dfd068436b7c5240d5495b62e2cabab3b11ae2f167a1f8852932eec",
+      "mode": "0o644",
+      "size": 1148
+    },
+    {
+      "path": "hindsight-docs/static/img/harness/kilo.svg",
+      "sha256": "0e8115fe04e4bb07a2122cb66ddc718a7cdfb18fdcfa020bf5dfb51fd92d75e9",
+      "mode": "0o644",
+      "size": 686
+    },
+    {
+      "path": "hindsight-docs/static/img/harness/kimi-code.svg",
+      "sha256": "937616746780d0c7c4bda92820db39f503f6a3e9b7cfebe438a5fb61b62d3991",
+      "mode": "0o644",
+      "size": 1083
+    },
+    {
+      "path": "hindsight-docs/static/img/harness/opencode.png",
+      "sha256": "2f2d5687a641f7fc1c3931072249a5984660375c091064fe8b374e4e43a8656c",
+      "mode": "0o644",
+      "size": 1541
+    },
+    {
+      "path": "hindsight-docs/static/img/harness/pi.svg",
+      "sha256": "4c02d96792d3d49cf328a876a2df5dd1845a8599c537857ecca847bf6548d8e9",
+      "mode": "0o644",
+      "size": 239
+    },
+    {
+      "path": "hindsight-docs/static/img/harness/prime-agent.svg",
+      "sha256": "7313d84cebd0c3c56db75351c67a515df18569bc1936e66100c264d1a01dca9a",
+      "mode": "0o644",
+      "size": 481
+    },
+    {
+      "path": "hindsight-docs/static/img/harness/qwen-code.svg",
+      "sha256": "52113608880dfafae0b605b8fb57ccbdbae3c8fd5dee4606987f9b2d341d8035",
+      "mode": "0o644",
+      "size": 1594
+    },
+    {
+      "path": "hindsight-docs/static/img/harness/traecode.png",
+      "sha256": "8b08a522b34538170cb70db0131cb0768c5cd86212c036afeb5e14212eb9027b",
+      "mode": "0o644",
+      "size": 15300
+    },
+    {
+      "path": "hindsight-docs/static/img/harness/workbuddy.png",
+      "sha256": "41fce90acf26d7627797d65398dd60dde8aad181d0794686d70b6d4162c15764",
+      "mode": "0o644",
+      "size": 22397
+    },
+    {
+      "path": "hindsight-docs/static/img/harness/zcode.svg",
+      "sha256": "6cd538ff67bc03b4a69778bbe59c4ec2462940b8b952e23a254d75408505bff3",
+      "mode": "0o644",
+      "size": 479
+    }
+  ]
+}

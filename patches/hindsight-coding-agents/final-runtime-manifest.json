@@ -1,0 +1,400 @@
+{
+  "label": "CPI414 final post-build installer input with exact retry filename selector",
+  "source_commit": "16df02aeeadb45d2cb7298b52f9785bc49544484",
+  "version": "0.8.2",
+  "producer_command": "npm run build",
+  "build_result": "ESM and DTS passed",
+  "file_count": 65,
+  "files": [
+    {
+      "path": "dist/antigravity-hook.js",
+      "size": 185716,
+      "mode": "0o755",
+      "sha256": "793cb783b6acf3a4ec9c61cee2191d1c325ae7cffe0e0779da8c60c25fd932d4"
+    },
+    {
+      "path": "dist/antigravity-statusline.js",
+      "size": 33675,
+      "mode": "0o755",
+      "sha256": "325d014dc3ac15ca22a97833496593ff73ffed57a238703eb54a41062f06a4a7"
+    },
+    {
+      "path": "dist/antigravity-stop-hook.js",
+      "size": 192844,
+      "mode": "0o755",
+      "sha256": "388cc71d41a43c106c614eba62ed553bd35ff5749d4b7821bca5e531a9effafb"
+    },
+    {
+      "path": "dist/claude-hook.js",
+      "size": 185707,
+      "mode": "0o755",
+      "sha256": "4690e4a0ad1ebe647c47e440f0799b8af35c356b80c91fd5f25fd1f65c4ca24e"
+    },
+    {
+      "path": "dist/claude-sessionstart-hook.js",
+      "size": 208696,
+      "mode": "0o755",
+      "sha256": "7955bfc778678cc174b1aa6587ef786895aa5824886f5921e024ebee1c69fad9"
+    },
+    {
+      "path": "dist/claude-stop-hook.js",
+      "size": 192835,
+      "mode": "0o755",
+      "sha256": "924d2e02b90b5013e897548faaf795e27685290f90373b834607f41db4cd82c8"
+    },
+    {
+      "path": "dist/cline.js",
+      "size": 735517,
+      "mode": "0o644",
+      "sha256": "bbbd11dc33099d89078de793656cc3a3189f6210fb89e4f0b922873c05bae76e"
+    },
+    {
+      "path": "dist/codebuddy-hook.js",
+      "size": 185708,
+      "mode": "0o755",
+      "sha256": "242cf2c800676f9297dd3f3ffd69e995fa0354abec204eb48923adb6dfd0e6c5"
+    },
+    {
+      "path": "dist/codebuddy-sessionstart-hook.js",
+      "size": 208697,
+      "mode": "0o755",
+      "sha256": "6a06e4e7d2a4a787b02e0af35c2c7fcf37ffc58aa120bcc033f4dc7d49c594da"
+    },
+    {
+      "path": "dist/codebuddy-stop-hook.js",
+      "size": 192836,
+      "mode": "0o755",
+      "sha256": "8ff6c726d2062a1507dd226cf75229e0349575484a797655fa4bfc34925f6ea2"
+    },
+    {
+      "path": "dist/codex-hook.js",
+      "size": 185700,
+      "mode": "0o755",
+      "sha256": "5cea0133563785a5453eb637890c0ca27ed2753ec72dcabd4b47030faa173d31"
+    },
+    {
+      "path": "dist/codex-sessionstart-hook.js",
+      "size": 208689,
+      "mode": "0o755",
+      "sha256": "c15f295eab0d32d2f8072d76edd60e8f3b04639b881c68df81109d72933ea4ec"
+    },
+    {
+      "path": "dist/codex-stop-hook.js",
+      "size": 192828,
+      "mode": "0o755",
+      "sha256": "0c41e7bc4f9b8f40bc1f6a9dcdd56baff272557a59382cacd5466270bcb79f9e"
+    },
+    {
+      "path": "dist/copilot-hook.js",
+      "size": 185708,
+      "mode": "0o755",
+      "sha256": "6eb02257855bec78dbab1e5800ab53d387545773028e5d1281a44554aa90e043"
+    },
+    {
+      "path": "dist/copilot-sessionstart-hook.js",
+      "size": 208697,
+      "mode": "0o755",
+      "sha256": "c40184a2f98bcff01f6325c3ed566fac573055f85d038fb3427233a316861643"
+    },
+    {
+      "path": "dist/copilot-stop-hook.js",
+      "size": 192836,
+      "mode": "0o755",
+      "sha256": "227a52194d342edd464ffbc2f4c8a4e6f60f1048fe972c6e969cf5cb5127d59a"
+    },
+    {
+      "path": "dist/cursor-hook.js",
+      "size": 185706,
+      "mode": "0o755",
+      "sha256": "d635ac7b2531bcb57171e9ff27b0b80885ddd0ad38e615483e5c35eeb143ff26"
+    },
+    {
+      "path": "dist/cursor-sessionstart-hook.js",
+      "size": 208695,
+      "mode": "0o755",
+      "sha256": "a4dd15d334cdd44e4c4e3d5197e4eccbf3e7487555639824d86d43d35eada2fe"
+    },
+    {
+      "path": "dist/cursor-stop-hook.js",
+      "size": 192834,
+      "mode": "0o755",
+      "sha256": "f2afe014354b2a56311b03aae5b67971d56f35530c917493307c0ecaaed5e123"
+    },
+    {
+      "path": "dist/daemon-start.js",
+      "size": 36970,
+      "mode": "0o755",
+      "sha256": "dcb219f57c74cc7e75cc3b0e913d9c5f77e433ca095b738ab70f8166586547a1"
+    },
+    {
+      "path": "dist/dcode-hook.js",
+      "size": 185700,
+      "mode": "0o755",
+      "sha256": "b5e5eac30472c9016c61530e6be80c43c9cdc273ecff6bcc8174528eb5c4dbdd"
+    },
+    {
+      "path": "dist/dcode-sessionstart-hook.js",
+      "size": 208689,
+      "mode": "0o755",
+      "sha256": "69aeb44b3ed9491504c2d8930c1562205244163d87c9f1d7659b7feee9d27717"
+    },
+    {
+      "path": "dist/dcode-stop-hook.js",
+      "size": 192828,
+      "mode": "0o755",
+      "sha256": "83607fdd2abcd6d0c0c5fe0bc1cb81c46ce672b1fa78ee7fba3d1d2704601b30"
+    },
+    {
+      "path": "dist/deepen.js",
+      "size": 113850,
+      "mode": "0o755",
+      "sha256": "f9dba1fe64a74612d1afc22274e417bd1055eeff10c42ecbd8a256af2fa16c61"
+    },
+    {
+      "path": "dist/devin-hook.js",
+      "size": 185704,
+      "mode": "0o755",
+      "sha256": "ebd67bbe0915708a18cd3eb44fb0be21e35dfaefc9923300eec59738f87b0247"
+    },
+    {
+      "path": "dist/devin-sessionstart-hook.js",
+      "size": 208693,
+      "mode": "0o755",
+      "sha256": "0a3bb91f23db1648be00585a135531f998e7f56a0924db2e2ef55f99aa2dcab4"
+    },
+    {
+      "path": "dist/devin-stop-hook.js",
+      "size": 192832,
+      "mode": "0o755",
+      "sha256": "b60ddebb75455f783e567795c6ce43ee4c10e22248487b099bd6dbf8f69673cf"
+    },
+    {
+      "path": "dist/droid-hook.js",
+      "size": 185708,
+      "mode": "0o755",
+      "sha256": "b9b356e0149cd765cff14356d1cab16094ae0327f4add63282c20a3746404b25"
+    },
+    {
+      "path": "dist/droid-sessionstart-hook.js",
+      "size": 208697,
+      "mode": "0o755",
+      "sha256": "edb13b6df06892eacea0a1565ce3e25d24bd643985dea5e2488da01064f99e33"
+    },
+    {
+      "path": "dist/droid-stop-hook.js",
+      "size": 192836,
+      "mode": "0o755",
+      "sha256": "2ec301d69d91d3bf1893ed6b39cdad904a3ff085ebdc5108dae1d6cd3b60459d"
+    },
+    {
+      "path": "dist/dsh.js",
+      "size": 739988,
+      "mode": "0o644",
+      "sha256": "9090602cc8365600fa74c89c4903f5a4c9999c22ef87b075bba06a7c0c483dc4"
+    },
+    {
+      "path": "dist/grok-hook.js",
+      "size": 185704,
+      "mode": "0o755",
+      "sha256": "7c440974e1b2503a0438259acbf5576a0bb54a0c23efa0310afe6b805d4e15e2"
+    },
+    {
+      "path": "dist/grok-sessionstart-hook.js",
+      "size": 208693,
+      "mode": "0o755",
+      "sha256": "6e71dd418871ee22e210a46a215f47d76d1ec9e121bc25538eec5d00ae347511"
+    },
+    {
+      "path": "dist/grok-stop-hook.js",
+      "size": 192832,
+      "mode": "0o755",
+      "sha256": "c0d68a70f04a72a114f7377749df3b2c4489c1eff676c1d5b7c4e89fe2da811f"
+    },
+    {
+      "path": "dist/hindsight-seed.js",
+      "size": 31392,
+      "mode": "0o755",
+      "sha256": "c1909554ad118110b980b8dffc8076a132b10f3a8a7cdfe6fd8c2b0f6d14bc4b"
+    },
+    {
+      "path": "dist/index.d.ts",
+      "size": 213,
+      "mode": "0o644",
+      "sha256": "66821c6046c160943a60cb1b17fa9762c9503cf9656c417d749a0cbf513c78bd"
+    },
+    {
+      "path": "dist/index.js",
+      "size": 1191837,
+      "mode": "0o644",
+      "sha256": "42243ea8fb41999e3530da777b70538e1fdb1962d4e69899fd68bb42374fbd80"
+    },
+    {
+      "path": "dist/installer.js",
+      "size": 248203,
+      "mode": "0o755",
+      "sha256": "06a1d1b9aecced889c8761dc6e5198d8344039ff4af581fbae942acf59569b34"
+    },
+    {
+      "path": "dist/kilo.js",
+      "size": 1191810,
+      "mode": "0o644",
+      "sha256": "2c61cab5ba0783ad95c2fb67e26c2ab4f190aaeea7d3130a28c74bce42f8e4c2"
+    },
+    {
+      "path": "dist/kimi-hook.js",
+      "size": 185703,
+      "mode": "0o755",
+      "sha256": "385ba6e4cb9caeba63adadf21baf84b72659cce3ca9f14c24bbf41944d2752cf"
+    },
+    {
+      "path": "dist/kimi-sessionstart-hook.js",
+      "size": 208692,
+      "mode": "0o755",
+      "sha256": "20a64896698ad7eee9ffdb42684d01b847e2737cf774193e915017e9af835131"
+    },
+    {
+      "path": "dist/kimi-stop-hook.js",
+      "size": 192831,
+      "mode": "0o755",
+      "sha256": "cf9790a8ee4caf86e0728ae8a2729175f7cafda4df532af758ee7365d4066800"
+    },
+    {
+      "path": "dist/mcp-server.js",
+      "size": 1251453,
+      "mode": "0o755",
+      "sha256": "7de99a4454a17fc6706fbb547edb66a97de0063d269acf5f4098135d27b43c82"
+    },
+    {
+      "path": "dist/opencode2.js",
+      "size": 1190004,
+      "mode": "0o644",
+      "sha256": "5c7915f996fbdf83157ee7ce179c0c3fcd29545fe26d88a1d054307c2138724f"
+    },
+    {
+      "path": "dist/pi.js",
+      "size": 737794,
+      "mode": "0o644",
+      "sha256": "1a9f1e63537ac13a9e4763ec086485e448aabd36c18f49303860a15f6e402d9c"
+    },
+    {
+      "path": "dist/prime-agent.js",
+      "size": 737830,
+      "mode": "0o644",
+      "sha256": "00a6642f5e5de73246bc631803663ceb82e0f6b55e45757c73c25738d3ee7903"
+    },
+    {
+      "path": "dist/qwen-hook.js",
+      "size": 185703,
+      "mode": "0o755",
+      "sha256": "6e3f3bb245b1edba4c06b38a800ad7a1fe90708a59cfd1df9a4da5fd09094c64"
+    },
+    {
+      "path": "dist/qwen-sessionstart-hook.js",
+      "size": 208692,
+      "mode": "0o755",
+      "sha256": "7c27c0db16bbf907d07a1b5cf0dfd4a0c4505cbacb3f69c9ba456652f8e95a70"
+    },
+    {
+      "path": "dist/qwen-stop-hook.js",
+      "size": 192831,
+      "mode": "0o755",
+      "sha256": "825fce7f83c343f1d3572c81a9efe6b6ecbca35434f11c7b2571be07d60997a1"
+    },
+    {
+      "path": "dist/status.js",
+      "size": 90009,
+      "mode": "0o755",
+      "sha256": "e063c0da2f6332fc6e4c9b50ce6e95694690bdfe652453e90d8dbeaf9ccda784"
+    },
+    {
+      "path": "dist/survey-supervisor.js",
+      "size": 2015,
+      "mode": "0o755",
+      "sha256": "0f043f761dc8fc5112ddf86959a8dc926c8fe32d9b8e8cdbfcddb650537ae587"
+    },
+    {
+      "path": "dist/traecode-hook.js",
+      "size": 185706,
+      "mode": "0o755",
+      "sha256": "1a071a7ae9c8c81f56903de0cc959f7e44731b7c0ba5777fb0632c9a0f81b7d8"
+    },
+    {
+      "path": "dist/traecode-sessionstart-hook.js",
+      "size": 208695,
+      "mode": "0o755",
+      "sha256": "4af27837b0f5bccab19da6462cca91d1d0c1148b6dadf692e1479f296463cee4"
+    },
+    {
+      "path": "dist/traecode-stop-hook.js",
+      "size": 192834,
+      "mode": "0o755",
+      "sha256": "aa45323e1e4fcb081ad05190726410c26cb0b8a599a41aa963bc550719ab751b"
+    },
+    {
+      "path": "dist/workbuddy-hook.js",
+      "size": 185708,
+      "mode": "0o755",
+      "sha256": "a186a31e8449e373b8083897dee797eebbcc7662c9f0171c3d95cdf73651e766"
+    },
+    {
+      "path": "dist/workbuddy-sessionstart-hook.js",
+      "size": 208697,
+      "mode": "0o755",
+      "sha256": "7edba9b7dba2c918f0e99d09e2324ceba8dd5310465698ea46324dd63ba886b5"
+    },
+    {
+      "path": "dist/workbuddy-stop-hook.js",
+      "size": 192836,
+      "mode": "0o755",
+      "sha256": "832361053c2a58fa42f12847dce128b89721f558a7a44531f7a505b7bec94200"
+    },
+    {
+      "path": "dist/zcode-hook.js",
+      "size": 185700,
+      "mode": "0o755",
+      "sha256": "7e95568eaa0328977196614e62711f2687bd3658b3e70c0d359b41b1d5fbe831"
+    },
+    {
+      "path": "dist/zcode-sessionstart-hook.js",
+      "size": 208689,
+      "mode": "0o755",
+      "sha256": "be8356db2dde361915d9fa50800d1ac4f23bfdc8ee768f7bfd972cfa7d0c4266"
+    },
+    {
+      "path": "dist/zcode-stop-hook.js",
+      "size": 192828,
+      "mode": "0o755",
+      "sha256": "c7f67f934c4f0070c434f7be10a0ad60483e8102918a73ee783db0cd104f51c8"
+    },
+    {
+      "path": "hooks/hooks.json",
+      "size": 706,
+      "mode": "0o644",
+      "sha256": "1d0617fd75a5729fa5b5fdb67b248384eaa74bf2c647c3b494b2fe05d83e292e"
+    },
+    {
+      "path": "index.js",
+      "size": 603,
+      "mode": "0o644",
+      "sha256": "4d906968db9b5d32c27db47799700b1b4739cd16bd3322c23b8842593af3264d"
+    },
+    {
+      "path": "package.json",
+      "size": 4644,
+      "mode": "0o644",
+      "sha256": "f761bc91b53f5972cb67a50d96636ebd87511743c28883c3b557edf810df80e5"
+    },
+    {
+      "path": "plugin.json",
+      "size": 371,
+      "mode": "0o644",
+      "sha256": "bc6827dbba0bdf1b48d9c76d017c79ed72203ad31d095a8a124ac25ee13cd407"
+    },
+    {
+      "path": "skill/SKILL.md",
+      "size": 82447,
+      "mode": "0o644",
+      "sha256": "dd3a78db3e533f5053fb3f478d8de5971d0a4473cc26b48ed1107630bea1ff27"
+    }
+  ]
+}
