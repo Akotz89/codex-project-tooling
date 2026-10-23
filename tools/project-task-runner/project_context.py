@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 
 
 def digest(raw: bytes) -> str:
@@ -23,10 +24,12 @@ def bind_project_context(runtime, project_root, canonical_state, project_id,
             or not state.is_absolute() or state.resolve(strict=True) != state
             or not state.is_relative_to(root)
             or not code_root.is_absolute() or code_root.resolve(strict=True) != code_root
+            or not code_root.is_dir()
             or type(project_id) is not str
             or re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", project_id) is None):
         raise ValueError("project_context_binding")
     parameters = inspect.signature(runtime.bind_context).parameters
+    runtime.LEGACY_PROJECT_BINDING = None
     if "project_id" in parameters:
         kwargs = {"project_id": project_id}
         if legacy_project_binding is not None:
@@ -40,11 +43,11 @@ def bind_project_context(runtime, project_root, canonical_state, project_id,
         # root/state call so downstream checks retain the caller's project ID.
         bound = runtime.bind_context(root, state)
         runtime.PROJECT_ID = project_id
-        if legacy_project_binding is not None:
-            runtime.LEGACY_PROJECT_BINDING = legacy_project_binding
+        runtime.LEGACY_PROJECT_BINDING = legacy_project_binding
     if (bound != state or runtime.PROJECT_ROOT != root
             or runtime.CANONICAL_STATE != state or Path(runtime.CODE_ROOT) != code_root
-            or getattr(runtime, "PROJECT_ID", None) != project_id):
+            or getattr(runtime, "PROJECT_ID", None) != project_id
+            or getattr(runtime, "LEGACY_PROJECT_BINDING", None) != legacy_project_binding):
         raise ValueError("project_context_runtime_binding")
     return state
 
@@ -94,6 +97,10 @@ def read_selected_packet(selection, key, expected_prefix, project_root,
             or not path.is_relative_to(root / "work")
             or not path.name.startswith(expected_prefix) or path.suffix != ".json"):
         raise ValueError("packet_path")
+    info = path.lstat()
+    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+            or info.st_uid != os.getuid() or info.st_mode & 0o022):
+        raise ValueError("packet_mode")
     raw = caller_api.read_pinned_source(path, reference["sha256"], limit=limit)
     value = json.loads(raw)
     if type(value) is not dict:
@@ -188,7 +195,9 @@ def bind_root_runtime_context(packets, references, contract, project_root, proje
     runtime_path = Path(contract["runtime_path"])
     if (not state.is_absolute() or state.resolve(strict=True) != state or not state.is_relative_to(root)
             or not code_root.is_absolute() or code_root.resolve(strict=True) != code_root
-            or not runtime_path.is_absolute() or runtime_path.resolve(strict=True) != runtime_path):
+            or not code_root.is_dir() or not runtime_path.is_absolute()
+            or runtime_path.resolve(strict=True) != runtime_path
+            or not runtime_path.is_relative_to(code_root)):
         raise ValueError("packet_chain_paths")
     pins = candidate["runtime_source_pins"]
     sources = read_runtime_sources(pins, code_root, caller_api)

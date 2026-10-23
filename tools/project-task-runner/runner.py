@@ -384,9 +384,12 @@ def budget_check(intent,ready,info):
     return actual
 def load_job(job):
     job=private_dir(job);intent=read(job/'intent.json')
-    jobid=intent['job_id'];need(type(jobid) is str and len(jobid)==32 and all(x in '0123456789abcdef' for x in jobid),'job_id')
-    need(intent['unit'].endswith('-'+jobid+'.service') and unit_description(intent)
-         and intent['job_dir']==str(job) and intent['uid']==os.getuid(),'job_identity')
+    need(type(intent) is dict,'job_shape')
+    jobid=intent.get('job_id');unit=intent.get('unit')
+    need(type(jobid) is str and len(jobid)==32 and all(x in '0123456789abcdef' for x in jobid),'job_id')
+    need(type(unit) is str and unit.endswith('-'+jobid+'.service') and unit_description(intent)
+         and intent.get('job_dir')==str(job) and type(intent.get('uid')) is int
+         and intent['uid']==os.getuid(),'job_identity')
     return job,intent
 def custody(job,intent,info):
     ready=read(job/'ready.json')

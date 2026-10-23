@@ -63,6 +63,27 @@ class ProjectContext(unittest.TestCase):
         self.run.base.publish(path, config)
         return path
 
+    def test_binding_clears_stale_cross_project_legacy_binding(self):
+        class Runtime:
+            PROJECT_ROOT = None
+            CANONICAL_STATE = None
+            CODE_ROOT = None
+            PROJECT_ID = 'old-project'
+            LEGACY_PROJECT_BINDING = {'project_id': 'old-project'}
+
+            @staticmethod
+            def bind_context(root, state):
+                Runtime.PROJECT_ROOT = root
+                Runtime.CANONICAL_STATE = state
+                Runtime.CODE_ROOT = HERE.parents[2]
+                return state
+
+        root = self.roots[0]
+        context_helpers.bind_project_context(
+            Runtime, root, root / 'state', 'first-project', HERE.parents[2])
+        self.assertIsNone(Runtime.LEGACY_PROJECT_BINDING)
+        self.assertEqual(Runtime.PROJECT_ID, 'first-project')
+
     def enqueue(self, root, explicit=True, project_binding=None):
         with patch.object(self.run.base, 'manager_environment', return_value=({}, 'fixture')), \
              patch.object(self.run, 'common_cgroup', return_value=Path('/unused')), \

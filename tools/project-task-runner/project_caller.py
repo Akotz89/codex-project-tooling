@@ -15,11 +15,12 @@ HERE = Path(__file__).resolve().parent
 BINDING_PATH = None
 RUNTIME = None
 BOOTSTRAP_API = None
+EXPECTED_BINDING_SHA256 = None
 
 
-def configure(binding_path, caller_api=None):
+def configure(binding_path, caller_api=None, *, expected_binding_sha256=None):
     """Bind one explicit project data document before caller operations."""
-    global BINDING_PATH, PROJECT_CONTEXT_PATH, BOOTSTRAP_API
+    global BINDING_PATH, PROJECT_CONTEXT_PATH, BOOTSTRAP_API, EXPECTED_BINDING_SHA256
     BINDING_PATH = Path(binding_path)
     raw = read_regular(BINDING_PATH, limit=2 * 1024 * 1024)
     value = json.loads(raw)
@@ -27,6 +28,7 @@ def configure(binding_path, caller_api=None):
         raise Refused('binding_schema')
     PROJECT_CONTEXT_PATH = Path(value['project_context_path'])
     BOOTSTRAP_API = caller_api
+    EXPECTED_BINDING_SHA256 = expected_binding_sha256
     return BINDING_PATH
 
 
@@ -37,6 +39,15 @@ class Refused(Exception):
 def need(value, code):
     if not value:
         raise Refused(code)
+
+
+def canonical_project_marker(path, root):
+    try:
+        resolved = path.resolve(strict=True)
+        return (resolved == path and resolved.is_relative_to(root)
+                and resolved.is_file())
+    except (OSError, RuntimeError):
+        return False
 
 
 def read_regular(path, *, private=False, limit=65536):
@@ -75,6 +86,9 @@ def binding():
     need(path == BINDING_PATH, 'binding_path')
     binding_raw = read_regular(path)
     binding_sha256 = hashlib.sha256(binding_raw).hexdigest()
+    need(type(EXPECTED_BINDING_SHA256) is str
+         and re.fullmatch(r'[0-9a-f]{64}', EXPECTED_BINDING_SHA256) is not None
+         and binding_sha256 == EXPECTED_BINDING_SHA256, 'root_binding_trust')
     value = json.loads(binding_raw)
     caller_contract = value.get('caller_contract') if type(value) is dict else None
     need(type(caller_contract) is dict, 'caller_contract')
@@ -100,9 +114,11 @@ def binding():
     root = Path(value['project_root'])
     state = Path(value['canonical_state'])
     code_root = Path(value['code_root'])
+    agents_marker = root / 'AGENTS.md'
+    context_marker = root / '.factory/project-context.md'
     need(root.is_absolute() and root.resolve(strict=True) == root and root.is_dir()
-         and (root / 'AGENTS.md').is_file()
-         and (root / '.factory/project-context.md').is_file(), 'project_root')
+         and canonical_project_marker(agents_marker, root)
+         and canonical_project_marker(context_marker, root), 'project_root')
     need(state.is_absolute() and state.resolve(strict=True) == state and state.is_relative_to(root),
          'canonical_state')
     need(code_root.is_absolute() and code_root.resolve(strict=True) == code_root, 'code_root')
@@ -159,7 +175,9 @@ def binding():
     runtime_binding = value['project_runtime_binding']
     need(type(runtime_binding) is dict and set(runtime_binding) == {
          'project_id', 'unit_prefix', 'payload_environment'}
-         and runtime_binding['project_id'] == value['project_id'], 'project_runtime_binding')
+         and runtime_binding['project_id'] == value['project_id']
+         and runtime_binding == value['root_packet_contract'].get('legacy_project_binding'),
+         'project_runtime_binding')
     packet_contract = value['root_packet_contract']
     caller_contract = value['caller_contract']
     contract_keys = {'binding_schema', 'runtime_context_sha256', 'source_view_sha256',
@@ -614,11 +632,25 @@ def root04_profile(context, adaptive, bound, config_path, job, config, value,
          and profile['actual_job_authorized'] == bound['adoption']['actual_job_authorized'],
          'root04_profile_binding')
     provenance = profile['source_map']
+    need(type(provenance) is dict and set(provenance) == {'path', 'sha256', 'source_identity'}
+         and type(provenance['path']) is str
+         and re.fullmatch(r'[0-9a-f]{64}', provenance['sha256']) is not None
+         and re.fullmatch(r'[0-9a-f]{64}', provenance['source_identity']) is not None,
+         'source_provenance_reference')
     provenance_path = Path(provenance['path'])
+    need(provenance_path.is_absolute()
+         and provenance_path == provenance_path.resolve(strict=True)
+         and provenance_path.is_relative_to(bound['project_root'] / 'work')
+         and config['sources'].get(str(provenance_path)) == provenance['sha256'],
+         'source_provenance_path')
     provenance_raw = read_regular(provenance_path, private=True, limit=1048576)
     need(hashlib.sha256(provenance_raw).hexdigest() == provenance['sha256'],
          'source_provenance_hash')
     provenance_document = json.loads(provenance_raw)
+    need(type(provenance_document) is dict
+         and provenance_document.get('schema') == value['caller_contract']['source_provenance_schema']
+         and type(provenance_document.get('local_source_pins')) is dict,
+         'source_provenance_shape')
     source_view_path = (history_root / value['caller_contract']['source_view_name']).resolve(strict=True)
     expected_view = config['sources'].get(str(source_view_path))
     need(expected_view == value['caller_contract']['source_view_sha256']
@@ -821,6 +853,13 @@ def dispatch(operation, job_arg, config_arg=None):
                                      profile_raw=profile_raw)
                 else:
                     need('context_selection' not in bound, 'successor_context_cross_binding')
+                    config_path = project_path(profile_document.get('config'), root,
+                                               'root04_config_path', must_exist=True)
+                    selected_config, _ = adaptive.configuration(config_path)
+                    need(selected_config == intent['config'], 'root04_config_reopen_binding')
+                    root04_profile(context, adaptive, bound, config_path, job,
+                                   selected_config, value, require_absent=False,
+                                   profile_raw=profile_raw)
             result = adaptive.advance(job)
             if root04_preflight(value, intent.get('config', {})):
                 profile_document, _source = root04_existing_profile(
@@ -832,6 +871,27 @@ def dispatch(operation, job_arg, config_arg=None):
                         value, generic, adaptive, context, bound, job,
                         intent['config'])
             return result
+        if root04_preflight(value, intent.get('config', {})):
+            _profile_path, profile_raw, profile_document = caller_profile_document(
+                intent['config'], root, job, value)
+            if profile_document.get('schema') == value['caller_contract']['successor_profile_schema']:
+                context, bound, adaptive = load_selected_context(
+                    value, profile_document.get('context_selection'))
+                config_path = project_path(profile_document.get('config'), root,
+                                           'successor_config_path', must_exist=True)
+                selected_config, _ = adaptive.configuration(config_path)
+                need(selected_config == intent['config'], 'successor_config_reopen_binding')
+                selected_profile(context, adaptive, bound, config_path, job, selected_config, value,
+                                 require_absent=False, profile_raw=profile_raw)
+            else:
+                need('context_selection' not in bound, 'successor_context_cross_binding')
+                config_path = project_path(profile_document.get('config'), root,
+                                           'root04_config_path', must_exist=True)
+                selected_config, _ = adaptive.configuration(config_path)
+                need(selected_config == intent['config'], 'root04_config_reopen_binding')
+                root04_profile(context, adaptive, bound, config_path, job,
+                               selected_config, value, require_absent=False,
+                               profile_raw=profile_raw)
         return adaptive.stop(job)
     sources = intent.get('config', {}).get('sources', {})
     saved_binding = sources.get(str(BINDING_PATH.resolve()))

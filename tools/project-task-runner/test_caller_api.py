@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -51,6 +52,16 @@ class PromotionReceiptTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_load_job_rejects_non_string_unit_as_controlled_refusal(self):
+        job = self.root / "job"
+        job.mkdir(mode=0o700)
+        runner.publish(job / "intent.json", {
+            "job_id": "a" * 32, "unit": ["project-task-" + "a" * 32 + ".service"],
+            "job_dir": str(job), "uid": os.getuid(),
+        })
+        with self.assertRaisesRegex(runner.Refused, "job_identity"):
+            runner.load_job(job)
 
     def _write_outcome(self, *, state="complete", scratch_cleanup="complete",
                        retained_scratch=None, manifest_path=None):

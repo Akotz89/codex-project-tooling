@@ -202,11 +202,39 @@ class FakeRuntime:
 
 
 class GenericCallerBindingTests(unittest.TestCase):
+    def test_binding_refuses_external_symlink_project_markers(self):
+        with tempfile.TemporaryDirectory(dir=REPOSITORY) as temp:
+            work = Path(temp)
+            _binding, binding_path, root, _state = make_binding(work)
+            caller.configure(binding_path, expected_binding_sha256=digest(binding_path.read_bytes()))
+            for relative in ('AGENTS.md', '.factory/project-context.md'):
+                with self.subTest(marker=relative):
+                    marker = root / relative
+                    external = work / f'external-{Path(relative).name}'
+                    external.write_text('external marker\n', encoding='utf-8')
+                    marker.unlink()
+                    marker.symlink_to(external)
+                    with self.assertRaisesRegex(caller.Refused, 'project_root'):
+                        caller.binding()
+                    marker.unlink()
+                    marker.write_text('inert fixture\n', encoding='utf-8')
+
+    def test_binding_changes_after_root_selection_refuse(self):
+        with tempfile.TemporaryDirectory(dir=REPOSITORY) as temp:
+            _binding, binding_path, _root, _state = make_binding(Path(temp))
+            trusted = digest(binding_path.read_bytes())
+            caller.configure(binding_path, expected_binding_sha256=trusted)
+            changed = json.loads(binding_path.read_text())
+            changed['project_id'] = 'substituted-project'
+            write_document(binding_path, changed)
+            with self.assertRaisesRegex(caller.Refused, 'root_binding_trust'):
+                caller.binding()
+
     def test_inert_second_project_reaches_legacy_public_run_status_stop(self):
         with tempfile.TemporaryDirectory(dir=REPOSITORY) as temp:
             work = Path(temp)
             binding, binding_path, root, _state = make_binding(work)
-            caller.configure(binding_path)
+            caller.configure(binding_path, expected_binding_sha256=digest(binding_path.read_bytes()))
             caller.binding()
             config_path = root / 'work/run-config.json'
             job_path = root / 'work/jobs/future'
@@ -232,7 +260,7 @@ class GenericCallerBindingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=REPOSITORY) as temp:
             work = Path(temp)
             binding, binding_path, root, state = make_binding(work, packets=True)
-            caller.configure(binding_path)
+            caller.configure(binding_path, expected_binding_sha256=digest(binding_path.read_bytes()))
             caller.binding()
 
             executable = Path(sys.executable).resolve(strict=True)
