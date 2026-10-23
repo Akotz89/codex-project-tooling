@@ -27,6 +27,15 @@ PROPS=('LoadState','ActiveState','SubState','MainPID','InvocationID','ControlGro
 class Refused(Exception):pass
 def need(value,code):
     if not value:raise Refused(code)
+def unit_description(intent):
+    """Derive manager identity from this job's unit, including stored v1 units."""
+    jobid=intent.get('job_id');unit=intent.get('unit')
+    need(type(jobid) is str and type(unit) is str,'job_identity')
+    suffix='-'+jobid+'.service'
+    need(unit.endswith(suffix),'job_identity')
+    prefix=unit[:-len(suffix)]
+    need(re.fullmatch(r'[a-z0-9][a-z0-9-]{0,62}',prefix) is not None,'job_identity')
+    return prefix+' '+jobid
 def digest(raw):return hashlib.sha256(raw).hexdigest()
 def canonical(v):return json.dumps(v,sort_keys=True,separators=(',',':')).encode()
 def private_dir(path):
@@ -293,7 +302,7 @@ def wait_ready(job,intent,env):
         info=unit_show(intent['unit'],env)
         need(info.get('LoadState')=='loaded' and info.get('ActiveState') in ('active','activating')
              and info.get('Result') in ('success',''),'readiness_unit_failed')
-        need(info.get('Description')=='wow-task '+intent['job_id'] and bool(info.get('InvocationID')),
+        need(info.get('Description')==unit_description(intent) and bool(info.get('InvocationID')),
              'readiness_unit_identity')
         if invocation is None:invocation=info['InvocationID']
         need(info['InvocationID']==invocation,'readiness_unit_identity')
@@ -375,14 +384,18 @@ def budget_check(intent,ready,info):
     return actual
 def load_job(job):
     job=private_dir(job);intent=read(job/'intent.json')
-    jobid=intent['job_id'];need(type(jobid) is str and len(jobid)==32 and all(x in '0123456789abcdef' for x in jobid),'job_id')
-    need(intent['unit']=='wow-task-'+jobid+'.service' and intent['job_dir']==str(job) and intent['uid']==os.getuid(),'job_identity')
+    need(type(intent) is dict,'job_shape')
+    jobid=intent.get('job_id');unit=intent.get('unit')
+    need(type(jobid) is str and len(jobid)==32 and all(x in '0123456789abcdef' for x in jobid),'job_id')
+    need(type(unit) is str and unit.endswith('-'+jobid+'.service') and unit_description(intent)
+         and intent.get('job_dir')==str(job) and type(intent.get('uid')) is int
+         and intent['uid']==os.getuid(),'job_identity')
     return job,intent
 def custody(job,intent,info):
     ready=read(job/'ready.json')
     need(ready['intent_sha256']==digest(read_bytes(job/'intent.json')) and ready['job_id']==intent['job_id'],'intent_binding')
     need(info.get('LoadState')!='not-found','unit_absent')
-    need(info['InvocationID']==ready['invocation_id'] and info['Description']=='wow-task '+intent['job_id'],'invocation_mismatch')
+    need(info['InvocationID']==ready['invocation_id'] and info['Description']==unit_description(intent),'invocation_mismatch')
     cg=info['ControlGroup']
     need(cg=='' or cg==service_cgroup(ready),'cgroup_mismatch')
     pid=int(info['MainPID'])
@@ -421,12 +434,12 @@ def public_status(job,env=None):
 def launch(job,config):
     env,version=manager_environment();c,chash=configuration(config)
     job=Path(job).absolute();private_dir(job.parent);job.mkdir(mode=0o700)
-    jobid=uuid.uuid4().hex;intent={'job_id':jobid,'unit':'wow-task-'+jobid+'.service','job_dir':str(job),'uid':os.getuid(),'config':c,'config_sha256':chash,'argv_sha256':digest(canonical(c['argv'])),'source_pins':source_pins(),'environment_sha256':digest(canonical(env)),'manager_version':version}
+    jobid=uuid.uuid4().hex;intent={'job_id':jobid,'unit':'project-task-'+jobid+'.service','job_dir':str(job),'uid':os.getuid(),'config':c,'config_sha256':chash,'argv_sha256':digest(canonical(c['argv'])),'source_pins':source_pins(),'environment_sha256':digest(canonical(env)),'manager_version':version}
     if c.get('stdin_file'):
         f,intent['stdin_identity']=open_input(c['stdin_file']);f.close()
     publish(job/'environment.json',env);publish(job/'intent.json',intent)
     properties=unlimited_properties()
-    argv=['systemd-run','--user','--quiet','--unit='+intent['unit'],'--description=wow-task '+jobid,'--service-type=exec','--remain-after-exit','--expand-environment=no','--working-directory='+str(job)]
+    argv=['systemd-run','--user','--quiet','--unit='+intent['unit'],'--description='+unit_description(intent),'--service-type=exec','--remain-after-exit','--expand-environment=no','--working-directory='+str(job)]
     for k,v in properties.items():argv.append('--property='+k+'='+str(v))
     for k,v in env.items():argv.append('--setenv='+k+'='+v)
     argv += [sys.executable,'-B',str(HERE/'runner.py'),'_worker',str(job)]
@@ -522,7 +535,7 @@ def worker(job):
     info=unit_show(intent['unit'],env)
     need(info.get('MainPID')==str(os.getpid()) and info.get('ControlGroup')==cg
          and info.get('InvocationID')==os.environ.get('INVOCATION_ID')
-         and bool(info.get('InvocationID')) and info.get('Description')=='wow-task '+intent['job_id'],'supervisor_unit_identity')
+         and bool(info.get('InvocationID')) and info.get('Description')==unit_description(intent),'supervisor_unit_identity')
     try:
         need(ctypes.CDLL(None).prctl(36,1,0,0,0)==0,'subreaper')
         need(all(os.environ.get(k)==v for k,v in env.items()),'unit_environment')

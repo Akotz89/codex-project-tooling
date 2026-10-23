@@ -1,5 +1,7 @@
 """Offline project binding checks; no native units or live state are used."""
 from contextlib import contextmanager
+from contextlib import redirect_stdout
+import io
 import importlib.util
 import json
 import os
@@ -13,6 +15,10 @@ import unittest
 from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
+CONTEXT_SPEC = importlib.util.spec_from_file_location(
+    'generic_project_context_helpers', HERE.parent / 'project_context.py')
+context_helpers = importlib.util.module_from_spec(CONTEXT_SPEC)
+CONTEXT_SPEC.loader.exec_module(context_helpers)
 
 
 def load():
@@ -57,14 +63,37 @@ class ProjectContext(unittest.TestCase):
         self.run.base.publish(path, config)
         return path
 
-    def enqueue(self, root, explicit=True):
+    def test_binding_clears_stale_cross_project_legacy_binding(self):
+        class Runtime:
+            PROJECT_ROOT = None
+            CANONICAL_STATE = None
+            CODE_ROOT = None
+            PROJECT_ID = 'old-project'
+            LEGACY_PROJECT_BINDING = {'project_id': 'old-project'}
+
+            @staticmethod
+            def bind_context(root, state):
+                Runtime.PROJECT_ROOT = root
+                Runtime.CANONICAL_STATE = state
+                Runtime.CODE_ROOT = HERE.parents[2]
+                return state
+
+        root = self.roots[0]
+        context_helpers.bind_project_context(
+            Runtime, root, root / 'state', 'first-project', HERE.parents[2])
+        self.assertIsNone(Runtime.LEGACY_PROJECT_BINDING)
+        self.assertEqual(Runtime.PROJECT_ID, 'first-project')
+
+    def enqueue(self, root, explicit=True, project_binding=None):
         with patch.object(self.run.base, 'manager_environment', return_value=({}, 'fixture')), \
              patch.object(self.run, 'common_cgroup', return_value=Path('/unused')), \
              patch.object(self.run.policy, 'sample_host', return_value={'missing': ['offline.fixture']}) as sample, \
              patch.object(self.run, 'start_unit', side_effect=AssertionError('offline fixture must not launch')):
             config = self.config(root)
-            result = (self.run.launch(root / 'job', config, root / 'state', root) if explicit
-                      else self.run.launch(root / 'job', config, root / 'state'))
+            result = (self.run.launch(root / 'job', config, root / 'state', root,
+                                      project_binding=project_binding) if explicit
+                      else self.run.launch(root / 'job', config, root / 'state',
+                                           project_binding=project_binding))
             self.assertEqual(result['state'], 'READY')
             self.assertEqual(result['capacity_status'], 'unknown')
             self.assertEqual(sample.call_args.args[0], root)
@@ -176,6 +205,106 @@ class ProjectContext(unittest.TestCase):
         self.assertIsNone(self.run.CANONICAL_STATE)
         self.assertEqual(self.run.CODE_ROOT, HERE.parents[2])
         self.assertTrue(self.run.source_pins())
+
+    def test_inert_second_project_binding_uses_only_explicit_project_and_state(self):
+        second = self.roots[1]
+        state = self.run.bind_context(second, second / 'state')
+
+        self.assertEqual(self.run.PROJECT_ROOT, second.resolve())
+        self.assertEqual(self.run.ROOT, second.resolve())
+        self.assertEqual(self.run.CANONICAL_STATE, (second / 'state').resolve())
+        self.assertEqual(state, self.run.CANONICAL_STATE)
+        self.assertEqual(self.run.PROJECT_ROOT.name, 'second')
+
+    def test_generic_context_helper_passes_project_identity_to_runtime(self):
+        second = self.roots[1]
+        state = context_helpers.bind_project_context(
+            self.run, second, second / 'state', 'second-project', HERE.parents[2])
+        self.assertEqual(state, (second / 'state').resolve())
+        self.assertEqual(self.run.PROJECT_ID, 'second-project')
+
+    def test_packet_set_reads_and_hashes_one_bounded_pinned_snapshot(self):
+        root = self.roots[0]
+        packet = root / 'work' / 'packets' / 'source.json'
+        packet.parent.mkdir(parents=True)
+        raw = b'{"generation":1}\n'
+        packet.write_bytes(raw)
+
+        class API:
+            def __init__(self): self.reads = []
+            def read_pinned_source(self, path, expected, *, limit):
+                self.reads.append((Path(path), expected, limit))
+                captured = Path(path).read_bytes()
+                if __import__('hashlib').sha256(captured).hexdigest() != expected:
+                    raise ValueError('pin drift')
+                return captured
+
+        api = API()
+        import hashlib
+        descriptors = {'source_evidence': {
+            'path': 'work/packets/source.json',
+            'sha256': hashlib.sha256(raw).hexdigest()}}
+        packets, references = context_helpers.read_pinned_packet_set(
+            descriptors, root, api, limit=128)
+        self.assertEqual(packets['source_evidence'], {'generation': 1})
+        self.assertEqual(references['source_evidence']['sha256'], descriptors['source_evidence']['sha256'])
+        self.assertEqual(len(api.reads), 1)
+        self.assertEqual(api.reads[0][2], 128)
+
+    def test_second_project_binding_drives_public_run_status_stop_and_payload_paths(self):
+        second = self.roots[1]
+        binding = {'project_id': 'second-project', 'unit_prefix': 'second-task',
+                   'payload_environment': {'SECOND_TASK_SCRATCH': '{job}/scratch'}}
+        state = context_helpers.bind_project_context(
+            self.run, second, second / 'state', 'second-project', HERE.parents[2],
+            legacy_project_binding=binding)
+        config = self.config(second)
+
+        def cli(args):
+            output = io.StringIO()
+            with patch.object(self.run.sys, 'argv', ['runner.py', *args]), \
+                 patch.object(self.run.base, 'manager_environment', return_value=({}, 'fixture')), \
+                 patch.object(self.run, 'common_cgroup', return_value=Path('/unused')), \
+                 patch.object(self.run.policy, 'sample_host', return_value={'missing': ['offline.fixture']}), \
+                 patch.object(self.run, 'start_unit', side_effect=AssertionError('offline fixture must not launch')), \
+                 redirect_stdout(output):
+                code = self.run.main()
+            self.assertEqual(code, 0, output.getvalue())
+            return json.loads(output.getvalue())
+
+        result = cli(['run', '--job', str(second / 'job'), '--config', str(config),
+                      '--state', str(state), '--project-root', str(second)])
+        intent = self.run.base.read(second / 'job/intent.json')
+        self.assertEqual(intent['project_binding'], binding)
+        self.assertEqual(intent['unit'], 'second-task-' + result['job_id'] + '.service')
+        self.assertEqual(self.run.payload_environment(intent, second / 'job'),
+                         {'SECOND_TASK_SCRATCH': str(second / 'job/scratch')})
+        status = cli(['status', '--job', str(second / 'job')])
+        stopped = cli(['stop', '--job', str(second / 'job')])
+        self.assertEqual(status['job_id'], result['job_id'])
+        self.assertEqual(stopped['state'], 'CANCELLED')
+
+    def test_generic_context_and_runtime_have_no_wow_identity_or_path_assumptions(self):
+        for path in (HERE.parent / 'project_context.py', HERE / 'runner.py',
+                     HERE.parent / 'runner.py', HERE.parent / 'caller_api.py'):
+            source = path.read_bytes().lower()
+            for forbidden in (b'wow-private-server', b'wow_task_',
+                              b'/wow private server/', b'root-resume-20261020'):
+                self.assertNotIn(forbidden, source, f'{path}: {forbidden!r}')
+
+    def test_legacy_v2_intent_uses_explicitly_bound_payload_environment(self):
+        root = self.roots[0]
+        legacy = {'project_id': 'wow-private-server', 'unit_prefix': 'wow-task',
+                  'payload_environment': {
+                      'WOW_TASK_CONTROL_FILE': '{job}/control.json',
+                      'WOW_TASK_SCRATCH_DIR': '{job}/scratch'}}
+        self.run.bind_context(root, root / 'state', 'wow-private-server', legacy)
+        job = root / 'legacy-job'
+        job.mkdir(mode=0o700)
+        intent = {'job_id': 'legacy-1', 'unit': 'wow-task-legacy-1.service'}
+        self.assertEqual(self.run.payload_environment(intent, job), {
+            'WOW_TASK_CONTROL_FILE': str(job / 'control.json'),
+            'WOW_TASK_SCRATCH_DIR': str(job / 'scratch')})
 
     def test_job_paths_stay_inside_project_before_config_or_ledger_work(self):
         root = self.roots[0]
@@ -402,6 +531,66 @@ class ProjectContext(unittest.TestCase):
         with patch.object(self.run.base, 'read', side_effect=read_before_host), \
              self.assertRaisesRegex(RuntimeError, 'fixture stops before host work'):
             self.run.worker(root / 'job')
+
+    def test_worker_passes_custom_project_binding_to_payload_subprocess(self):
+        from types import SimpleNamespace
+
+        root = self.roots[0]
+        job = root / 'bound-job'
+        job.mkdir(mode=0o700)
+        (job / 'environment.json').write_text('{}', encoding='utf-8')
+        (job / 'environment.json').chmod(0o600)
+        state = root / 'state'
+        project_binding = {'project_id': 'second-project', 'unit_prefix': 'second-task',
+                           'payload_environment': {
+                               'SECOND_TASK_CONTROL': '{job}/control.json',
+                               'SECOND_TASK_SCRATCH': '{job}/scratch'}}
+        intent = {'contract_version': 2, 'candidate': str(self.run.HERE),
+                  'project_root': str(root), 'state_dir': str(state), 'job_id': 'run-1',
+                  'unit': 'second-task-run-1.service', 'project_binding': project_binding,
+                  'source_pins': {}, 'topology': 'none', 'config': {'argv': ['/usr/bin/true'], 'cwd': str(root),
+                    'sources': {}, 'estimates': {'memory_bytes': 1}, 'owner': 'fixture'}}
+        self.run.base.publish(job / 'intent.json', intent)
+        cg = '/user.slice/user-1000.slice/user@1000.service/second-task-run-1.service'
+        identity = {'pid': os.getpid(), 'uid': os.getuid(), 'start_ticks': 1, 'cgroup': cg}
+        captured = {}
+
+        class StopBeforePayload(Exception):
+            pass
+
+        def admit(job_path, _cancelled, _deadline):
+            ready = self.run.base.read(job_path / 'ready.json')
+            self.run.base.publish(job_path / 'admission.json', {
+                'intent_sha256': ready['intent_sha256'],
+                'invocation_id': ready['invocation_id']})
+
+        def publish(path, value):
+            Path(path).write_text(json.dumps(value), encoding='utf-8')
+            Path(path).chmod(0o600)
+
+        def capture_popen(*args, **kwargs):
+            captured['args'] = args
+            captured['kwargs'] = kwargs
+            raise StopBeforePayload()
+
+        with patch.object(self.run.base, 'load_job', return_value=(job, intent)), \
+             patch.object(self.run.base, 'process', return_value=identity), \
+             patch.object(self.run.base, 'unit_show', return_value={
+                 'MainPID': str(os.getpid()), 'ControlGroup': cg,
+                 'InvocationID': 'fixture-invocation', 'Description': 'second-task run-1'}), \
+             patch.object(self.run.base, 'management_cgroup', return_value=cg), \
+             patch.object(self.run.base, 'pins'), \
+             patch.object(self.run.base, 'admission_wait_ok', side_effect=admit), \
+             patch.object(self.run.base, 'cleanup_members', return_value={'quiescent': True, 'errors': []}), \
+             patch.object(self.run.base, 'publish', side_effect=publish), \
+             patch.object(self.run.ctypes, 'CDLL', return_value=SimpleNamespace(prctl=lambda *args: 0)), \
+             patch.object(self.run.subprocess, 'Popen', side_effect=capture_popen), \
+             patch.dict(os.environ, {'INVOCATION_ID': 'fixture-invocation'}):
+            self.run.worker(job)
+
+        payload_env = captured['kwargs']['env']
+        self.assertEqual(payload_env['SECOND_TASK_CONTROL'], str(job / 'control.json'))
+        self.assertEqual(payload_env['SECOND_TASK_SCRATCH'], str(job / 'scratch'))
 
     def test_mismatched_intent_refuses_all_resume_paths_before_lock(self):
         first, second = self.roots

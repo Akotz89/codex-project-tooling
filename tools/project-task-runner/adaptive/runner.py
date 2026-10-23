@@ -9,6 +9,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import resource
 import signal
 import stat
@@ -20,7 +21,8 @@ import uuid
 sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
 CODE_ROOT = HERE.parents[2]
-PROJECT_ROOT = ROOT = CANONICAL_STATE = None
+PROJECT_ROOT = ROOT = CANONICAL_STATE = PROJECT_ID = None
+LEGACY_PROJECT_BINDING = None
 
 
 def module(name, path):
@@ -37,18 +39,88 @@ need = base.need
 TERMINAL = retention.TERMINAL
 
 
-def bind_context(project_root, state):
+def bind_context(project_root, state, project_id=None, legacy_project_binding=None):
     """Bind explicit existing project/state inputs without selecting a store."""
-    global PROJECT_ROOT, ROOT, CANONICAL_STATE
+    global PROJECT_ROOT, ROOT, CANONICAL_STATE, PROJECT_ID, LEGACY_PROJECT_BINDING
     root = Path.cwd() if project_root is None else Path(project_root)
     root = root.resolve(strict=True)
     need(root.is_dir(), 'project_directory')
+    if project_id is not None:
+        need(type(project_id) is str and re.fullmatch(
+            r'[a-z0-9][a-z0-9._-]{0,63}', project_id) is not None, 'project_identity')
     state = base.private_dir(state)
     state = state.resolve(strict=True)
     need(state.is_relative_to(root), 'state_outside_project')
     PROJECT_ROOT = ROOT = root
     CANONICAL_STATE = state
+    PROJECT_ID = project_id
+    if legacy_project_binding is not None:
+        legacy = validate_project_binding(legacy_project_binding, check_context=False)
+        need(legacy['project_id'] == project_id, 'legacy_project_binding_identity')
+        LEGACY_PROJECT_BINDING = legacy
     return state
+
+
+def validate_project_binding(value=None, *, check_context=True):
+    """Validate caller-supplied project identity and unit/payload data."""
+    if value is None:
+        if LEGACY_PROJECT_BINDING is not None and (
+                PROJECT_ID is None or LEGACY_PROJECT_BINDING['project_id'] == PROJECT_ID):
+            return dict(LEGACY_PROJECT_BINDING)
+        value = {'project_id': PROJECT_ID or 'generic', 'unit_prefix': 'project-task',
+                 'payload_environment': {}}
+    need(type(value) is dict and set(value) == {
+        'project_id', 'unit_prefix', 'payload_environment'}, 'project_binding_shape')
+    project_id = value['project_id']; prefix = value['unit_prefix']; payload = value['payload_environment']
+    need(type(project_id) is str and re.fullmatch(
+        r'[a-z0-9][a-z0-9._-]{0,63}', project_id) is not None, 'project_binding_identity')
+    need(type(prefix) is str and re.fullmatch(
+        r'[a-z0-9][a-z0-9-]{0,62}', prefix) is not None, 'project_binding_unit')
+    need(not check_context or PROJECT_ID is None or PROJECT_ID == project_id,
+         'project_binding_context')
+    need(type(payload) is dict, 'project_binding_environment')
+    for name, template in payload.items():
+        need(type(name) is str and re.fullmatch(
+            r'[A-Z][A-Z0-9_]{0,63}', name) is not None
+            and type(template) is str and template.count('{job}') == 1
+            and template.replace('{job}', '').find('{') < 0
+            and template.replace('{job}', '').find('}') < 0,
+            'project_binding_environment')
+    return {'project_id': project_id, 'unit_prefix': prefix,
+            'payload_environment': dict(payload)}
+
+
+def intent_project_binding(intent):
+    value = intent.get('project_binding')
+    if value is not None:
+        result = validate_project_binding(value, check_context=False)
+        need(intent.get('unit') == result['unit_prefix'] + '-' + intent['job_id'] + '.service',
+             'project_unit_binding')
+        return result
+    # Existing v2 records carry their historical unit. Derive that identity
+    # from the record so status/stop remain compatible without a fixed prefix.
+    unit = intent.get('unit', '')
+    suffix = '-' + intent.get('job_id', '') + '.service'
+    need(type(unit) is str and type(intent.get('job_id')) is str and unit.endswith(suffix),
+         'project_unit_binding')
+    prefix = unit[:-len(suffix)]
+    need(re.fullmatch(r'[a-z0-9][a-z0-9-]{0,62}', prefix) is not None,
+         'project_unit_binding')
+    if LEGACY_PROJECT_BINDING is not None:
+        need(prefix == LEGACY_PROJECT_BINDING['unit_prefix'], 'legacy_project_unit_binding')
+        return dict(LEGACY_PROJECT_BINDING)
+    return {'project_id': PROJECT_ID or 'legacy', 'unit_prefix': prefix,
+            'payload_environment': {}}
+
+
+def payload_environment(intent, job):
+    binding = intent_project_binding(intent)
+    values = {}
+    for name, template in binding['payload_environment'].items():
+        path = Path(template.replace('{job}', str(job))).resolve(strict=False)
+        need(path.is_relative_to(Path(job).resolve(strict=True)), 'project_payload_path')
+        values[name] = str(path)
+    return values
 
 
 def project_job(job):
@@ -313,8 +385,9 @@ def budget_check(intent, ready, info, cpu):
     return actual
 
 
-def launch(job, config, state, project_root=None):
-    state = bind_context(project_root, state)
+def launch(job, config, state, project_root=None, project_binding=None):
+    binding = validate_project_binding(project_binding)
+    state = bind_context(project_root, state, binding['project_id'])
     need(state == CANONICAL_STATE, 'canonical_shared_state_required')
     job = project_job(job)
     base.private_dir(job.parent)
@@ -326,7 +399,8 @@ def launch(job, config, state, project_root=None):
     (job / 'scratch').mkdir(mode=0o700)
     ident = uuid.uuid4().hex
     intent = {'contract_version': 2, 'candidate': str(HERE), 'project_root': str(ROOT), 'state_dir': str(state), 'job_id': ident,
-              'unit': 'wow-task-' + ident + '.service', 'job_dir': str(job), 'uid': os.getuid(), 'config': c,
+              'unit': binding['unit_prefix'] + '-' + ident + '.service', 'project_binding': binding,
+              'job_dir': str(job), 'uid': os.getuid(), 'config': c,
               'config_sha256': chash, 'argv_sha256': base.digest(base.canonical(c['argv'])), 'source_pins': source_pins(),
               'environment_sha256': base.digest(base.canonical(env)), 'manager_version': version, 'topology': base.TOPOLOGY}
     if c.get('stdin_file'):
@@ -349,10 +423,14 @@ def launch(job, config, state, project_root=None):
 def start_unit(job, intent, record, env):
     properties = base.unlimited_properties()
     cpu = record['allocation']['cpu']
+    binding = intent_project_binding(intent)
     if intent.get('topology') == base.TOPOLOGY:
         properties.update(Delegate='cpu', DelegateSubgroup='management')
-    argv = ['systemd-run', '--user', '--quiet', '--unit=' + intent['unit'], '--description=wow-task ' + intent['job_id'],
+    argv = ['systemd-run', '--user', '--quiet', '--unit=' + intent['unit'], '--description=' + binding['unit_prefix'] + ' ' + intent['job_id'],
             '--service-type=exec', '--remain-after-exit', '--expand-environment=no', '--working-directory=' + str(job)]
+    if intent.get('project_binding') is None and LEGACY_PROJECT_BINDING is not None:
+        argv.append('--setenv=PROJECT_TASK_LEGACY_BINDING=' + json.dumps(
+            LEGACY_PROJECT_BINDING, sort_keys=True, separators=(',', ':')))
     argv += ['--property=' + k + '=' + str(v) for k, v in properties.items()]
     argv += ['--setenv=' + k + '=' + v for k, v in env.items()]
     argv += [sys.executable, '-B', str(HERE / 'runner.py'), '_worker', str(job)]
@@ -390,7 +468,7 @@ def start_unit(job, intent, record, env):
 def advance(job, env=None):
     job, intent = base.load_job(job)
     need(intent.get('contract_version') == 2 and intent['candidate'] == str(HERE), 'candidate_mismatch')
-    bind_context(intent.get('project_root'), intent['state_dir'])
+    bind_context(intent.get('project_root'), intent['state_dir'], intent_project_binding(intent)['project_id'])
     job = project_job(job)
     base.pins(intent['source_pins'])
     env = base.manager_environment()[0] if env is None else env
@@ -463,7 +541,7 @@ def cleanup_terminal(job, env):
 def stop(job):
     job, intent = base.load_job(job)
     need(intent.get('contract_version') == 2 and intent['candidate'] == str(HERE), 'candidate_mismatch')
-    bind_context(intent.get('project_root'), intent['state_dir'])
+    bind_context(intent.get('project_root'), intent['state_dir'], intent_project_binding(intent)['project_id'])
     job = project_job(job)
     base.pins(intent['source_pins'])
     with locked(intent['state_dir']) as state:
@@ -587,7 +665,19 @@ def worker(job):
     os.umask(0o077)
     job, intent = base.load_job(job)
     need(intent.get('contract_version') == 2 and intent['candidate'] == str(HERE), 'worker_candidate')
-    bind_context(intent.get('project_root'), intent['state_dir'])
+    global LEGACY_PROJECT_BINDING
+    legacy_raw = os.environ.get('PROJECT_TASK_LEGACY_BINDING')
+    if legacy_raw is not None:
+        try:
+            legacy_value = json.loads(legacy_raw)
+        except (TypeError, json.JSONDecodeError) as error:
+            raise base.Refused('legacy_project_binding_environment') from error
+        need(type(legacy_value) is dict and json.dumps(
+            legacy_value, sort_keys=True, separators=(',', ':')) == legacy_raw,
+             'legacy_project_binding_environment')
+        LEGACY_PROJECT_BINDING = validate_project_binding(legacy_value, check_context=False)
+    binding = intent_project_binding(intent)
+    bind_context(intent.get('project_root'), intent['state_dir'], binding['project_id'])
     job = project_job(job)
     env = base.read(job / 'environment.json')
     c = intent['config']
@@ -601,7 +691,7 @@ def worker(job):
     delegated = intent.get('topology') == base.TOPOLOGY
     need(cg.endswith('/' + intent['unit'] + ('/management' if delegated else '')), 'supervisor_cgroup')
     info = base.unit_show(intent['unit'], env)
-    need(info.get('MainPID') == str(os.getpid()) and base.management_cgroup(intent, info.get('ControlGroup', '')) == cg and info.get('InvocationID') == os.environ.get('INVOCATION_ID') and bool(info.get('InvocationID')) and info.get('Description') == 'wow-task ' + intent['job_id'], 'supervisor_unit_identity')
+    need(info.get('MainPID') == str(os.getpid()) and base.management_cgroup(intent, info.get('ControlGroup', '')) == cg and info.get('InvocationID') == os.environ.get('INVOCATION_ID') and bool(info.get('InvocationID')) and info.get('Description') == binding['unit_prefix'] + ' ' + intent['job_id'], 'supervisor_unit_identity')
     counters = {'bytes_seen': 0, 'bytes_kept': 0, 'truncated': False}
     try:
         need(ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0, 'subreaper')
@@ -617,7 +707,7 @@ def worker(job):
         base.admission_wait_ok(job, cancelled, deadline)
         need(base.read(job / 'admission.json') == {'intent_sha256': ready['intent_sha256'], 'invocation_id': ready['invocation_id']}, 'admission_identity')
         base.pins(intent['source_pins']); base.pins(c['sources']); need(not cancelled, 'cancelled_before_payload')
-        payload_env = dict(env, WOW_TASK_CONTROL_FILE=str(job / 'control.json'), WOW_TASK_SCRATCH_DIR=str(job / 'scratch'))
+        payload_env = dict(env, **payload_environment(intent, job))
         stdin = base.open_input(c['stdin_file'], intent['stdin_identity'])[0] if c.get('stdin_file') else subprocess.DEVNULL
         with (job / 'payload.log').open('xb', buffering=0) as log:
             try:
