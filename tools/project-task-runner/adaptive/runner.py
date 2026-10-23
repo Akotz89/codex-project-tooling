@@ -425,7 +425,7 @@ def start_unit(job, intent, record, env):
     cpu = record['allocation']['cpu']
     binding = intent_project_binding(intent)
     if intent.get('topology') == base.TOPOLOGY:
-        properties.update(Delegate='cpu', DelegateSubgroup='management')
+        properties.update(Delegate=' '.join(base.TOPOLOGY_CONTROLLERS), DelegateSubgroup='management')
     argv = ['systemd-run', '--user', '--quiet', '--unit=' + intent['unit'], '--description=' + binding['unit_prefix'] + ' ' + intent['job_id'],
             '--service-type=exec', '--remain-after-exit', '--expand-environment=no', '--working-directory=' + str(job)]
     if intent.get('project_binding') is None and LEGACY_PROJECT_BINDING is not None:
@@ -436,33 +436,58 @@ def start_unit(job, intent, record, env):
     argv += [sys.executable, '-B', str(HERE / 'runner.py'), '_worker', str(job)]
     base.publish(job / 'launch-intent.json', {'properties': properties, 'job_id': intent['job_id'],
                                             'launcher_process': base.process(os.getpid())})
+    phase = 'launcher_start'
     try:
-        result = base.command(argv, env)
-    except subprocess.TimeoutExpired:
-        base.publish(job / 'launch-outcome.json', {'state': 'UNKNOWN', 'error': 'launcher_timeout'})
-        return
-    base.publish(job / 'launch-outcome.json', {'state': 'RETURNED', 'exit': result.returncode, 'stderr': result.stderr[:4096]})
-    if result.returncode != 0 and base.unit_show(intent['unit'], env).get('LoadState') == 'not-found' and not (job / 'ready.json').exists():
-        record['state'] = 'failed-before-launch'
-        return
-    need(result.returncode == 0, 'launch_rejected')
-    base.wait_ready(job, intent, env)
-    info = base.unit_show(intent['unit'], env)
-    ready = base.custody(job, intent, info)
-    if intent.get('topology') == base.TOPOLOGY:
-        apply_allocation(job, record['allocation'], env)
-    actual = budget_check(intent, ready, info, cpu)
-    need(ready['environment_sha256'] == intent['environment_sha256'], 'environment_changed')
-    base.pins(intent['source_pins']); base.pins(intent['config']['sources'])
-    base.publish(job / 'custody.json', {'invocation_id': ready['invocation_id'], 'process': ready['process'], 'budget': actual, 'manager': info})
-    base.custody(job, intent, base.unit_show(intent['unit'], env))
-    allocation = record['allocation']
-    descriptor = intent['config']['cooperative']
-    replace(job / 'control.json', {'version': 2, 'job_id': intent['job_id'], 'cpu': cpu,
-             'fanout': allocation['fanout'] if descriptor['enabled'] else None,
-             'checkpoint': allocation['checkpoint'] if descriptor['enabled'] else None})
-    base.publish(job / 'admission.json', {'intent_sha256': base.digest(base.read_bytes(job / 'intent.json')), 'invocation_id': ready['invocation_id']})
-    record['state'] = 'running'
+        try:
+            result = base.command(argv, env)
+        except subprocess.TimeoutExpired:
+            base.publish(job / 'launch-outcome.json', {'state': 'UNKNOWN', 'error': 'launcher_timeout'})
+            return
+        base.publish(job / 'launch-outcome.json', {'state': 'RETURNED', 'exit': result.returncode, 'stderr': result.stderr[:4096]})
+        if result.returncode != 0 and base.unit_show(intent['unit'], env).get('LoadState') == 'not-found' and not (job / 'ready.json').exists():
+            record['state'] = 'failed-before-launch'
+            return
+        need(result.returncode == 0, 'launch_rejected')
+        phase = 'readiness'
+        base.wait_ready(job, intent, env)
+        phase = 'unit_readback'
+        info = base.unit_show(intent['unit'], env)
+        phase = 'identity_and_topology'
+        ready = base.custody(job, intent, info)
+        if intent.get('topology') == base.TOPOLOGY:
+            phase = 'adaptive_allocation'
+            apply_allocation(job, record['allocation'], env)
+        phase = 'physical_budget'
+        actual = budget_check(intent, ready, info, cpu)
+        phase = 'environment_and_source_pins'
+        need(ready['environment_sha256'] == intent['environment_sha256'], 'environment_changed')
+        base.pins(intent['source_pins']); base.pins(intent['config']['sources'])
+        base.publish(job / 'custody.json', {'invocation_id': ready['invocation_id'], 'process': ready['process'], 'budget': actual, 'manager': info})
+        base.custody(job, intent, base.unit_show(intent['unit'], env))
+        allocation = record['allocation']
+        descriptor = intent['config']['cooperative']
+        replace(job / 'control.json', {'version': 2, 'job_id': intent['job_id'], 'cpu': cpu,
+                 'fanout': allocation['fanout'] if descriptor['enabled'] else None,
+                 'checkpoint': allocation['checkpoint'] if descriptor['enabled'] else None})
+        phase = 'publish_admission'
+        base.publish(job / 'admission.json', {'intent_sha256': base.digest(base.read_bytes(job / 'intent.json')), 'invocation_id': ready['invocation_id']})
+        record['state'] = 'running'
+    except Exception as error:
+        receipt = {'phase': phase, 'exception_type': type(error).__name__}
+        reason = str(error)
+        if isinstance(error, base.Refused) and re.fullmatch(r'[a-z0-9_]{1,80}', reason):
+            receipt['reason'] = reason
+        filename = getattr(error, 'filename', None)
+        if isinstance(filename, (str, bytes, os.PathLike)):
+            path = Path(os.fsdecode(filename))
+            if path.is_absolute() and Path('/sys/fs/cgroup') in path.parents and '..' not in path.parts:
+                receipt['path'] = str(path)
+        try:
+            if not (job / 'pre-admission-error.json').exists():
+                base.publish(job / 'pre-admission-error.json', receipt)
+        except Exception:
+            pass
+        raise
 
 
 def advance(job, env=None):
