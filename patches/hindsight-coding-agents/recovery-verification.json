@@ -1,0 +1,16 @@
+{
+  "base": "16df02aeeadb45d2cb7298b52f9785bc49544484",
+  "patch_sha256": "d731edc331147969f322e1c00661416b1a10612e502763206280c8a18ef9bbb4",
+  "git_apply_check": "passed",
+  "git_apply": "passed",
+  "patched_source_files_verified": 255,
+  "unchanged_support_files_recoverable_at_base_verified": 22,
+  "all_bytes_modes": true,
+  "upstream_notice_paths": [
+    "LICENSE"
+  ],
+  "license_sha256": "01fde0bedf83bdc185065d7af524a61690efe576a67f922eaff3a1280c17b63a",
+  "source_repo_writes": false,
+  "base_file_modes_read_from_official_git_tree": true,
+  "manifest_modes_not_used_to_materialize_base": true
+}

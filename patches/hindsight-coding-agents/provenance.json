@@ -1,0 +1,35 @@
+{
+  "repository": "https://github.com/vectorize-io/hindsight",
+  "official_base": "16df02aeeadb45d2cb7298b52f9785bc49544484",
+  "package": "@vectorize-io/hindsight-coding-agents",
+  "package_version": "0.8.2",
+  "source_patch_sha256": "d731edc331147969f322e1c00661416b1a10612e502763206280c8a18ef9bbb4",
+  "source_manifest_sha256": "0e008301771f4d0ec08045610b11fe76ee3b3d50f5c44f809f30f00af55fd94b",
+  "runtime_manifest_sha256": "0254b010dd24c5e6d38a1c43a5232cf41af46c87eba7362a1f19caec4a9905dc",
+  "retained_archives": [
+    {
+      "path": "local CPI414 memory-implementation/final-source.tar.gz",
+      "sha256": "1140191ef8b695f57d22501b79e209760429e724e9ac281227d10ecf0f4eb78f",
+      "members": 255
+    },
+    {
+      "path": "local CPI414 memory-implementation/final-runtime.tar.gz",
+      "sha256": "ca537da33d7427d6f14765dcfc2c7c2bc8c72c07aa02127f3d87536975dd60f5",
+      "members": 65
+    },
+    {
+      "path": "local CPI414 memory-implementation/supporting-source.tar.gz",
+      "sha256": "b1b7f819a8a6ee17702251919d1a690ec738d5e3993d0d651af283d00af69b23",
+      "members": 22
+    }
+  ],
+  "source_closure": {
+    "path": "work/delivery-workflow-repair-20261023/memory-review/closure-final.json",
+    "sha256": "695ae935cff02dd68c3e07c35da848adaab64545fa6f75a9d3bed7a725165569",
+    "at": "2026-10-23T16:05:48.972434+00:00",
+    "verdict": "source_closure_supported: all four original B7-B10 findings and independent M1-M3 corrections closed within the synchronous local lifecycle/replay scope; no remaining blocking defect found by inspection",
+    "runtime_acceptance": "not_performed; this is source closure and retained evidence verification, not live adoption or useful completed memory acceptance"
+  },
+  "implementation_report_sha256": "412ec6c6a8b904f4d8eab5679109aae6f160a03a5be5e1c8d3654310dac55e77",
+  "distribution": "supplemental source patch and text manifests only; build/runtime/source tarballs/dependencies/state/credentials excluded"
+}

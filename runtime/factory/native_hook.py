@@ -105,7 +105,7 @@ def native_caller_mapping(prepared, session_id):
         return 'native_prefix_session_uuid'
     raise ValueError('native_caller_mismatch')
 
-def validate(event, root, *, fresh=True):
+def validate(event, root, *, fresh=True, private_reader=None):
     from .consumer import shared_root, read_settings, project_binding, verify_source
     from .jev_router import validate_allowed_models
     root = shared_root(Path(root).resolve())
@@ -121,7 +121,7 @@ def validate(event, root, *, fresh=True):
     current_models = validate_allowed_models(config['allowed_models']) if 'allowed_models' in config else None
     current_policy = {'allowed_models': current_models}
     arguments, locator, native = dispatch_input(event)
-    path, prepared = private_json(root, locator)
+    path, prepared = (private_json if private_reader is None else private_reader)(root, locator)
     if native is not None and any(key in prepared for key in ('native_transport', 'native_task_name', 'native_request')):
         raise ValueError('native_transport_mode_mismatch')
     expected_id = path.stem

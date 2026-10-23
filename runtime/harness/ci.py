@@ -44,27 +44,21 @@ def resolve(argv: list[str]) -> list[str]:
     cannot find the file specified", which reads like the tool is not installed when
     it is on PATH and works in any terminal.
 
-    THE QUOTES COME OFF FIRST, and that is not cosmetic. Commands are split with
-    posix=False, which is right on Windows because it leaves backslashes in paths
-    alone -- but it also leaves the QUOTES attached to the token, so an interpreter
-    path containing a space arrives quoted, `shutil.which` cannot match it, and
-    subprocess fails with the exact misleading error this function exists to
-    prevent. `C:\\Program Files` is where Windows puts things.
+    Legacy command strings are unquoted by run() after parsing. Structured argv
+    is already literal, including any intentional surrounding quote characters.
     """
     if not argv:
         return argv
-    # EVERY token, not just argv[0]. See unquote() for what only doing the head
-    # cost: an import check that could not fail.
-    argv = [unquote(t) for t in argv]
     return [shutil.which(argv[0]) or argv[0], *argv[1:]]
 
 
-def run(step: str, cmd: str | list[str], timeout: int = 600) -> tuple[int, str]:
+def run(step: str, cmd: str | list[str], timeout: int = 600, *, cwd: Path = ROOT) -> tuple[int, str]:
     """One rung. A TIMEOUT IS A FAILURE, not a skip -- a hung check reports nothing."""
-    argv = resolve(shlex.split(cmd, posix=False) if isinstance(cmd, str) else list(cmd))
+    argv = resolve([unquote(token) for token in shlex.split(cmd, posix=False)]
+                   if isinstance(cmd, str) else list(cmd))
     try:
         p = subprocess.run(
-            argv, cwd=ROOT, capture_output=True, text=True,
+            argv, cwd=cwd, capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=timeout,
         )
         return p.returncode, (p.stdout or "") + (p.stderr or "")
@@ -98,13 +92,54 @@ def skipped(name: str, marker: str) -> None:
     print(f"{marker}_SKIPPED no '{name}' command in harness.config.json", flush=True)
 
 
+def source_checks() -> list[tuple[str, list[str], re.Pattern]]:
+    """Validate the complete declaration before running any configured command.
+
+    Only argv and a positive discovered-result count are configurable. The
+    adapter owns SHARED_SOURCE; callers cannot override cwd, source or env.
+    Declaration order is execution order, and names identify failures uniquely.
+    """
+    if "source_checks" not in CONFIG:
+        return []
+    checks = CONFIG["source_checks"]
+    if not isinstance(checks, list) or not checks:
+        raise ValueError("source_checks must be a nonempty list")
+    validated = []
+    names = set()
+    for check in checks:
+        if not isinstance(check, dict) or set(check) != {"name", "argv", "count_pattern"}:
+            raise ValueError("each source check requires only name, argv and count_pattern")
+        name, argv, pattern = check["name"], check["argv"], check["count_pattern"]
+        if (not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", name)
+                or name in names):
+            raise ValueError("source check names must be unique lowercase identifiers")
+        if (not isinstance(argv, list) or not argv
+                or any(not isinstance(arg, str) or not arg or "\0" in arg for arg in argv)):
+            raise ValueError(f"source check {name} requires nonempty argv strings")
+        if not isinstance(pattern, str) or not pattern.strip():
+            raise ValueError(f"source check {name} requires a count_pattern")
+        try:
+            compiled = re.compile(pattern)
+        except re.error as error:
+            raise ValueError(f"source check {name} has invalid count_pattern") from error
+        if compiled.groups != 1:
+            raise ValueError(f"source check {name} count_pattern requires one capture group")
+        names.add(name)
+        validated.append((name, argv, compiled))
+    return validated
+
+
 def main() -> int:
     if any(arg not in {"--quick"} for arg in sys.argv[1:]):
         print("Usage: python harness/ci.py [--quick] (static and unit checks only)")
         return 2
     print("HARNESS_START mode=ordinary", flush=True)
-    if not CONFIG.get("static") and not CONFIG.get("unit"):
-        return fail("configuration", "NO_CHECKS: configure static or unit commands")
+    try:
+        checks = source_checks()
+    except ValueError as error:
+        return fail("configuration", f"SOURCE_CHECKS_ERROR: {error}")
+    if not CONFIG.get("static") and not CONFIG.get("unit") and not checks:
+        return fail("configuration", "NO_CHECKS: configure static, unit or source_checks commands")
     # --- 1. static -----------------------------------------------------------
     static_cmd = CONFIG.get("static") or ""
     if not static_cmd:
@@ -144,6 +179,21 @@ def main() -> int:
                 "and an absent one look identical here)",
                 flush=True,
             )
+
+    # --- 3. explicitly registered checks of the adapter's bound source --------
+    for name, argv, pattern in checks:
+        step = f"source:{name}"
+        rc, out = run(step, argv, cwd=SHARED_SOURCE)
+        if rc != 0:
+            return fail(step, out)
+        matches = list(pattern.finditer(out))
+        count = matches[0].group(1) if len(matches) == 1 else ""
+        if not count or not re.fullmatch(r"[0-9]+", count) or int(count) == 0:
+            return fail(step, "SOURCE_CHECK_ERROR: expected exactly one positive result count\n" + out[-2000:])
+        skipped_count = re.search(r"^OK \([^\r\n)]*\bskipped=(\d+)[^\r\n)]*\)\s*$", out, re.MULTILINE)
+        if skipped_count and int(skipped_count.group(1)) >= int(count):
+            return fail(step, "SOURCE_CHECK_ERROR: all discovered tests were skipped\n" + out[-2000:])
+        print(f"SOURCE_CHECK_PASSED name={name} count={int(count)} source={SHARED_SOURCE}", flush=True)
 
     print("RUNTIME_NOT_RUN: shared workflow verification is separate", flush=True)
     print("CHECKS_OK mode=ordinary", flush=True)

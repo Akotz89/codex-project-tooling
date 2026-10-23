@@ -294,7 +294,7 @@ class CliApp:
             raise AppDidNotStart("driver=cli but cli.invoke is empty in harness.config.json")
         rc, out, err = self.run(self.cfg.get("smoke_args", "--help"))
         want = self.cfg.get("smoke_contains", "")
-        if rc not in (0, 1) or (want and want not in (out + err)):
+        if rc != 0 or (want and want not in (out + err)):
             raise AppDidNotStart(f"the smoke invocation failed: rc={rc}\n{(out + err)[-1500:]}")
         print("APP_STARTED driver=cli", flush=True)
         return self
