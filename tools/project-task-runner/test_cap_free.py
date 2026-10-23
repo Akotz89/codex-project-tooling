@@ -45,6 +45,12 @@ class LimitsContract(unittest.TestCase):
                           props['RuntimeMaxSec']), ('infinity',) * 4)
         self.assertEqual((props['KillMode'], props['Restart']), ('mixed', 'no'))
 
+    def test_native_process_limit_binding_inherits_manager_default(self):
+        baseline = [256751, 256751]
+        props = base.unlimited_properties(baseline)
+        self.assertNotIn('LimitNPROC', props)
+        self.assertEqual(props['TasksMax'], 'infinity')
+
     def test_readback_proves_all_resource_properties_unlimited(self):
         with tempfile.TemporaryDirectory() as temp:
             cgroup = Path(temp)
@@ -65,6 +71,70 @@ class LimitsContract(unittest.TestCase):
                 (cgroup / 'pids.max').write_text('256')
                 with self.assertRaisesRegex(base.Refused, 'physical_budget'):
                     base.budget_check(intent, ready, info)
+
+    def test_native_nproc_requires_exact_launcher_process_and_unit_readback(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cgroup = Path(temp)
+            for name, value in {'memory.max': 'max', 'memory.high': 'max',
+                                'memory.swap.max': 'max', 'pids.max': 'max',
+                                'cpu.max': 'max 100000'}.items():
+                (cgroup / name).write_text(value)
+            baseline = [256751, 256751]
+            intent = {'config': {'limits': self.valid()},
+                      'native_process_limit': baseline,
+                      'manager_default_process_limit': baseline}
+            ready = {'process': {'cgroup': '/fixture'},
+                     'address_space': [base.resource.RLIM_INFINITY] * 2,
+                     'process_limit': baseline}
+            info = {name: 'infinity' for name in
+                    ('LimitAS', 'LimitASSoft', 'RuntimeMaxUSec', 'MemoryMax',
+                     'MemoryHigh', 'MemorySwapMax', 'CPUQuotaPerSecUSec',
+                     'TasksMax')}
+            info.update(LimitNPROCSoft='256751', LimitNPROC='256751',
+                        KillMode='mixed', Restart='no')
+            with patch.object(base, 'cgdir', return_value=cgroup):
+                base.budget_check(intent, ready, info)
+
+                for changed in (
+                        {'ready': {**ready, 'process_limit': [256750, 256751]},
+                         'info': info, 'reason': 'process_limit_actual'},
+                        {'ready': ready,
+                         'info': {**info, 'LimitNPROCSoft': '256750'},
+                         'reason': 'manager_budget'},
+                        {'ready': ready,
+                         'info': {**info, 'LimitNPROC': 'infinity'},
+                         'reason': 'manager_budget'},
+                        {'ready': {**ready, 'process_limit': [True, 256751]},
+                         'info': info, 'reason': 'process_limit_actual'},
+                        {'ready': ready,
+                         'info': {**info, 'LimitNPROC': '0256751'},
+                         'reason': 'process_limit_manager'}):
+                    with self.subTest(reason=changed['reason']), \
+                            self.assertRaisesRegex(base.Refused, changed['reason']):
+                        base.budget_check(intent, changed['ready'], changed['info'])
+
+                malformed = {**intent, 'native_process_limit': [256751, True]}
+                with self.assertRaisesRegex(base.Refused, 'process_limit_baseline'):
+                    base.budget_check(malformed, ready, info)
+
+    def test_old_unlimited_receipt_still_requires_infinity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cgroup = Path(temp)
+            for name, value in {'memory.max': 'max', 'memory.high': 'max',
+                                'memory.swap.max': 'max', 'pids.max': 'max',
+                                'cpu.max': 'max 100000'}.items():
+                (cgroup / name).write_text(value)
+            ready = {'process': {'cgroup': '/fixture'},
+                     'address_space': [base.resource.RLIM_INFINITY] * 2,
+                     'process_limit': [256751, 256751]}
+            info = {name: 'infinity' for name in
+                    ('LimitAS', 'LimitASSoft', 'RuntimeMaxUSec', 'MemoryMax',
+                     'MemoryHigh', 'MemorySwapMax', 'CPUQuotaPerSecUSec',
+                     'TasksMax', 'LimitNPROC', 'LimitNPROCSoft')}
+            info.update(KillMode='mixed', Restart='no')
+            with patch.object(base, 'cgdir', return_value=cgroup), \
+                    self.assertRaisesRegex(base.Refused, 'process_limit_actual'):
+                base.budget_check({'config': {'limits': self.valid()}}, ready, info)
 
     def test_only_complete_historical_finite_receipts_take_legacy_audit_path(self):
         intent = {'config': {'limits': {'memory_bytes': 16777216, 'cpu_percent': 25,
