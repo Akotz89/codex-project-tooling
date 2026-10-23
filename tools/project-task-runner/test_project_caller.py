@@ -201,7 +201,217 @@ class FakeRuntime:
         return {'state': 'MOCK-STOP'}
 
 
+def successor_profile_fixture(directory):
+    root = Path(directory) / 'profile-project'
+    work = root / 'work'
+    qualification = work / 'qualification'
+    state = root / 'state'
+    jobs = work / 'jobs'
+    for path in (qualification, state, jobs, root / 'vendor'):
+        path.mkdir(parents=True, exist_ok=True)
+    job = jobs / 'future'
+    config_path = work / 'config.json'
+    config_path.write_text('{}\n', encoding='utf-8')
+    executable = Path(sys.executable).resolve(strict=True)
+    api_path = root / 'vendor/caller_api.py'
+    api_path.write_text('# inert API source pin\n', encoding='utf-8')
+    context_path = work / 'project-context.json'
+    context_path.write_text('{}\n', encoding='utf-8')
+    api_sha = digest(api_path.read_bytes())
+    context_sha = digest(context_path.read_bytes())
+    tooling_commit = '1' * 40
+    pins = {str(executable): digest(executable.read_bytes())}
+    accounting = {
+        'accounting_reader': {'path': '/tooling/accounting/reader.py', 'sha256': '2' * 64},
+        'capacity_guard': {'path': '/tooling/accounting/guard.py', 'sha256': '3' * 64},
+    }
+    selection = {name: {'path': str(work / 'packets' / f'{name}.json'),
+                        'sha256': str(index) * 64}
+                 for index, name in enumerate(('source_evidence', 'candidate', 'adoption'), 1)}
+    bound = {
+        'project_root': root, 'canonical_state': state,
+        'context_selection': {'schema': 'root-successor-05', **selection},
+        'adoption': {'actual_job_authorized': True, 'code_root': '/tooling',
+                     'runtime_path': '/tooling/adaptive'},
+        'source_evidence': {'source': {'observed_merge': '4' * 40}},
+        'candidate': {'runtime_source_pins': pins},
+        **accounting,
+    }
+    local_pins = {
+        str(qualification / 'caller_r7.py'): '5' * 64,
+        str(qualification / 'runtime_context.py'): '6' * 64,
+        str(api_path): api_sha,
+    }
+    source_map = {
+        'schema': 'provenance-v1', 'project_root': str(root),
+        'canonical_state': str(state), 'code_root': '/tooling',
+        'maintained_main': '4' * 40,
+        'root_packets': selection, 'runtime_source_pins': pins,
+        'accounting': accounting, 'local_source_pins': local_pins,
+        'published_tooling': {'commit': tooling_commit,
+                              'caller_api_path': str(api_path),
+                              'caller_api_sha256': api_sha},
+        'estimates_are_forecasts_only': True,
+        'actual_job_authorized': True,
+    }
+    source_map['source_identity'] = digest(json.dumps(
+        source_map, sort_keys=True, separators=(',', ':')).encode())
+    source_path = work / 'source-map.json'
+    source_raw = write_document(source_path, source_map)
+    source_ref = {'path': str(source_path), 'sha256': digest(source_raw),
+                  'source_identity': source_map['source_identity']}
+    value = {
+        'project_context_path': str(context_path), 'project_context_sha256': context_sha,
+        'caller_api_path': str(api_path), 'caller_api_sha256': api_sha,
+        'qualification_root': 'work/qualification', 'tooling_commit': tooling_commit,
+        'caller_contract': {
+            'successor_profile_schema': 'successor-profile-v1',
+            'source_provenance_schema': 'provenance-v1',
+            'historical_source_names': ['caller_r7.py', 'runtime_context.py'],
+            'qualification_source_names': ['caller_r7.py'],
+            'runtime_context_name': 'runtime_context.py',
+            'caller_entry_name': 'caller_r7.py', 'profile_names': ['profile.json'],
+            'promotion_name': 'promotion.json',
+        },
+    }
+    profile = {
+        'schema': 'successor-profile-v1', 'config': str(config_path),
+        'project_root': str(root), 'canonical_state': str(state),
+        'source_map': source_ref, 'future_job': str(job),
+        'promoted_source_map': str(job / 'artifacts/promotion.json'),
+        'artifacts': str(job / 'artifacts'), 'evidence': str(job / 'evidence'),
+        'actual_job_authorized': True,
+        'context_selection': bound['context_selection'],
+    }
+    profile_path = work / 'profile.json'
+    profile_raw = write_document(profile_path, profile)
+    config = {'argv': [str(executable), '-c', 'pass'],
+              'sources': {str(executable): digest(executable.read_bytes()),
+                          str(context_path): context_sha,
+                          str(api_path): api_sha,
+                          **{ref['path']: ref['sha256'] for ref in selection.values()},
+                          **pins,
+                          **{item['path']: item['sha256'] for item in accounting.values()},
+                          str(source_path): digest(source_raw),
+                          str(profile_path): digest(profile_raw)}}
+
+    class Base:
+        @staticmethod
+        def source_digest(path):
+            return digest(Path(path).read_bytes())
+
+        @staticmethod
+        def pins(_pins):
+            return None
+
+    class Adaptive:
+        base = Base()
+
+    return (value, bound, config, config_path, job, profile_path, profile, source_path,
+            source_map, Adaptive())
+
+
 class GenericCallerBindingTests(unittest.TestCase):
+    def test_qualification_root_accepts_canonical_nested_project_input_root(self):
+        with tempfile.TemporaryDirectory(dir=REPOSITORY) as temp:
+            binding, binding_path, root, _state = make_binding(Path(temp))
+            qualification = root / 'inputs' / 'caller'
+            qualification.mkdir(parents=True)
+            binding['qualification_root'] = 'inputs/caller'
+            write_document(binding_path, binding)
+            caller.configure(binding_path, expected_binding_sha256=digest(binding_path.read_bytes()))
+
+            value, bound_root, _binding_sha256 = caller.binding()
+
+            self.assertEqual(bound_root, root)
+            self.assertEqual(value['qualification_root'], 'inputs/caller')
+
+    def test_qualification_root_rejects_absolute_traversal_alias_and_symlink_escape(self):
+        with tempfile.TemporaryDirectory(dir=REPOSITORY) as temp:
+            binding, binding_path, root, _state = make_binding(Path(temp))
+            outside = Path(temp) / 'outside'
+            outside.mkdir()
+            (root / 'work' / 'escape').symlink_to(outside, target_is_directory=True)
+            invalid = (str(root / 'work' / 'qualification'), '../outside',
+                       'work/../outside', 'work//qualification',
+                       'work/./qualification', '.', 'C:/outside',
+                       'work\\qualification', 'work/escape/child')
+
+            for relative in invalid:
+                with self.subTest(qualification_root=relative):
+                    changed = dict(binding, qualification_root=relative)
+                    write_document(binding_path, changed)
+                    caller.configure(binding_path,
+                                     expected_binding_sha256=digest(binding_path.read_bytes()))
+                    with self.assertRaisesRegex(caller.Refused, 'qualification_root'):
+                        caller.binding()
+
+    def test_root_packet_authorization_binding_requires_exact_boolean(self):
+        with tempfile.TemporaryDirectory(dir=REPOSITORY) as temp:
+            binding, binding_path, _root, _state = make_binding(Path(temp))
+            for authorized in (None, 1, 'true', []):
+                with self.subTest(actual_job_authorized=authorized):
+                    contract = dict(binding['root_packet_contract'],
+                                    actual_job_authorized=authorized)
+                    write_document(binding_path, dict(binding, root_packet_contract=contract))
+                    caller.configure(binding_path,
+                                     expected_binding_sha256=digest(binding_path.read_bytes()))
+                    with self.assertRaisesRegex(caller.Refused, 'root_packet_contract'):
+                        caller.binding()
+
+    def test_successor_profile_accepts_root05_true_chain_and_checks_authorization_and_hashes(self):
+        with tempfile.TemporaryDirectory(dir=REPOSITORY) as temp:
+            (value, bound, config, config_path, job, profile_path, profile, source_path,
+             source_map, adaptive) = successor_profile_fixture(temp)
+            accepted, source = caller.selected_profile(
+                None, adaptive, bound, config_path, job, config, value,
+                profile_path=profile_path, caller_argv=False)
+            self.assertIs(accepted['actual_job_authorized'], True)
+            self.assertEqual(source['source_identity'], source_map['source_identity'])
+
+            original_raw = profile_path.read_bytes()
+            mutations = {
+                'false_authorization': ('actual_job_authorized', False),
+                'integer_authorization': ('actual_job_authorized', 1),
+                'string_authorization': ('actual_job_authorized', 'true'),
+                'project_identity': ('project_root', '/other/project'),
+                'state_identity': ('canonical_state', '/other/state'),
+            }
+            for name, (field, replacement) in mutations.items():
+                with self.subTest(profile_mutation=name):
+                    changed = dict(profile, **{field: replacement})
+                    raw = write_document(profile_path, changed)
+                    config['sources'][str(profile_path)] = digest(raw)
+                    with self.assertRaisesRegex(caller.Refused, 'successor_profile_binding'):
+                        caller.selected_profile(None, adaptive, bound, config_path, job,
+                                                config, value, profile_path=profile_path,
+                                                caller_argv=False)
+            changed = json.loads(original_raw)
+            changed['context_selection']['adoption']['sha256'] = 'f' * 64
+            raw = write_document(profile_path, changed)
+            config['sources'][str(profile_path)] = digest(raw)
+            with self.assertRaisesRegex(caller.Refused, 'successor_profile_binding'):
+                caller.selected_profile(None, adaptive, bound, config_path, job,
+                                        config, value, profile_path=profile_path,
+                                        caller_argv=False)
+            profile_path.write_bytes(original_raw)
+            config['sources'][str(profile_path)] = digest(original_raw)
+
+            config['sources'][str(profile_path)] = 'f' * 64
+            with self.assertRaisesRegex(caller.Refused, 'successor_profile_source_pin'):
+                caller.selected_profile(None, adaptive, bound, config_path, job,
+                                        config, value, profile_path=profile_path,
+                                        caller_argv=False)
+            config['sources'][str(profile_path)] = digest(original_raw)
+
+            source_map['maintained_main'] = '9' * 40
+            tampered = write_document(source_path, source_map)
+            config['sources'][str(source_path)] = digest(tampered)
+            with self.assertRaisesRegex(caller.Refused, 'successor_source_map_hash'):
+                caller.selected_profile(None, adaptive, bound, config_path, job,
+                                        config, value, profile_path=profile_path,
+                                        caller_argv=False)
+
     def test_binding_refuses_external_symlink_project_markers(self):
         with tempfile.TemporaryDirectory(dir=REPOSITORY) as temp:
             work = Path(temp)

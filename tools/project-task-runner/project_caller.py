@@ -50,6 +50,26 @@ def canonical_project_marker(path, root):
         return False
 
 
+def qualification_input_root(value, root):
+    """Accept only one canonical, contained project-relative input directory."""
+    need(type(value) is str and value and '\\' not in value
+         and re.match(r'^[A-Za-z]:', value) is None, 'qualification_root')
+    relative = Path(value)
+    need(not relative.is_absolute() and str(relative) == value and bool(relative.parts)
+         and not any(part in ('', '.', '..') for part in relative.parts),
+         'qualification_root')
+    path = root / relative
+    try:
+        resolved = path.resolve(strict=False)
+        exists = path.exists()
+        is_dir = path.is_dir()
+    except (OSError, RuntimeError, ValueError):
+        raise Refused('qualification_root')
+    need(resolved == path and resolved.is_relative_to(root)
+         and (not exists or is_dir), 'qualification_root')
+    return path
+
+
 def read_regular(path, *, private=False, limit=65536):
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, 'rb') as source:
@@ -127,15 +147,12 @@ def binding():
          'published_tooling_main_commit')
     generic_path = Path(value['generic_runner_path'])
     adaptive_path = Path(value['runtime_path']) / 'runner.py'
-    history_root = Path(value['qualification_root'])
+    history_root = qualification_input_root(value['qualification_root'], root)
     caller_api_path = Path(value['caller_api_path'])
     need(generic_path.is_absolute() and generic_path.resolve(strict=True) == generic_path,
          'generic_runner_path')
     need(adaptive_path.is_absolute() and adaptive_path.resolve(strict=True) == adaptive_path,
          'adaptive_runner_path')
-    need(not history_root.is_absolute() and str(history_root) == value['qualification_root']
-         and not any(part in ('.', '..') for part in history_root.parts)
-         and history_root.parts[:1] == ('work',), 'qualification_root')
     project_context_path = Path(value['project_context_path'])
     need(project_context_path.is_absolute() and project_context_path.resolve(strict=True) == project_context_path
          and re.fullmatch(r'[0-9a-f]{64}', value['project_context_sha256']) is not None
@@ -203,7 +220,8 @@ def binding():
                 + caller_contract['historical_source_names'])
         and set(caller_contract['qualification_source_names']) <= set(
             caller_contract['historical_source_names']), 'caller_contract_schema')
-    need(type(packet_contract) is dict and packet_contract.get('actual_job_authorized') is False
+    need(type(packet_contract) is dict
+         and type(packet_contract.get('actual_job_authorized')) is bool
          and packet_contract.get('project_root') == str(root)
          and packet_contract.get('canonical_state') == value['canonical_state']
          and packet_contract.get('code_root') == value['code_root']
