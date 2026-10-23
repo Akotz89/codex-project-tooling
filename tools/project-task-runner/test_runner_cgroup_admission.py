@@ -1,5 +1,6 @@
 """Focused controller-topology and pre-admission failure receipts."""
 import errno
+from contextlib import nullcontext
 import importlib.util
 import json
 import os
@@ -38,6 +39,208 @@ class CgroupAdmissionTests(unittest.TestCase):
                                          side_effect=refuse_systemd_run)
         self.native_guard.start()
         self.addCleanup(self.native_guard.stop)
+
+    def test_manager_default_nproc_uses_same_user_bus_and_rejects_missing_values(self):
+        env = {'DBUS_SESSION_BUS_ADDRESS': 'unix:path=/fixture/bus'}
+        result = SimpleNamespace(
+            returncode=0,
+            stdout='DefaultLimitNPROC=256751\nDefaultLimitNPROCSoft=256751\n',
+            stderr='')
+        with patch.object(base, 'command', return_value=result) as command:
+            self.assertEqual(base.manager_default_process_limit(env),
+                             [256751, 256751])
+        self.assertEqual(command.call_args.args[0], [
+            'systemctl', '--user', 'show',
+            '--property=DefaultLimitNPROC,DefaultLimitNPROCSoft'])
+        self.assertIs(command.call_args.args[1], env)
+        self.assertEqual(base.native_process_limit_baseline(
+            [256751, 256751], [256751, 256751]), [256751, 256751])
+        with self.assertRaisesRegex(base.Refused, 'process_limit_baseline_manager'):
+            base.native_process_limit_baseline([256751, 256751], [256750, 256751])
+
+        for output in ('DefaultLimitNPROC=256751\n',
+                       'DefaultLimitNPROC=256751\nDefaultLimitNPROCSoft=256752\n',
+                       'DefaultLimitNPROC=256751\nDefaultLimitNPROCSoft=garbage\n'):
+            with self.subTest(output=output), \
+                    patch.object(base, 'command', return_value=SimpleNamespace(
+                        returncode=0, stdout=output, stderr='')):
+                with self.assertRaises(base.Refused):
+                    base.manager_default_process_limit(env)
+
+    def test_adaptive_launch_binds_observed_native_and_manager_baseline(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / 'work').mkdir(mode=0o700)
+            state = root / 'state'
+            state.mkdir(mode=0o700)
+            job = root / 'work' / 'job'
+            baseline = base.process_limit_pair(
+                base.resource.getrlimit(base.resource.RLIMIT_NPROC),
+                'process_limit_baseline')
+            previous = (adaptive.ROOT, adaptive.CANONICAL_STATE,
+                        adaptive.PROJECT_ROOT, adaptive.PROJECT_ID)
+
+            def restore_context():
+                adaptive.ROOT, adaptive.CANONICAL_STATE, \
+                    adaptive.PROJECT_ROOT, adaptive.PROJECT_ID = previous
+
+            self.addCleanup(restore_context)
+            config = {'argv': ['/usr/bin/true'], 'owner': 'fixture-owner',
+                      'lease': 'fixture-lease',
+                      'estimates': {'memory_bytes': 128, 'disk_bytes': 128,
+                                    'inodes': 1},
+                      'foreground': False, 'cooperative': {'enabled': False}}
+            binding = {'project_id': 'fixture-project',
+                       'unit_prefix': 'fixture-task',
+                       'payload_environment': {}}
+            captured = {}
+
+            def stop_before_runtime(path, env):
+                captured['job'] = path
+                captured['intent'] = base.read(path / 'intent.json')
+                captured['intent_hash'] = base.digest(
+                    base.read_bytes(path / 'intent.json'))
+                return {'fixture_only': True}
+
+            with patch.object(adaptive, 'configuration',
+                              return_value=(config, 'fixture-config-hash')), \
+                    patch.object(base, 'manager_environment',
+                                 return_value=({}, 'fixture-manager')), \
+                    patch.object(base, 'manager_default_process_limit',
+                                 return_value=baseline), \
+                    patch.object(adaptive, 'locked',
+                                 side_effect=lambda unused: nullcontext()), \
+                    patch.object(adaptive, 'read_ledger',
+                                 side_effect=lambda unused: {'jobs': {}}), \
+                    patch.object(adaptive, 'replace'), \
+                    patch.object(adaptive, 'advance', side_effect=stop_before_runtime):
+                result = adaptive.launch(
+                    job, root / 'config.json', state,
+                    project_root=root, project_binding=binding)
+
+            self.assertEqual(result, {'fixture_only': True})
+            self.assertEqual(captured['intent']['native_process_limit'], baseline)
+            self.assertEqual(captured['intent']['manager_default_process_limit'],
+                             baseline)
+            self.assertEqual(captured['intent']['job_id'],
+                             captured['intent']['unit'].split('-')[-1].removesuffix('.service'))
+            self.assertEqual(captured['intent_hash'],
+                             base.digest(base.canonical(captured['intent']) + b'\n'))
+            without_baseline = dict(captured['intent'])
+            without_baseline.pop('native_process_limit')
+            without_baseline.pop('manager_default_process_limit')
+            self.assertNotEqual(captured['intent_hash'],
+                                base.digest(base.canonical(without_baseline) + b'\n'))
+
+    def test_base_launch_omits_nproc_override_for_bound_baseline(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            parent = root / 'actual-use'
+            parent.mkdir(mode=0o700)
+            job = parent / 'job'
+            baseline = base.process_limit_pair(
+                resource.getrlimit(resource.RLIMIT_NPROC), 'process_limit_baseline')
+            config = {'argv': ['/usr/bin/true'], 'limits': {
+                'memory_bytes': 'infinity', 'cpu_percent': 'infinity',
+                'address_space_bytes': 'infinity', 'runtime_seconds': 'infinity'}}
+            captured = {}
+
+            def reject_before_runtime(argv, env):
+                captured['argv'] = argv
+                captured['launch'] = base.read(job / 'launch-intent.json')
+                return SimpleNamespace(returncode=1, stderr='fixture refusal')
+
+            with patch.object(base, 'configuration', return_value=(config, 'fixture-hash')), \
+                    patch.object(base, 'manager_environment', return_value=({}, 'fixture-manager')), \
+                    patch.object(base, 'manager_default_process_limit', return_value=baseline), \
+                    patch.object(base, 'command', side_effect=reject_before_runtime), \
+                    self.assertRaisesRegex(base.Refused, 'manager_launch_rejected'):
+                base.launch(job, root / 'config.json')
+
+            self.assertNotIn('LimitNPROC', captured['launch']['properties'])
+            self.assertNotIn('--property=LimitNPROC=infinity', captured['argv'])
+            self.assertEqual(captured['launch']['native_process_limit'], baseline)
+            self.assertEqual(captured['launch']['manager_default_process_limit'], baseline)
+
+    def test_adaptive_start_unit_omits_nproc_override_for_bound_baseline(self):
+        with tempfile.TemporaryDirectory() as temp:
+            job = Path(temp) / 'job'
+            job.mkdir(mode=0o700)
+            baseline = base.process_limit_pair(
+                resource.getrlimit(resource.RLIMIT_NPROC), 'process_limit_baseline')
+            intent = {'job_id': 'a' * 32, 'unit': 'fixture-' + 'a' * 32 + '.service',
+                      'native_process_limit': baseline,
+                      'manager_default_process_limit': baseline}
+            record = {'allocation': {'cpu': 1}}
+            captured = {}
+
+            def reject_before_runtime(argv, env):
+                captured['argv'] = argv
+                captured['launch'] = base.read(job / 'launch-intent.json')
+                return SimpleNamespace(returncode=1, stderr='fixture refusal')
+
+            with patch.object(base, 'manager_default_process_limit', return_value=baseline), \
+                    patch.object(adaptive, 'intent_project_binding', return_value={
+                        'unit_prefix': 'fixture'}), \
+                    patch.object(base, 'command', side_effect=reject_before_runtime), \
+                    patch.object(base, 'unit_show', return_value={'LoadState': 'not-found'}):
+                adaptive.start_unit(job, intent, record, {})
+
+            self.assertEqual(record['state'], 'failed-before-launch')
+            self.assertNotIn('LimitNPROC', captured['launch']['properties'])
+            self.assertNotIn('--property=LimitNPROC=infinity', captured['argv'])
+            self.assertEqual(captured['launch']['native_process_limit'], baseline)
+            self.assertEqual(captured['launch']['manager_default_process_limit'], baseline)
+
+    def test_true_unlimited_bound_baseline_round_trips_without_override(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            parent = root / 'actual-use'
+            parent.mkdir(mode=0o700)
+            job = parent / 'job'
+            infinity_pair = [resource.RLIM_INFINITY, resource.RLIM_INFINITY]
+            config = {'argv': ['/usr/bin/true'], 'limits': {
+                'memory_bytes': 'infinity', 'cpu_percent': 'infinity',
+                'address_space_bytes': 'infinity', 'runtime_seconds': 'infinity'}}
+            captured = {}
+
+            def reject_before_runtime(argv, env):
+                captured['argv'] = argv
+                captured['intent'] = base.read(job / 'intent.json')
+                captured['launch'] = base.read(job / 'launch-intent.json')
+                return SimpleNamespace(returncode=1, stderr='fixture refusal')
+
+            with patch.object(base, 'configuration', return_value=(config, 'fixture-hash')), \
+                    patch.object(base, 'manager_environment', return_value=({}, 'fixture-manager')), \
+                    patch.object(base, 'manager_default_process_limit',
+                                 return_value=infinity_pair), \
+                    patch.object(base.resource, 'getrlimit', return_value=tuple(infinity_pair)), \
+                    patch.object(base, 'command', side_effect=reject_before_runtime), \
+                    self.assertRaisesRegex(base.Refused, 'manager_launch_rejected'):
+                base.launch(job, root / 'config.json')
+
+            self.assertEqual(captured['intent']['native_process_limit'], infinity_pair)
+            self.assertEqual(captured['intent']['manager_default_process_limit'], infinity_pair)
+            self.assertEqual(captured['launch']['native_process_limit'], infinity_pair)
+            self.assertEqual(captured['launch']['manager_default_process_limit'], infinity_pair)
+            self.assertNotIn('LimitNPROC', captured['launch']['properties'])
+            self.assertNotIn('--property=LimitNPROC=infinity', captured['argv'])
+
+            cgroup = root / 'cgroup'
+            cgroup.mkdir()
+            for name, value in {'memory.max': 'max', 'memory.high': 'max',
+                                'memory.swap.max': 'max', 'pids.max': 'max',
+                                'cpu.max': 'max 100000'}.items():
+                (cgroup / name).write_text(value)
+            ready = {'process': {'cgroup': '/fixture'},
+                     'address_space': infinity_pair, 'process_limit': infinity_pair}
+            info = {name: 'infinity' for name in (
+                'LimitAS', 'LimitASSoft', 'RuntimeMaxUSec', 'MemoryMax',
+                'MemoryHigh', 'MemorySwapMax', 'CPUQuotaPerSecUSec', 'TasksMax',
+                'LimitNPROC', 'LimitNPROCSoft')}
+            info.update(KillMode='mixed', Restart='no')
+            with patch.object(base, 'cgdir', return_value=cgroup):
+                base.budget_check(captured['intent'], ready, info)
 
     def test_native_subprocess_guard_fails_before_execution(self):
         with self.assertRaisesRegex(AssertionError,
@@ -182,6 +385,40 @@ class CgroupAdmissionTests(unittest.TestCase):
                     base.admission_wait_ok(job, False, float('inf'),
                                            require_launcher=True)
 
+    def test_custody_requires_launch_baseline_to_match_hashed_intent(self):
+        with tempfile.TemporaryDirectory() as temp:
+            job = Path(temp) / 'job'
+            job.mkdir(mode=0o700)
+            job_id = 'b' * 32
+            baseline = [256751, 256751]
+            intent = {'job_id': job_id, 'unit': 'project-task-' + job_id + '.service',
+                      'job_dir': str(job), 'uid': os.getuid(),
+                      'native_process_limit': baseline,
+                      'manager_default_process_limit': baseline}
+            base.publish(job / 'intent.json', intent)
+            ready = {'job_id': job_id,
+                     'intent_sha256': base.digest(base.read_bytes(job / 'intent.json')),
+                     'invocation_id': 'fixture-invocation',
+                     'process': {'pid': 123, 'uid': os.getuid(), 'start_ticks': 77,
+                                 'cgroup': '/user.slice/fixture.service'}}
+            base.publish(job / 'ready.json', ready)
+            info = {'LoadState': 'loaded', 'InvocationID': 'fixture-invocation',
+                    'Description': base.unit_description(intent),
+                    'ControlGroup': '/user.slice/fixture.service', 'MainPID': '0'}
+            with patch.object(base, 'process', side_effect=FileNotFoundError):
+                for launch_record in (
+                        {'job_id': job_id},
+                        {'job_id': job_id, 'native_process_limit': baseline},
+                        {'job_id': job_id, 'native_process_limit': [256750, 256751],
+                         'manager_default_process_limit': baseline}):
+                    with self.subTest(launch_record=launch_record):
+                        launch_path = job / 'launch-intent.json'
+                        launch_path.unlink(missing_ok=True)
+                        base.publish(launch_path, launch_record)
+                        with self.assertRaisesRegex(base.Refused,
+                                                    'process_limit_baseline_binding'):
+                            base.custody(job, intent, info)
+
     def test_start_unit_preserves_primary_pre_admission_path_and_phase(self):
         with tempfile.TemporaryDirectory() as temp:
             job = Path(temp) / 'job'
@@ -190,6 +427,12 @@ class CgroupAdmissionTests(unittest.TestCase):
             intent = {'unit': 'wow-task-' + job_id + '.service',
                       'job_id': job_id, 'topology': base.TOPOLOGY,
                       'source_pins': {}, 'environment_sha256': 'env',
+                      'native_process_limit': base.process_limit_pair(
+                          base.resource.getrlimit(base.resource.RLIMIT_NPROC),
+                          'process_limit_baseline'),
+                      'manager_default_process_limit': base.process_limit_pair(
+                          base.resource.getrlimit(base.resource.RLIMIT_NPROC),
+                          'process_limit_manager_default'),
                       'config': {'sources': {}, 'cooperative': {'enabled': False}}}
             record = {'allocation': {'cpu': 1.0, 'fanout': 0,
                                      'checkpoint': False}}
@@ -199,6 +442,8 @@ class CgroupAdmissionTests(unittest.TestCase):
                 '/management/memory.max')
             with patch.object(adaptive, 'intent_project_binding',
                               return_value={'unit_prefix': 'wow-task'}), \
+                    patch.object(base, 'manager_default_process_limit',
+                                 return_value=intent['manager_default_process_limit']), \
                     patch.object(base, 'process', return_value={
                         'pid': 5, 'uid': os.getuid(), 'start_ticks': 8,
                         'cgroup': '/user.slice/manager'}), \
@@ -209,6 +454,11 @@ class CgroupAdmissionTests(unittest.TestCase):
                     adaptive.start_unit(job, intent, record, {})
             self.assertIn('--property=Delegate=cpu memory pids',
                           command.call_args.args[0])
+            launch_intent = base.read(job / 'launch-intent.json')
+            self.assertEqual(launch_intent['native_process_limit'],
+                             intent['native_process_limit'])
+            self.assertEqual(launch_intent['manager_default_process_limit'],
+                             intent['manager_default_process_limit'])
             receipt = json.loads((job / 'pre-admission-error.json').read_text())
             self.assertEqual(receipt, {
                 'phase': 'readiness',
@@ -221,6 +471,8 @@ class CgroupAdmissionTests(unittest.TestCase):
             second_job.mkdir(mode=0o700)
             with patch.object(adaptive, 'intent_project_binding',
                               return_value={'unit_prefix': 'wow-task'}), \
+                    patch.object(base, 'manager_default_process_limit',
+                                 return_value=intent['manager_default_process_limit']), \
                     patch.object(base, 'process', return_value={
                         'pid': 5, 'uid': os.getuid(), 'start_ticks': 8,
                         'cgroup': '/user.slice/manager'}), \

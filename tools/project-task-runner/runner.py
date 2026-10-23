@@ -220,6 +220,14 @@ def manager_environment():
     p=command(['systemctl','--user','show','--property=Version','--value'],env)
     need(p.returncode==0 and p.stdout.strip(),'user_manager_version')
     return env,p.stdout.strip()
+def manager_default_process_limit(env):
+    p=command(['systemctl','--user','show','--property=DefaultLimitNPROC,DefaultLimitNPROCSoft'],env)
+    values=dict(line.split('=',1) for line in p.stdout.splitlines() if '=' in line)
+    need(p.returncode==0 and set(values)=={'DefaultLimitNPROC','DefaultLimitNPROCSoft'},
+         'process_limit_manager_default')
+    return process_limit_pair([process_limit_property(values['DefaultLimitNPROCSoft']),
+                               process_limit_property(values['DefaultLimitNPROC'])],
+                              'process_limit_manager_default')
 def unit_show(unit,env):
     p=command(['systemctl','--user','show',unit,'--no-pager','--property='+','.join(PROPS)],env)
     values=dict(line.split('=',1) for line in p.stdout.splitlines() if '=' in line)
@@ -282,6 +290,22 @@ def runtime_matches(actual,seconds):
     if seconds=='infinity':return actual=='infinity'
     need(type(seconds) is int and seconds>=10,'runtime_budget')
     return runtime_microseconds(actual)==seconds*1000000
+def process_limit_pair(value,code):
+    need(type(value) in (list,tuple) and len(value)==2
+         and all(type(item) is int and (item==resource.RLIM_INFINITY or item>=0) for item in value),code)
+    soft,hard=value
+    need(hard==resource.RLIM_INFINITY or soft!=resource.RLIM_INFINITY and soft<=hard,code)
+    return [soft,hard]
+def process_limit_property(value):
+    need(type(value) is str and len(value)<=64,'process_limit_manager')
+    if value=='infinity':return resource.RLIM_INFINITY
+    need(re.fullmatch(r'(0|[1-9][0-9]*)',value) is not None,'process_limit_manager')
+    return int(value)
+def native_process_limit_baseline(inherited,manager_default):
+    inherited=process_limit_pair(inherited,'process_limit_baseline')
+    manager_default=process_limit_pair(manager_default,'process_limit_manager_default')
+    need(inherited==manager_default,'process_limit_baseline_manager')
+    return inherited
 def admission_wait_ok(job,cancelled,legacy_deadline,require_launcher=False):
     need(not cancelled and not (job/'stop-intent.json').exists(),'admission_cancelled')
     launch=read(job/'launch-intent.json') if (job/'launch-intent.json').exists() else {}
@@ -348,11 +372,19 @@ def historical_budget_check(intent,ready,info):
     need(runtime_matches(info['RuntimeMaxUSec'],limit['runtime_seconds']),'runtime_manager')
     need(info['MemoryMax']==str(limit['memory_bytes']) and info['MemorySwapMax']=='0' and info['KillMode']=='mixed' and info['Restart']=='no','manager_budget')
     return actual
-def unlimited_properties():
-    return {'MemoryMax':'infinity','MemoryHigh':'infinity','MemorySwapMax':'infinity','CPUQuota':'',
-            'TasksMax':'infinity','LimitNPROC':'infinity','LimitAS':'infinity','RuntimeMaxSec':'infinity',
-            'TimeoutStopSec':5,'KillMode':'mixed','Restart':'no','UMask':'0077',
-            'StandardOutput':'null','StandardError':'null'}
+def unlimited_properties(native_process_limit=None):
+    properties={'MemoryMax':'infinity','MemoryHigh':'infinity','MemorySwapMax':'infinity','CPUQuota':'',
+                'TasksMax':'infinity','LimitAS':'infinity','RuntimeMaxSec':'infinity',
+                'TimeoutStopSec':5,'KillMode':'mixed','Restart':'no','UMask':'0077',
+                'StandardOutput':'null','StandardError':'null'}
+    if native_process_limit is None:
+        # Compatibility for old, unbound launch paths: preserve their explicit
+        # unlimited NPROC request. New launches omit it to inherit the exact
+        # process/manager baseline bound in intent and launch-intent.
+        properties['LimitNPROC']='infinity'
+    else:
+        process_limit_pair(native_process_limit,'process_limit_baseline')
+    return properties
 def budget_check(intent,ready,info):
     limit=intent.get('config',{}).get('limits',{})
     if limits_are_unlimited(limit):
@@ -380,11 +412,27 @@ def budget_check(intent,ready,info):
         actual[value]=fields
     actual=actual[ready['process']['cgroup']]
     infinity=resource.RLIM_INFINITY
-    need(ready['address_space']==[infinity,infinity] and ready['process_limit']==[infinity,infinity],'process_limit_actual')
+    need(ready['address_space']==[infinity,infinity],'process_limit_actual')
+    # New adaptive jobs carry a launcher-observed, private intent baseline.
+    # Older/legacy jobs retain their original infinity-only contract.
+    if 'native_process_limit' in intent or 'manager_default_process_limit' in intent:
+        need('native_process_limit' in intent and 'manager_default_process_limit' in intent,
+             'process_limit_baseline')
+        expected_nproc=process_limit_pair(intent['native_process_limit'],'process_limit_baseline')
+        manager_default=process_limit_pair(intent['manager_default_process_limit'],
+                                           'process_limit_manager_default')
+        need(manager_default==expected_nproc,'process_limit_baseline_manager')
+    else:
+        expected_nproc=[infinity,infinity]
+    actual_nproc=process_limit_pair(ready.get('process_limit'),'process_limit_actual')
+    need(actual_nproc==expected_nproc,'process_limit_actual')
     need(info['LimitAS']==info['LimitASSoft']=='infinity','address_space_manager')
     need(info['RuntimeMaxUSec']=='infinity','runtime_manager')
-    need(all(info[name]=='infinity' for name in ('MemoryMax','MemoryHigh','MemorySwapMax','CPUQuotaPerSecUSec','TasksMax','LimitNPROC','LimitNPROCSoft'))
+    need(all(info[name]=='infinity' for name in ('MemoryMax','MemoryHigh','MemorySwapMax','CPUQuotaPerSecUSec','TasksMax'))
          and info['KillMode']=='mixed' and info['Restart']=='no','manager_budget')
+    manager_nproc=[process_limit_property(info.get('LimitNPROCSoft')),
+                   process_limit_property(info.get('LimitNPROC'))]
+    need(manager_nproc==expected_nproc,'manager_budget')
     return actual
 def load_job(job):
     job=private_dir(job);intent=read(job/'intent.json')
@@ -398,6 +446,11 @@ def load_job(job):
 def custody(job,intent,info):
     ready=read(job/'ready.json')
     need(ready['intent_sha256']==digest(read_bytes(job/'intent.json')) and ready['job_id']==intent['job_id'],'intent_binding')
+    if 'native_process_limit' in intent or 'manager_default_process_limit' in intent:
+        launch=read(job/'launch-intent.json')
+        need(launch.get('native_process_limit')==intent.get('native_process_limit')
+             and launch.get('manager_default_process_limit')==intent.get('manager_default_process_limit'),
+             'process_limit_baseline_binding')
     need(info.get('LoadState')!='not-found','unit_absent')
     need(info['InvocationID']==ready['invocation_id'] and info['Description']==unit_description(intent),'invocation_mismatch')
     cg=info['ControlGroup']
@@ -437,17 +490,25 @@ def public_status(job,env=None):
     return {'job_id':intent['job_id'],'unit':intent['unit'],'state':state,'payload_returncode':result['payload_returncode'] if result else (payload['returncode'] if payload else None),'first_failure':result['first_failure'] if result else (payload['first_failure'] if payload else None),'cleanup':result['cleanup'] if result else None,'unit_state':info['ActiveState']+'/'+info['SubState'],'manager_result':info['Result'],'manager_exit_status':int(info['ExecMainStatus']),'identity_verified':True}
 def launch(job,config):
     env,version=manager_environment();c,chash=configuration(config)
+    manager_nproc_default=manager_default_process_limit(env)
+    native_process_limit=native_process_limit_baseline(
+        resource.getrlimit(resource.RLIMIT_NPROC),manager_nproc_default)
     job=Path(job).absolute();private_dir(job.parent);job.mkdir(mode=0o700)
-    jobid=uuid.uuid4().hex;intent={'job_id':jobid,'unit':'project-task-'+jobid+'.service','job_dir':str(job),'uid':os.getuid(),'config':c,'config_sha256':chash,'argv_sha256':digest(canonical(c['argv'])),'source_pins':source_pins(),'environment_sha256':digest(canonical(env)),'manager_version':version}
+    jobid=uuid.uuid4().hex;intent={'job_id':jobid,'unit':'project-task-'+jobid+'.service','job_dir':str(job),'uid':os.getuid(),'config':c,'config_sha256':chash,'argv_sha256':digest(canonical(c['argv'])),'source_pins':source_pins(),'environment_sha256':digest(canonical(env)),'manager_version':version,'native_process_limit':native_process_limit,'manager_default_process_limit':manager_nproc_default}
     if c.get('stdin_file'):
         f,intent['stdin_identity']=open_input(c['stdin_file']);f.close()
     publish(job/'environment.json',env);publish(job/'intent.json',intent)
-    properties=unlimited_properties()
+    properties=unlimited_properties(native_process_limit)
     argv=['systemd-run','--user','--quiet','--unit='+intent['unit'],'--description='+unit_description(intent),'--service-type=exec','--remain-after-exit','--expand-environment=no','--working-directory='+str(job)]
     for k,v in properties.items():argv.append('--property='+k+'='+str(v))
     for k,v in env.items():argv.append('--setenv='+k+'='+v)
     argv += [sys.executable,'-B',str(HERE/'runner.py'),'_worker',str(job)]
-    publish(job/'launch-intent.json',{'job_id':jobid,'properties':properties,'launcher_process':process(os.getpid())})
+    launcher_manager_default=manager_default_process_limit(env)
+    need(launcher_manager_default==manager_nproc_default,'process_limit_baseline_manager')
+    launcher_native_process_limit=native_process_limit_baseline(
+        resource.getrlimit(resource.RLIMIT_NPROC),launcher_manager_default)
+    need(launcher_native_process_limit==native_process_limit,'process_limit_baseline_changed')
+    publish(job/'launch-intent.json',{'job_id':jobid,'properties':properties,'launcher_process':process(os.getpid()),'native_process_limit':launcher_native_process_limit,'manager_default_process_limit':launcher_manager_default})
     try:p=command(argv,env)
     except subprocess.TimeoutExpired:
         publish(job/'launch-outcome.json',{'state':'UNKNOWN','error':'launcher_timeout'});return {'state':'UNKNOWN','job_id':jobid}

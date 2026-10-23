@@ -395,6 +395,9 @@ def launch(job, config, state, project_root=None, project_binding=None):
         read_ledger(state)
     c, chash = configuration(config)
     env, version = base.manager_environment()
+    manager_nproc_default = base.manager_default_process_limit(env)
+    native_process_limit = base.native_process_limit_baseline(
+        resource.getrlimit(resource.RLIMIT_NPROC), manager_nproc_default)
     job.mkdir(mode=0o700)
     (job / 'scratch').mkdir(mode=0o700)
     ident = uuid.uuid4().hex
@@ -402,7 +405,9 @@ def launch(job, config, state, project_root=None, project_binding=None):
               'unit': binding['unit_prefix'] + '-' + ident + '.service', 'project_binding': binding,
               'job_dir': str(job), 'uid': os.getuid(), 'config': c,
               'config_sha256': chash, 'argv_sha256': base.digest(base.canonical(c['argv'])), 'source_pins': source_pins(),
-              'environment_sha256': base.digest(base.canonical(env)), 'manager_version': version, 'topology': base.TOPOLOGY}
+              'environment_sha256': base.digest(base.canonical(env)), 'manager_version': version, 'topology': base.TOPOLOGY,
+              'native_process_limit': native_process_limit,
+              'manager_default_process_limit': manager_nproc_default}
     if c.get('stdin_file'):
         f, intent['stdin_identity'] = base.open_input(c['stdin_file']); f.close()
     base.publish(job / 'environment.json', env)
@@ -421,7 +426,13 @@ def launch(job, config, state, project_root=None, project_binding=None):
 
 
 def start_unit(job, intent, record, env):
-    properties = base.unlimited_properties()
+    manager_nproc_default = base.manager_default_process_limit(env)
+    native_process_limit = base.native_process_limit_baseline(
+        resource.getrlimit(resource.RLIMIT_NPROC), manager_nproc_default)
+    need(native_process_limit == intent.get('native_process_limit')
+         and manager_nproc_default == intent.get('manager_default_process_limit'),
+         'process_limit_baseline_changed')
+    properties = base.unlimited_properties(native_process_limit)
     cpu = record['allocation']['cpu']
     binding = intent_project_binding(intent)
     if intent.get('topology') == base.TOPOLOGY:
@@ -435,7 +446,9 @@ def start_unit(job, intent, record, env):
     argv += ['--setenv=' + k + '=' + v for k, v in env.items()]
     argv += [sys.executable, '-B', str(HERE / 'runner.py'), '_worker', str(job)]
     base.publish(job / 'launch-intent.json', {'properties': properties, 'job_id': intent['job_id'],
-                                            'launcher_process': base.process(os.getpid())})
+                                            'launcher_process': base.process(os.getpid()),
+                                            'native_process_limit': native_process_limit,
+                                            'manager_default_process_limit': manager_nproc_default})
     phase = 'launcher_start'
     try:
         try:
