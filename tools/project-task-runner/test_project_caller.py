@@ -158,6 +158,8 @@ def make_binding(work, *, project_id='inert-example-project', packets=False):
         'project_context_sha256': digest(context_source),
         'caller_api_path': str(REPOSITORY / 'tools/project-task-runner/caller_api.py'),
         'caller_api_sha256': digest((REPOSITORY / 'tools/project-task-runner/caller_api.py').read_bytes()),
+        'caller_runtime_path': str(REPOSITORY / 'tools/project-task-runner/caller_runtime.py'),
+        'caller_runtime_sha256': digest((REPOSITORY / 'tools/project-task-runner/caller_runtime.py').read_bytes()),
         'candidate_adaptive_root': str(ADAPTIVE_ROOT), 'candidate_source_pins': pins,
         'candidate_context_api_sha256': digest(
             (REPOSITORY / 'tools/project-task-runner/project_context.py').read_bytes()),
@@ -215,6 +217,13 @@ def successor_profile_fixture(directory):
     executable = Path(sys.executable).resolve(strict=True)
     api_path = root / 'vendor/caller_api.py'
     api_path.write_text('# inert API source pin\n', encoding='utf-8')
+    tooling_root = root / 'vendor/tooling'
+    helper_root = tooling_root / 'tools/project-task-runner'
+    helper_root.mkdir(parents=True)
+    caller_runtime_path = helper_root / 'caller_runtime.py'
+    caller_runtime_path.write_text('# inert runtime API source pin\n', encoding='utf-8')
+    context_api_path = helper_root / 'project_context.py'
+    context_api_path.write_text('# inert context API source pin\n', encoding='utf-8')
     context_path = work / 'project-context.json'
     context_path.write_text('{}\n', encoding='utf-8')
     api_sha = digest(api_path.read_bytes())
@@ -231,8 +240,8 @@ def successor_profile_fixture(directory):
     bound = {
         'project_root': root, 'canonical_state': state,
         'context_selection': {'schema': 'root-successor-05', **selection},
-        'adoption': {'actual_job_authorized': True, 'code_root': '/tooling',
-                     'runtime_path': '/tooling/adaptive'},
+        'adoption': {'actual_job_authorized': True, 'code_root': str(tooling_root),
+                     'runtime_path': str(tooling_root / 'tools/project-task-runner/adaptive')},
         'source_evidence': {'source': {'observed_merge': '4' * 40}},
         'candidate': {'runtime_source_pins': pins},
         **accounting,
@@ -241,16 +250,22 @@ def successor_profile_fixture(directory):
         str(qualification / 'caller_r7.py'): '5' * 64,
         str(qualification / 'runtime_context.py'): '6' * 64,
         str(api_path): api_sha,
+        str(caller_runtime_path): digest(caller_runtime_path.read_bytes()),
+        str(context_api_path): digest(context_api_path.read_bytes()),
     }
     source_map = {
         'schema': 'provenance-v1', 'project_root': str(root),
-        'canonical_state': str(state), 'code_root': '/tooling',
+        'canonical_state': str(state), 'code_root': str(tooling_root),
         'maintained_main': '4' * 40,
         'root_packets': selection, 'runtime_source_pins': pins,
         'accounting': accounting, 'local_source_pins': local_pins,
         'published_tooling': {'commit': tooling_commit,
                               'caller_api_path': str(api_path),
-                              'caller_api_sha256': api_sha},
+                              'caller_api_sha256': api_sha,
+                              'caller_runtime_path': str(caller_runtime_path),
+                              'caller_runtime_sha256': digest(caller_runtime_path.read_bytes()),
+                              'context_api_path': str(context_api_path),
+                              'context_api_sha256': digest(context_api_path.read_bytes())},
         'estimates_are_forecasts_only': True,
         'actual_job_authorized': True,
     }
@@ -261,6 +276,10 @@ def successor_profile_fixture(directory):
     source_ref = {'path': str(source_path), 'sha256': digest(source_raw),
                   'source_identity': source_map['source_identity']}
     value = {
+        'tooling_candidate_root': str(tooling_root),
+        'caller_runtime_path': str(caller_runtime_path),
+        'caller_runtime_sha256': digest(caller_runtime_path.read_bytes()),
+        'candidate_context_api_sha256': digest(context_api_path.read_bytes()),
         'project_context_path': str(context_path), 'project_context_sha256': context_sha,
         'caller_api_path': str(api_path), 'caller_api_sha256': api_sha,
         'qualification_root': 'work/qualification', 'tooling_commit': tooling_commit,
@@ -289,6 +308,7 @@ def successor_profile_fixture(directory):
               'sources': {str(executable): digest(executable.read_bytes()),
                           str(context_path): context_sha,
                           str(api_path): api_sha,
+                          **local_pins,
                           **{ref['path']: ref['sha256'] for ref in selection.values()},
                           **pins,
                           **{item['path']: item['sha256'] for item in accounting.values()},

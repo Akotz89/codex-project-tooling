@@ -117,7 +117,8 @@ def binding():
             'generic_runner_path', 'generic_runner_sha256', 'runtime_path',
             'runtime_runner_sha256', 'canonical_state', 'code_root',
             'qualification_root', 'project_context_path', 'project_context_sha256',
-            'caller_api_path', 'caller_api_sha256', 'candidate_adaptive_root',
+            'caller_api_path', 'caller_api_sha256', 'caller_runtime_path',
+            'caller_runtime_sha256', 'candidate_adaptive_root',
             'candidate_source_pins', 'candidate_context_api_sha256',
             'caller_path', 'caller_sha256', 'tooling_candidate_root',
             'project_runtime_binding', 'root_packet_contract', 'caller_contract'}
@@ -149,6 +150,7 @@ def binding():
     adaptive_path = Path(value['runtime_path']) / 'runner.py'
     history_root = qualification_input_root(value['qualification_root'], root)
     caller_api_path = Path(value['caller_api_path'])
+    caller_runtime_path = Path(value['caller_runtime_path'])
     need(generic_path.is_absolute() and generic_path.resolve(strict=True) == generic_path,
          'generic_runner_path')
     need(adaptive_path.is_absolute() and adaptive_path.resolve(strict=True) == adaptive_path,
@@ -162,9 +164,12 @@ def binding():
          and caller_api_path.name == 'caller_api.py', 'caller_api_path')
     need(caller_api_path == code_root / 'tools/project-task-runner/caller_api.py',
          'published_caller_api_binding')
+    need(caller_runtime_path == code_root / 'tools/project-task-runner/caller_runtime.py',
+         'published_caller_runtime_binding')
     for name, path_key in (('generic_runner_sha256', generic_path),
                            ('runtime_runner_sha256', adaptive_path),
-                           ('caller_api_sha256', caller_api_path)):
+                           ('caller_api_sha256', caller_api_path),
+                           ('caller_runtime_sha256', caller_runtime_path)):
         expected = value[name]
         need(re.fullmatch(r'[0-9a-f]{64}', expected) is not None
              and sha256_file(path_key) == expected, 'source_binding_' + name)
@@ -380,7 +385,12 @@ def selected_profile(context, adaptive, bound, config_path, job, config, value,
          and source_map['published_tooling'] == {
              'commit': value['tooling_commit'],
              'caller_api_path': value['caller_api_path'],
-             'caller_api_sha256': value['caller_api_sha256']}
+             'caller_api_sha256': value['caller_api_sha256'],
+             'caller_runtime_path': value['caller_runtime_path'],
+             'caller_runtime_sha256': value['caller_runtime_sha256'],
+             'context_api_path': str(Path(value['tooling_candidate_root'])
+                                     / 'tools/project-task-runner/project_context.py'),
+             'context_api_sha256': value['candidate_context_api_sha256']}
          and source_map['estimates_are_forecasts_only'] is True
          and type(source_map['actual_job_authorized']) is bool
          and source_map['actual_job_authorized'] is bound['adoption']['actual_job_authorized'] is True,
@@ -392,7 +402,7 @@ def selected_profile(context, adaptive, bound, config_path, job, config, value,
     local_names = historical_names
     local_pins = source_map['local_source_pins']
     api_path = str(Path(value['caller_api_path']).resolve(strict=True))
-    expected_local_names = local_names | {'caller_api.py'}
+    expected_local_names = local_names | {'caller_api.py', 'caller_runtime.py', 'project_context.py'}
     local_by_name = {}
     if type(local_pins) is dict:
         for path, digest in local_pins.items():
@@ -407,7 +417,14 @@ def selected_profile(context, adaptive, bound, config_path, job, config, value,
             local_by_name[source_path.name] = (path, digest)
     need(type(local_pins) is dict and set(local_by_name) == expected_local_names
          and local_by_name[value['caller_contract']['runtime_context_name']][0] == str(history_root / value['caller_contract']['runtime_context_name'])
-         and local_by_name['caller_api.py'] == (api_path, value['caller_api_sha256']),
+         and local_by_name['caller_api.py'] == (api_path, value['caller_api_sha256'])
+         and local_by_name['caller_runtime.py'] == (
+             str(Path(value['caller_runtime_path']).resolve(strict=True)),
+             value['caller_runtime_sha256'])
+         and local_by_name['project_context.py'] == (
+             str(Path(value['tooling_candidate_root']).resolve(strict=True)
+                 / 'tools/project-task-runner/project_context.py'),
+             value['candidate_context_api_sha256']),
          'successor_local_source_membership')
     pins = dict(source_map['runtime_source_pins']) | dict(local_pins)
     for key in ('accounting_reader', 'capacity_guard'):
@@ -416,17 +433,23 @@ def selected_profile(context, adaptive, bound, config_path, job, config, value,
     history_paths = {local_by_name[name][0] for name in historical_names}
     if caller_argv:
         expected_paths = {str(history_root / name) for name in historical_names}
-        expected_paths.add(api_path)
+        expected_paths.update({api_path, value['caller_runtime_path'],
+                               str(Path(value['tooling_candidate_root']).resolve(strict=True)
+                                   / 'tools/project-task-runner/project_context.py')})
         need(set(local_pins) == expected_paths, 'successor_local_source_membership')
         checked_pins = pins
     else:
-        # These hashes remain in the source identity as Root04 qualification
-        # history. They are not ordinary-v2 execution dependencies and must
-        # not force those task-local files to exist at launch/status/stop.
-        need(all(Path(path).is_relative_to(bound['project_root'] / 'work')
+        # These source hashes remain in the provenance identity; this execution
+        # mode does not load task adapter files as runtime dependencies.
+        qualification_root = Path(bound['project_root']) / value['qualification_root']
+        need(all(Path(path).is_relative_to(qualification_root)
                  for path in history_paths), 'qualification_source_history_path')
         checked_pins = dict(source_map['runtime_source_pins'])
         checked_pins[api_path] = value['caller_api_sha256']
+        checked_pins[str(Path(value['caller_runtime_path']).resolve(strict=True))] = value['caller_runtime_sha256']
+        context_api_path = (Path(value['tooling_candidate_root']).resolve(strict=True)
+                            / 'tools/project-task-runner/project_context.py')
+        checked_pins[str(context_api_path)] = value['candidate_context_api_sha256']
         checked_pins.update({item['path']: item['sha256']
                              for item in source_map['accounting'].values()})
     checked_pins[str(Path(value['project_context_path']))] = value['project_context_sha256']
