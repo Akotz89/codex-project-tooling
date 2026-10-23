@@ -83,6 +83,7 @@ def cgdir(value):
     need(value.startswith('/') and value!='/' and '..' not in PurePosixPath(value).parts,'cgroup_path')
     return Path('/sys/fs/cgroup')/value.lstrip('/')
 TOPOLOGY = 'management-workload-v1'
+TOPOLOGY_CONTROLLERS = ('cpu', 'memory', 'pids')
 def service_cgroup(ready):
     return ready.get('topology', {}).get('service', ready['process']['cgroup'])
 def management_cgroup(intent, service):
@@ -114,7 +115,8 @@ def topology_check(intent,ready,info):
     need(info.get('Delegate')=='yes' and info.get('DelegateSubgroup')=='management','delegation_manager')
     if cg.exists():
         need(not (cg/'cgroup.procs').read_text().strip(),'nonempty_service_root')
-        need('cpu' in (cg/'cgroup.subtree_control').read_text().split(),'cpu_not_delegated')
+        enabled=set((cg/'cgroup.subtree_control').read_text().split())
+        need(set(TOPOLOGY_CONTROLLERS)<=enabled,'controllers_not_delegated')
         need({p.name for p in cg.iterdir() if p.is_dir()}=={'management','workload'},'unexpected_topology')
         for name in ('management','workload'):
             leaf=cg/name
@@ -127,7 +129,9 @@ def setup_topology(intent,info):
     need(info.get('Delegate')=='yes' and info.get('DelegateSubgroup')=='management','delegation_manager')
     need(not (cg/'cgroup.procs').read_text().strip(),'nonempty_service_root')
     need({p.name for p in cg.iterdir() if p.is_dir()}=={'management'},'unexpected_topology')
-    (cg/'cgroup.subtree_control').write_text('+cpu')
+    available=set((cg/'cgroup.controllers').read_text().split())
+    need(set(TOPOLOGY_CONTROLLERS)<=available,'controller_unavailable')
+    (cg/'cgroup.subtree_control').write_text('+'+' +'.join(TOPOLOGY_CONTROLLERS))
     (cg/'workload').mkdir()
     topology={'version':TOPOLOGY,'service':service,'management':service+'/management','workload':service+'/workload'}
     topology_check(intent,{'process':process(os.getpid()),'topology':topology},info)
