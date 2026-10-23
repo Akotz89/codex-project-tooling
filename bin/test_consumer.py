@@ -70,6 +70,24 @@ WORK = HOME / "work/cpi410/tests"
 WORK.mkdir(parents=True, exist_ok=True)
 
 
+class NativeAuditEntryTests(unittest.TestCase):
+    def test_shared_command_uses_actual_project_and_propagates_status(self):
+        from factory import usage_collector
+        actual = Path("/actual/bound/caller")
+        args = ["--preparation", "work/task/private.json", "--thread-id", "caller", "--call-id", "call"]
+        with patch.object(consumer, "project_root", return_value=actual), \
+                patch.object(usage_collector, "audit_native_cli", return_value=1) as audit:
+            self.assertEqual(consumer.main(["audit-native-call", *args]), 1)
+            audit.assert_called_once_with(actual, args)
+
+    def test_help_exposes_audit_and_existing_commands(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(consumer.main(["--help"]), 0)
+        for command in ("audit-native-call", "route-subagent", "route-worker", "factory schedule", "factory run"):
+            self.assertIn(command, output.getvalue())
+
+
 class Fixture(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=WORK, prefix="factory consumer ")
@@ -195,7 +213,19 @@ class ConsumerTests(Fixture):
     def test_actual_flat_native_hook_rewrites_and_denies_wrong_locator(self):
         self.native_hook_source_boundary("collaborationspawn_agent")
 
-    def native_hook_source_boundary(self, tool_name):
+    def test_actual_native_audit_opaque_hook_records(self):
+        self.native_hook_source_boundary("collaborationspawn_agent", opaque=True)
+
+    def test_actual_native_audit_subdirectory_session(self):
+        self.native_hook_source_boundary("collaborationspawn_agent", opaque=True, session_layout="subdir")
+
+    def test_actual_native_audit_linked_worktree_session(self):
+        self.native_hook_source_boundary("collaborationspawn_agent", opaque=True, session_layout="worktree")
+
+    def test_actual_native_audit_permission_and_current_binding_refusals(self):
+        self.native_hook_source_boundary("collaborationspawn_agent", opaque=True, audit_controls=True)
+
+    def native_hook_source_boundary(self, tool_name, opaque=False, session_layout="root", audit_controls=False):
         session_id = "01a15564-fd5f-7550-aadb-de6160ef7b5d"
         caller = "native:" + session_id
         body = "Perform the bounded parser task and verify its assertions."
@@ -215,6 +245,13 @@ class ConsumerTests(Fixture):
                         "route-subagent", "--caller-id", caller, "--work-dir", "work/native"]
         hook_args = [sys.executable, "-B",
                      str(self.fixture_factory / "bin/factory.py"), "native-hook"]
+        session_cwd = self.app
+        if session_layout == "subdir":
+            session_cwd = self.app / "nested/session"
+            session_cwd.mkdir(parents=True)
+        elif session_layout == "worktree":
+            session_cwd = self.base / "linked-session"
+            self.git(self.app, "worktree", "add", "-q", "-b", "audit-linked", str(session_cwd))
 
         def prepare():
             result = subprocess.run(prepare_args, input=json.dumps(request), cwd=self.app,
@@ -223,15 +260,20 @@ class ConsumerTests(Fixture):
             return json.loads(result.stdout)
 
         def event(receipt, tool_id):
-            return {"hook_event_name": "PreToolUse", "cwd": str(self.app),
+            packet = dict(receipt["native_request"])
+            if opaque:
+                import base64
+                packet["message"] = base64.urlsafe_b64encode(b"\x80" + b"\0" * 8 + b"x" * 64).decode()
+            return {"hook_event_name": "PreToolUse", "cwd": str(session_cwd),
                     "session_id": session_id, "turn_id": "turn:1", "tool_use_id": tool_id,
-                    "tool_name": tool_name, "tool_input": dict(receipt["native_request"])}
+                    "tool_name": tool_name, "tool_input": packet}
 
         def hook(receipt, tool_id, wrong_locator=False):
             payload = event(receipt, tool_id)
             if wrong_locator:
-                locator = "work/native/jev-00000000000000000000000000000000.json"
-                payload["tool_input"]["task_name"] = "cpi414_" + locator.encode().hex()
+                from factory.jev_prepared_bridge import native_carrier
+                payload["tool_input"]["task_name"] = native_carrier(
+                    "work/native/jev-00000000000000000000000000000000.json")
             result = subprocess.run(hook_args, input=json.dumps(payload), cwd=self.app,
                                     capture_output=True, text=True, timeout=15)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -242,14 +284,106 @@ class ConsumerTests(Fixture):
         self.assertEqual(wrong["permissionDecision"], "deny")
         self.assertNotIn("updatedInput", wrong)
         self.assertFalse(Path(positive["receipt_path"]).with_suffix(".consume.json").exists())
-        allowed = hook(positive, "tool:valid")
+        allowed = hook(positive, "call_fixture_original")
         self.assertEqual(allowed["permissionDecision"], "allow")
         self.assertEqual(allowed["updatedInput"]["model"], "gpt-6.1-sol")
         self.assertEqual(allowed["updatedInput"]["reasoning_effort"], "medium")
         self.assertEqual(allowed["updatedInput"]["fork_turns"], "none")
         self.assertEqual(positive["receipt"]["attempts"], 1)
-        self.assertEqual(allowed["updatedInput"]["task_name"], positive["native_task_name"])
-        self.assertEqual(allowed["updatedInput"]["message"], body)
+        self.assertEqual(allowed["updatedInput"]["task_name"], positive["native_request"]["task_name"])
+        self.assertEqual(allowed["updatedInput"]["message"], event(positive, "call_fixture_original")["tool_input"]["message"])
+
+        if opaque:
+            post_event = event(positive, "call_fixture_original")
+            post_event.update(hook_event_name="PostToolUse", tool_response={"task_name":"/root/fixture_worker"})
+            post_result = subprocess.run(hook_args, input=json.dumps(post_event), cwd=self.app,
+                                         capture_output=True, text=True, timeout=15)
+            self.assertEqual(post_result.returncode, 0, post_result.stderr)
+            self.assertEqual(json.loads(post_result.stdout), {})
+
+        # Public shared audit uses real binding/carrier/source checks and owned original records.
+        import sqlite3
+        from datetime import datetime, timezone
+        codex_home = self.base / "audit-codex"
+        rollout = codex_home / "sessions/2026/10/23" / ("rollout-fixture-" + session_id + ".jsonl")
+        rollout.parent.mkdir(parents=True)
+        call_id = "call_fixture_original"
+        rows = [{"type": "session_meta", "payload": {"id": session_id, "cwd": str(session_cwd)}},
+                {"type": "response_item", "timestamp": datetime.now(timezone.utc).isoformat(),
+                 "payload": {"type": "function_call", "name": tool_name, "call_id": call_id,
+                             "arguments": json.dumps(event(positive, "call_fixture_original")["tool_input"])}},
+                {"type": "response_item", "payload": {"type": "function_call_output", "call_id": call_id,
+                 "output": json.dumps({"task_name": "/root/fixture_worker"})}}]
+        rollout.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        with contextlib.closing(sqlite3.connect(codex_home / "state_5.sqlite")) as connection, connection:
+            connection.execute("CREATE TABLE threads (id TEXT, rollout_path TEXT, cwd TEXT)")
+            connection.execute("INSERT INTO threads VALUES (?, ?, ?)", (session_id, str(rollout), str(session_cwd)))
+        audit_args = [sys.executable, "-B", str(self.fixture_factory / "bin/factory.py"), "audit-native-call",
+                      "--preparation", positive["receipt_path"], "--thread-id", session_id, "--call-id", call_id]
+        environment = {**os.environ, "CODEX_HOME": str(codex_home)}
+        audited = subprocess.run(audit_args, cwd=self.app, env=environment, capture_output=True, text=True, timeout=15)
+        self.assertEqual(audited.returncode, 0, audited.stderr + audited.stdout)
+        original_audit = json.loads(audited.stdout)
+        self.assertTrue(original_audit["observable_arguments_match"])
+        if opaque:
+            self.assertIsNone(original_audit["arguments_match"])
+            self.assertEqual(original_audit["plaintext_attestation"], "unavailable")
+            self.assertIsNotNone(original_audit["hook_binding"])
+        else:
+            self.assertTrue(original_audit["arguments_match"])
+        self.assertEqual(original_audit["status"], "matching_reported_launch")
+        self.assertEqual(original_audit["caller_acceptance"], "not_performed")
+        self.assertNotIn(body, audited.stdout)
+
+        if audit_controls:
+            preparation = Path(positive['receipt_path'])
+            evidence = [preparation, preparation.with_suffix('.consume.json'), preparation.with_suffix('.result.json')]
+            before = {path: path.read_bytes() for path in evidence}
+            def refused(reason):
+                checked = subprocess.run(audit_args, cwd=self.app, env=environment,
+                                         capture_output=True, text=True, timeout=15)
+                self.assertEqual(checked.returncode, 1, checked.stderr + checked.stdout)
+                result = json.loads(checked.stdout)
+                self.assertEqual(result['status'], 'unverified')
+                self.assertEqual(result['reason'], reason)
+                self.assertNotIn(body, checked.stdout)
+                self.assertEqual(before, {path: path.read_bytes() for path in evidence})
+            for path in (codex_home / 'state_5.sqlite', rollout):
+                with self.subTest(unsafe_path=path.name):
+                    mode = path.stat().st_mode & 0o777
+                    path.chmod(mode | 0o020)
+                    try:
+                        refused('unsafe_source_file')
+                    finally:
+                        path.chmod(mode)
+            settings_path = self.app / consumer.SETTINGS
+            for drift in ('source', 'policy'):
+                with self.subTest(current_binding_drift=drift):
+                    target = self.source / 'package.json' if drift == 'source' else settings_path
+                    previous = target.read_bytes()
+                    try:
+                        if drift == 'source':
+                            target.write_text('source drift')
+                        else:
+                            settings = json.loads(previous)
+                            settings.setdefault('jev_router', {})['allowed_models'] = ['gpt-6-luna']
+                            target.write_text(json.dumps(settings))
+                        refused('current_binding_unverified')
+                    finally:
+                        target.write_bytes(previous)
+            foreign = self.base / 'foreign-session'
+            foreign.mkdir()
+            self.git(foreign, 'init', '-q')
+            with contextlib.closing(sqlite3.connect(codex_home / 'state_5.sqlite')) as connection, connection:
+                connection.execute('UPDATE threads SET cwd=?', (str(foreign),))
+            rows[0]['payload']['cwd'] = str(foreign)
+            rollout.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+            refused('thread_cwd_mismatch')
+            with contextlib.closing(sqlite3.connect(codex_home / 'state_5.sqlite')) as connection, connection:
+                connection.execute('UPDATE threads SET cwd=?', (str(self.app),))
+            rows[0]['payload']['cwd'] = str(self.app / 'unrelated-subdir')
+            rollout.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+            refused('session_metadata_mismatch')
 
         unused = prepare()
         self.assertEqual(unused["source_binding"],
@@ -1219,6 +1353,17 @@ class ConfigureTests(unittest.TestCase):
 
 
 class InstallTests(Fixture):
+    def test_sync_never_installs_template_work_data(self):
+        copied_template = self.fixture_factory / "template"
+        temporary = copied_template / "work/factory-tests/collector/private-fixture.json"
+        temporary.parent.mkdir(parents=True)
+        temporary.write_text('disposable test data')
+        with patch("install.TEMPLATE", copied_template), contextlib.redirect_stdout(io.StringIO()) as output:
+            sync(self.app)
+        self.assertFalse((self.app / temporary.relative_to(copied_template)).exists())
+        self.assertNotIn("install work/", output.getvalue())
+        self.assertTrue(temporary.exists())
+
     def test_repeated_init_preserves_project_router_options(self):
         factory = load("factory_router_init_test", HOME / "bin/factory.py")
         router = {"key_file": "private/missing-reference", "jev_model": "jev-latest"}
@@ -1465,6 +1610,90 @@ class HarnessTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0, result.stdout)
             self.assertNotIn("CHECKS_OK", result.stdout)
 
+    def source_check(self, name="consumer", program="print('Ran 2 tests')"):
+        return {"name": name, "argv": [sys.executable, "-B", "-c", program],
+                "count_pattern": r"Ran (\d+) tests?"}
+
+    def test_source_checks_use_bound_source_in_declaration_order(self):
+        bound = f"from pathlib import Path; assert Path.cwd() == Path({str(HOME)!r}); print('Ran 2 tests')"
+        result = self.run_checks({"source_checks": [self.source_check("first", bound),
+                                                    self.source_check("second")]})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        first = f"SOURCE_CHECK_PASSED name=first count=2 source={HOME}"
+        second = f"SOURCE_CHECK_PASSED name=second count=2 source={HOME}"
+        self.assertIn(first, result.stdout)
+        self.assertLess(result.stdout.index(first), result.stdout.index(second))
+        self.assertIn("RUNTIME_NOT_RUN", result.stdout)
+        self.assertIn("CHECKS_OK mode=ordinary", result.stdout)
+
+    def test_structured_source_argv_preserves_literal_quotes_and_legacy_strings_parse(self):
+        literal = ['"surrounding quotes"', "'single quotes'", r'C:\path\with spaces']
+        check = self.source_check(program=f"import sys; assert sys.argv[1:] == {literal!r}; print('Ran 1 test')")
+        check['argv'].extend(literal)
+        result = self.run_checks({'static': f'"{sys.executable}" -c "assert 2 + 2 == 4"',
+                                  'source_checks': [check]})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('SOURCE_CHECK_PASSED name=consumer count=1', result.stdout)
+        self.assertIn('CHECKS_OK', result.stdout)
+
+    def test_all_skipped_actual_unittest_source_suite_refuses_success(self):
+        suite = self.root / 'skipped_suite.py'
+        for include_real_test in (False, True):
+            with self.subTest(include_real_test=include_real_test):
+                suite.write_text("import unittest\nclass Checks(unittest.TestCase):\n"
+                    " @unittest.skip('unavailable fixture')\n def test_skip(self): pass\n"
+                    + (" def test_real(self): self.assertEqual(2 + 2, 4)\n" if include_real_test else "")
+                    + "if __name__ == '__main__': unittest.main()\n")
+                check = self.source_check()
+                check['argv'] = [sys.executable, '-B', str(suite)]
+                result = self.run_checks({'source_checks': [check]})
+                if include_real_test:
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn('CHECKS_OK', result.stdout)
+                else:
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertIn('all discovered tests were skipped', result.stdout)
+                    self.assertIn('GATE_FAILED: source:consumer', result.stdout)
+                    self.assertNotIn('CHECKS_OK', result.stdout)
+
+    def test_failed_source_suite_keeps_prior_success_and_refuses_overall_success(self):
+        result = self.run_checks({"source_checks": [self.source_check("first"),
+                self.source_check("broken", "print('Ran 2 tests'); raise SystemExit(3)"),
+                self.source_check("never")]})
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("SOURCE_CHECK_PASSED name=first", result.stdout)
+        self.assertIn("GATE_FAILED: source:broken", result.stdout)
+        self.assertNotIn("name=never", result.stdout)
+        self.assertNotIn("CHECKS_OK", result.stdout)
+
+    def test_source_suite_requires_single_positive_integer_count(self):
+        for program in ("print('Ran 0 tests')", "print('no count')",
+                        "print('Ran 2 tests\\nRan 3 tests')", "print('Ran unknown tests')"):
+            with self.subTest(program=program):
+                result = self.run_checks({"source_checks": [self.source_check(program=program)]})
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("GATE_FAILED: source:consumer", result.stdout)
+                self.assertNotIn("CHECKS_OK", result.stdout)
+
+    def test_invalid_source_declarations_refuse_before_any_command(self):
+        sentinel = self.root / "SHOULD_NOT_RUN"
+        static = [sys.executable, "-c", f"from pathlib import Path; Path({str(sentinel)!r}).touch()"]
+        valid = self.source_check()
+        declarations = (None, {}, [], "command", [None], [valid, valid],
+                        [{**valid, "name": "bad name"}], [{**valid, "argv": "python check.py"}],
+                        [{**valid, "argv": []}], [{**valid, "argv": [False]}],
+                        [{**valid, "argv": ["bad\0exe"]}], [{**valid, "count_pattern": "["}],
+                        [{**valid, "count_pattern": "no capture"}],
+                        [{**valid, "count_pattern": "(two)(groups)"}],
+                        [{**valid, "cwd": str(self.root)}], [{"name": "missing"}])
+        for declaration in declarations:
+            with self.subTest(declaration=declaration):
+                result = self.run_checks({"static": static, "source_checks": declaration})
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("GATE_FAILED: configuration", result.stdout)
+                self.assertNotIn("CHECKS_OK", result.stdout)
+                self.assertFalse(sentinel.exists())
+
     def test_windows_pathext_resolution(self):
         if os.name != "nt":
             self.skipTest("Windows launcher fixture")
@@ -1481,6 +1710,25 @@ class HarnessTests(unittest.TestCase):
         with self.assertRaises(appproc.AppDidNotStart):
             with appproc.make_driver(cfg):
                 pass
+
+    def test_cli_smoke_requires_exit_zero_even_when_expected_text_matches(self):
+        appproc = load("cli_smoke_test", TEMPLATE / "harness/appproc.py")
+        appproc.ROOT = self.root
+        script = self.root / "smoke.py"
+        cfg = {"driver": "cli", "cli": {
+            "invoke": f'"{sys.executable}" smoke.py {{args}}',
+            "smoke_args": "status", "smoke_contains": "EXPECTED_SOURCE"}}
+        for code in (0, 1):
+            script.write_text(f"print('EXPECTED_SOURCE'); raise SystemExit({code})\n")
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                if code:
+                    with self.assertRaisesRegex(appproc.AppDidNotStart, "rc=1"):
+                        with appproc.make_driver(cfg):
+                            self.fail("failed CLI smoke must not start")
+                else:
+                    with appproc.make_driver(cfg):
+                        pass
+            self.assertEqual("APP_STARTED driver=cli" in output.getvalue(), code == 0)
 
     def test_mutation_unique_anchor_path_escape_and_noop(self):
         runner = load("mutation_test", TEMPLATE / "harness/mutations/run.py")

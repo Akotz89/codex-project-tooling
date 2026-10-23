@@ -16,8 +16,13 @@ implementation/review route and preserve the original caller's acceptance.
 
 Worker choices are limited to `gpt-6-luna` with currently supported effort and
 `gpt-6.1-sol` with low, medium or high effort. Preserve an explicit permitted pair;
-refuse a forbidden pair. Optional Jev assessment failure permits only an already
-validated ordinary pair. Current coordinator settings remain unchanged. Usage
+refuse a forbidden pair. Every new logical worker requires actual Jev assessment
+at the supported native or provider admission boundary, successful persistence,
+and consumption of the exact assessed permitted pair. A direct human pair
+requirement constrains the assessment and requires attributable provenance; it
+does not bypass assessment. Unavailable, malformed, insufficient, uncertain or
+unpersisted assessment refuses a new worker. Existing workers and their same-task
+continuations retain their settings. Current coordinator settings remain unchanged. Usage
 collection is explicit and project-local; no collector daemon is installed.
 
 For new project-bound native subagent preparations, `.factory/consumer.json` may

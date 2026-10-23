@@ -6,8 +6,9 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 EXPECTED = {
-    "capacity_budget": "5704525cb4cf73d0cac9444197fa1e80d81ec93a917f9d474a2a7716b2ad96af",
-    "capacity_guard": "076d152590a09b7db755bb5aa88e232b60354cfd8cb594369d6763726e930e72",
+    # Accepted cap-free accounting integration, merged as bffd267 (PR1).
+    "capacity_budget": "4a3082377bf936c187be9c6b462106a28709154aa2301ce4072c9f79ebab094b",
+    "capacity_guard": "8c8157550ec47fc1efc0be6ed2334cead3144e38e4d6b708e1ee65e4dd5024a1",
 }
 
 sys.path.insert(0, str(ROOT))
@@ -22,3 +23,4 @@ for name, digest in EXPECTED.items():
     if actual != digest:
         raise SystemExit(f"accounting.{name} source hash mismatch: {actual}")
 print("accounting modules import from the runtime root with accepted source hashes")
+print(f"ACCOUNTING_PUBLICATION_CHECKS count={len(EXPECTED)}")

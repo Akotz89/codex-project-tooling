@@ -136,6 +136,7 @@ def audit(root, worker_policy_source=None, bun=None):
     for error in errors:
         print(error)
     print(f"CONSUMER_AUDIT errors={len(errors)}; live source/provenance requires factory doctor")
+    print(f"CONSUMER_AUDIT_CHECKS count={len(adapters.ENTRIES)}")
     return int(bool(errors))
 
 if __name__ == "__main__":

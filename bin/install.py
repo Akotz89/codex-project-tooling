@@ -87,6 +87,10 @@ def sync(root: Path, dry: bool = False) -> None:
     # An installed file the user changed is backed up before the new version
     # replaces it; personal files are never overwritten.
     for src in sorted(TEMPLATE.rglob("*")):
+        # Development adapters keep disposable runtime/test data under the
+        # template's work/. It is never a distributable project scaffold.
+        if src.relative_to(TEMPLATE).parts[0] == "work":
+            continue
         if not src.is_file() or "__pycache__" in src.parts or src.suffix in {".pyc", ".pyo"}:
             continue
         rel = src.relative_to(TEMPLATE).as_posix()

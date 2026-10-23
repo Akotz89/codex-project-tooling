@@ -896,6 +896,7 @@ def main(argv: list[str] | None = None) -> int:
         return native_gate(args[1:])
     if not args or args[0] in {"--help", "-h"}:
         print("project-factory native-hook < native-event.json\n"
+              "project-factory audit-native-call --preparation work/<task>/jev-<id>.json --thread-id <uuid> --call-id <id>\n"
               "project-factory route-worker --caller-id <logical-caller> --work-dir work/<run>/<task> [--reuse-receipt <original>] < request.json\n"
               "project-factory route-subagent --caller-id <native-caller> --work-dir work/<task> < request.json\n"
               "factory run <shared-workflow> [native arguments]\n"
@@ -909,6 +910,9 @@ def main(argv: list[str] | None = None) -> int:
               "factory pause | unpause (stop scheduled launches; the timer keeps waking active runs)")
         return 0
     try:
+        if args[0] == "audit-native-call":
+            from .usage_collector import audit_native_cli
+            return audit_native_cli(project_root(), args[1:])
         if args[0] == "route-worker":
             return route_worker(project_root(), args[1:])
         if args[0] == "route-subagent":
