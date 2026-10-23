@@ -478,11 +478,94 @@ def stop(job):
         need(final.get('ActiveState') in ('inactive','failed',None) and subtree_empty(final.get('ControlGroup',''),intent.get('topology')==TOPOLOGY),'stop_not_quiescent')
         if not (job/'stop-result.json').exists():publish(job/'stop-result.json',{'unit_absent':final.get('LoadState')=='not-found','quiescent':True})
         return public_status(job,env)
-def drain(pipe,log,kept):
+def drain(pipe,log,counters):
     try:chunk=os.read(pipe.fileno(),65536)
-    except BlockingIOError:return kept
-    if chunk and kept<65536:part=chunk[:65536-kept];log.write(part);kept+=len(part)
-    return kept
+    except BlockingIOError:return None
+    except OSError as error:
+        counters['stream_error']=type(error).__name__
+        return None
+    if not chunk:
+        counters['stream_eof']=True
+        return False
+    counters['bytes_seen']+=len(chunk)
+    if counters.get('capture_error') is None:
+        view=memoryview(chunk)
+        while view:
+            try:written=log.write(view)
+            except OSError as error:
+                counters['capture_error']=type(error).__name__
+                break
+            if not written:
+                counters['capture_error']='OSError'
+                break
+            counters['bytes_kept']+=written
+            view=view[written:]
+    counters['truncated']=counters['bytes_seen']>counters['bytes_kept']
+    return True
+def capture_output(child,log,counters,tick,cleanup,on_exit=lambda code:None):
+    cleanup_result=None
+    while (child.poll() is None or not counters['stream_eof']) and not counters['stream_error']:
+        code=child.poll()
+        if code is not None:on_exit(code)
+        if code is not None and cleanup_result is None:
+            cleanup_result=cleanup(lambda:(drain(child.stdout,log,counters),tick()),on_exit)
+            if not cleanup_result['quiescent']:
+                counters['stream_error']='cleanup_not_quiescent'
+            continue
+        drained=drain(child.stdout,log,counters)
+        if counters['stream_error'] and child.poll() is None:
+            counters['stream_error_before_exit']=True
+        if cleanup_result is not None and drained is None:
+            counters['stream_error']='eof_not_proved_after_cleanup'
+            break
+        tick()
+        time.sleep(.025)
+    if cleanup_result is None and counters['stream_error']:
+        cleanup_result=cleanup(lambda:(drain(child.stdout,log,counters),tick()),on_exit)
+    return cleanup_result
+def complete_payload(child,log,counters,tick,cleanup,publish_exit,capture=capture_output,prior_failure=None):
+    capture_failure=None
+    published=False
+    def observe_exit(code):
+        nonlocal published
+        if published:return
+        publish_observed_payload_exit(code,prior_failure,counters,publish_exit)
+        published=True
+    try:
+        cleanup_result=capture(child,log,counters,tick,cleanup,on_exit=observe_exit)
+    except Exception as error:
+        capture_failure=error
+        counters['cleanup_error']=type(error).__name__
+        cleanup_result={'quiescent':False,'errors':[type(error).__name__]}
+    code=child.poll()
+    if counters.get('stream_error_before_exit'):
+        failure={'phase':'output_capture','code':counters['stream_error']}
+    elif code is not None and code!=0:
+        failure={'phase':'payload','code':'exit','returncode':code}
+    elif prior_failure is not None:
+        failure=prior_failure
+    elif capture_failure is not None:
+        failure={'phase':'cleanup','code':type(capture_failure).__name__}
+    elif counters['capture_error'] or counters['stream_error']:
+        failure={'phase':'output_capture','code':counters['capture_error'] or counters['stream_error']}
+    else:
+        failure=None
+    if code is None:
+        if capture_failure is not None:raise capture_failure
+        return code,failure,cleanup_result
+    observe_exit(code)
+    if capture_failure is not None:raise capture_failure
+    return code,failure,cleanup_result
+def record_payload_exit(returncode,failure,remember,publish_exit):
+    remember(returncode,failure)
+    publish_exit(returncode,failure)
+def publish_observed_payload_exit(returncode,prior_failure,counters,publish_exit):
+    capture_error=(counters.get('stream_error') if counters.get('stream_error_before_exit')
+                   else (counters.get('capture_error') or counters.get('stream_error')))
+    failure=(prior_failure if prior_failure is not None else
+             ({'phase':'output_capture','code':capture_error} if capture_error else
+              ({'phase':'payload','code':'exit','returncode':returncode} if returncode!=0 else None)))
+    publish_exit(returncode,failure)
 def signal_members(cgroup,signum,recursive=False):
     for pid,group in subtree_members(cgroup,recursive):
         if pid==os.getpid():continue
@@ -493,7 +576,7 @@ def signal_members(cgroup,signum,recursive=False):
                 signal.pidfd_send_signal(fd,signum)
             finally:os.close(fd)
         except (ProcessLookupError,FileNotFoundError):pass
-def cleanup_members(cgroup,child,recursive=False,expected_birth=None):
+def cleanup_members(cgroup,child,recursive=False,expected_birth=None,on_tick=None,on_child_exit=None):
     errors=[]
     try:
         deadline=time.monotonic()+2
@@ -505,11 +588,20 @@ def cleanup_members(cgroup,child,recursive=False,expected_birth=None):
                 except (ProcessLookupError,FileNotFoundError):current=None
                 if current and all(current[k]==expected_birth[k] for k in ('uid','start_ticks')):
                     need(current['cgroup']==expected_birth['cgroup'],'payload_escaped')
+            if child is not None and child.returncode is None:
+                status=os.waitid(os.P_PID,child.pid,os.WEXITED|os.WNOHANG|os.WNOWAIT)
+                if status is not None and status.si_pid==child.pid:
+                    child.returncode=status.si_status if status.si_code==os.CLD_EXITED else -status.si_status
+                    if on_child_exit is not None:on_child_exit(child.returncode)
             signal_members(cgroup,signal.SIGTERM if time.monotonic()<deadline else signal.SIGKILL,recursive)
+            if on_tick is not None:on_tick()
             while True:
                 try:
-                    pid,_=os.waitpid(-1,os.WNOHANG)
+                    pid,status= os.waitpid(-1,os.WNOHANG)
                     if pid==0:break
+                    if child is not None and pid==child.pid and child.returncode is None:
+                        child.returncode=os.waitstatus_to_exitcode(status)
+                        if on_child_exit is not None:on_child_exit(child.returncode)
                 except ChildProcessError:break
             if not any(pid!=os.getpid() for pid,_ in subtree_members(cgroup,recursive)):break
             need(time.monotonic()<deadline+1,'children_not_quiescent');time.sleep(.025)
@@ -555,20 +647,39 @@ def worker(job):
             try:birth=process(child.pid)
             except (FileNotFoundError,ProcessLookupError):birth=None
             publish(job/'payload-start.json',{'pid':child.pid,'process':birth,'identity_sampled':birth is not None})
-            os.set_blocking(child.stdout.fileno(),False);kept=0
-            while child.poll() is None:
-                kept=drain(child.stdout,log,kept)
+            os.set_blocking(child.stdout.fileno(),False)
+            counters={'bytes_seen':0,'bytes_kept':0,'truncated':False,'stream_eof':False,
+                      'capture_error':None,'stream_error':None,'stream_error_before_exit':False}
+            payload_exit_published=False
+            def capture_tick():
                 if cancelled:signal_members(cg,signal.SIGTERM if time.monotonic()-cancelled_at<.5 else signal.SIGKILL)
-                time.sleep(.025)
-            code=child.wait()
+            def capture_cleanup(on_tick,on_child_exit):
+                return cleanup_members(cg,child,expected_birth=birth,on_tick=on_tick,on_child_exit=on_child_exit)
+            def publish_payload_exit(returncode,failure):
+                nonlocal code,first,payload_exit_published
+                if payload_exit_published:return
+                def remember(returncode,failure):
+                    nonlocal code,first,payload_exit_published
+                    code=returncode
+                    first=failure
+                    payload_exit_published=True
+                def persist(returncode,failure):
+                    publish(job/'payload-exit.json',{'job_id':intent['job_id'],'intent_sha256':digest(read_bytes(job/'intent.json')),'returncode':returncode,'first_failure':failure})
+                record_payload_exit(returncode,failure,remember,persist)
+            def cleanup_child_exit(returncode):
+                publish_observed_payload_exit(returncode,first,counters,publish_payload_exit)
+            code,first,_=complete_payload(child,log,counters,capture_tick,capture_cleanup,publish_payload_exit,prior_failure=first)
             # Persist the actual first payload result before optional cgroup/log/cleanup work.
-            if code!=0:first={'phase':'payload','code':'exit','returncode':code}
-            publish(job/'payload-exit.json',{'job_id':intent['job_id'],'intent_sha256':digest(read_bytes(job/'intent.json')),'returncode':code,'first_failure':first})
-            kept=drain(child.stdout,log,kept);child.stdout.close()
+            child.stdout.close()
     except Exception as e:
         if first is None:first={'phase':'supervisor','code':str(e) if isinstance(e,Refused) else type(e).__name__}
         if not (job/'first-failure.json').exists():publish(job/'first-failure.json',first)
-    cleanup=cleanup_members(cg,child)
+    cleanup=cleanup_members(cg,child,expected_birth=birth,
+                            on_child_exit=cleanup_child_exit if child is not None and 'cleanup_child_exit' in locals() else None)
+    if 'counters' in locals():
+        capture_error=counters.get('cleanup_error') or counters.get('stream_error') or counters.get('capture_error')
+        if capture_error:cleanup['capture_error']=capture_error
+        publish(job/'output.json',counters)
     publish(job/'cleanup.json',cleanup)
     publish(job/'result.json',result_record(intent,digest(read_bytes(job/'intent.json')),os.environ.get('INVOCATION_ID'),code,first,cancelled,cleanup,(job/'stop-intent.json').exists()))
     return 0

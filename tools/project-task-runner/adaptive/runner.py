@@ -492,17 +492,56 @@ def advance(job, env=None):
         return result
 
 
-def drain(pipe, log, counters, cap=65536):
+def drain(pipe, log, counters):
     try:
         chunk = os.read(pipe.fileno(), 65536)
     except BlockingIOError:
         return None
+    except OSError as error:
+        counters['stream_error'] = type(error).__name__
+        return None
+    if not chunk:
+        counters['stream_eof'] = True
+        return False
     counters['bytes_seen'] += len(chunk)
-    keep = chunk[:max(0, cap - counters['bytes_kept'])]
-    log.write(keep)
-    counters['bytes_kept'] += len(keep)
+    if counters['capture_error'] is None:
+        view = memoryview(chunk)
+        while view:
+            try:
+                written = log.write(view)
+            except OSError as error:
+                counters['capture_error'] = type(error).__name__
+                break
+            if not written:
+                counters['capture_error'] = 'OSError'
+                break
+            counters['bytes_kept'] += written
+            view = view[written:]
     counters['truncated'] = counters['bytes_seen'] > counters['bytes_kept']
-    return bool(chunk)
+    return True
+
+
+def capture_output(child, log, counters, tick, cleanup, on_exit=lambda code: None):
+    cleanup_result = None
+    while (child.poll() is None or not counters['stream_eof']) and not counters['stream_error']:
+        code = child.poll()
+        if code is not None: on_exit(code)
+        if code is not None and cleanup_result is None:
+            cleanup_result = cleanup(lambda: drain(child.stdout, log, counters), on_exit)
+            if not cleanup_result['quiescent']:
+                counters['stream_error'] = 'cleanup_not_quiescent'
+            continue
+        drained = drain(child.stdout, log, counters)
+        if counters['stream_error'] and child.poll() is None:
+            counters['stream_error_before_exit'] = True
+        if cleanup_result is not None and drained is None:
+            counters['stream_error'] = 'eof_not_proved_after_cleanup'
+            break
+        tick()
+        time.sleep(.025)
+    if cleanup_result is None and counters['stream_error']:
+        cleanup_result = cleanup(lambda: drain(child.stdout, log, counters), on_exit)
+    return cleanup_result
 
 
 def cleanup_terminal(job, env):
@@ -629,7 +668,7 @@ def poll_helper(helper, counters):
     counters['helper_last_status'] = os.waitstatus_to_exitcode(status)
     return None
 
-def finish_helper(helper, management, counters):
+def finish_helper(helper, management, counters, on_tick=None, on_child_exit=None, child=None):
     # Reap the writer before final receipts; interrupted physical writes remain uncertain.
     outcome = {'quiescent': False, 'interrupted': helper is not None}
     try:
@@ -646,7 +685,8 @@ def finish_helper(helper, management, counters):
                     outcome['interrupted'] = False
                 else:
                     need(current == helper['process'], 'helper_identity')
-        cleanup = base.cleanup_members(management, None, True)
+        cleanup = base.cleanup_members(management, child, True, on_tick=on_tick,
+                                       on_child_exit=on_child_exit)
         outcome.update(cleanup)
         if helper is not None:
             # cleanup_members reaps all adopted children, including this exact helper.
@@ -682,6 +722,8 @@ def worker(job):
     env = base.read(job / 'environment.json')
     c = intent['config']
     child = None; first = None; code = None; cancelled = False; cancelled_at = None; helper = None; birth = None; placement_error = None
+    helper_cleanup = None
+    payload_exit_published = False
     def cancel(signum, frame):
         nonlocal cancelled, cancelled_at
         cancelled = True
@@ -692,7 +734,9 @@ def worker(job):
     need(cg.endswith('/' + intent['unit'] + ('/management' if delegated else '')), 'supervisor_cgroup')
     info = base.unit_show(intent['unit'], env)
     need(info.get('MainPID') == str(os.getpid()) and base.management_cgroup(intent, info.get('ControlGroup', '')) == cg and info.get('InvocationID') == os.environ.get('INVOCATION_ID') and bool(info.get('InvocationID')) and info.get('Description') == binding['unit_prefix'] + ' ' + intent['job_id'], 'supervisor_unit_identity')
-    counters = {'bytes_seen': 0, 'bytes_kept': 0, 'truncated': False}
+    counters = {'bytes_seen': 0, 'bytes_kept': 0, 'truncated': False,
+                'stream_eof': False, 'capture_error': None, 'stream_error': None,
+                'stream_error_before_exit': False}
     try:
         need(ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0, 'subreaper')
         need(all(os.environ.get(k) == v for k, v in env.items()), 'unit_environment')
@@ -721,8 +765,8 @@ def worker(job):
             base.publish(job / 'payload-start.json', {'pid': child.pid, 'process': birth, 'identity_sampled': birth is not None})
             os.set_blocking(child.stdout.fileno(), False)
             next_tick = time.monotonic() + 1
-            while child.poll() is None:
-                drain(child.stdout, log, counters)
+            def capture_tick():
+                nonlocal helper, next_tick, placement_error
                 helper = poll_helper(helper, counters)
                 if delegated and birth is not None:
                     try:
@@ -733,22 +777,40 @@ def worker(job):
                 if cancelled:
                     base.signal_members(service, signal.SIGCONT, delegated)
                     base.signal_members(service, signal.SIGTERM if time.monotonic() - cancelled_at < .5 else signal.SIGKILL, delegated)
-                elif time.monotonic() >= next_tick:
+                elif child.poll() is None and time.monotonic() >= next_tick:
                     if helper is None:
                         helper = start_helper(intent, env)
                         counters['helpers_started'] = counters.get('helpers_started', 0) + 1
                         counters['helper_births'] = (counters.get('helper_births', []) + [helper['process']])[-64:]
                         release_helper(helper)
                     next_tick = time.monotonic() + 1
-                time.sleep(.025)
-            code = child.wait()
-            if code != 0: first = {'phase': 'payload', 'code': 'exit', 'returncode': code}
-            base.publish(job / 'payload-exit.json', {'job_id': intent['job_id'], 'intent_sha256': ready['intent_sha256'], 'returncode': code, 'first_failure': first})
-            counters['stream_eof'] = False
-            for _ in range(16):
-                drained = drain(child.stdout, log, counters)
-                if drained is False: counters['stream_eof'] = True
-                if drained is not True: break
+            def capture_cleanup(on_tick, on_child_exit):
+                nonlocal helper, helper_cleanup
+                helper_cleanup = finish_helper(helper, cg, counters, on_tick, on_child_exit, child)
+                helper = None
+                cleanup = base.cleanup_members(info['ControlGroup'] if delegated else cg,
+                                               child, delegated, birth, on_tick=on_tick,
+                                               on_child_exit=on_child_exit)
+                cleanup['management_helper'] = helper_cleanup
+                cleanup['quiescent'] = cleanup['quiescent'] and helper_cleanup['quiescent']
+                return cleanup
+            def publish_payload_exit(returncode, failure):
+                nonlocal code, first, payload_exit_published
+                if payload_exit_published:return
+                def remember(returncode, failure):
+                    nonlocal code, first, payload_exit_published
+                    code = returncode
+                    first = failure
+                    payload_exit_published = True
+                def persist(returncode, failure):
+                    base.publish(job / 'payload-exit.json', {'job_id': intent['job_id'], 'intent_sha256': ready['intent_sha256'], 'returncode': returncode, 'first_failure': failure})
+                base.record_payload_exit(returncode, failure, remember, persist)
+            def cleanup_child_exit(returncode):
+                base.publish_observed_payload_exit(returncode, first, counters,
+                                                   publish_payload_exit)
+            code, first, _ = base.complete_payload(
+                child, log, counters, capture_tick, capture_cleanup,
+                publish_payload_exit, capture=capture_output, prior_failure=first)
             child.stdout.close()
     except Exception as error:
         if first is None: first = {'phase': 'supervisor', 'code': str(error) if isinstance(error, base.Refused) else type(error).__name__}
@@ -759,8 +821,16 @@ def worker(job):
         except Exception as error:
             placement_error = str(error)
             if first is None: first = {'phase': 'custody', 'code': placement_error}
-    helper_cleanup = finish_helper(helper, cg, counters)
-    cleanup = base.cleanup_members(info['ControlGroup'] if delegated else cg, child, delegated, birth)
+    if helper_cleanup is None:
+        helper_cleanup = finish_helper(
+            helper, cg, counters,
+            on_child_exit=cleanup_child_exit if child is not None and 'cleanup_child_exit' in locals() else None,
+            child=child)
+    cleanup = base.cleanup_members(
+        info['ControlGroup'] if delegated else cg, child, delegated, birth,
+        on_child_exit=cleanup_child_exit if child is not None and 'cleanup_child_exit' in locals() else None)
+    capture_error = counters.get('cleanup_error') or counters.get('stream_error') or counters.get('capture_error')
+    if capture_error: cleanup['capture_error'] = capture_error
     if placement_error is not None:
         cleanup['placement_error'] = placement_error
         cleanup['quiescent'] = False
