@@ -11,7 +11,7 @@ from pathlib import Path
 import sqlite3
 from typing import TypedDict
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -22,6 +22,8 @@ class State(TypedDict, total=False):
     event: dict
     event_hash: str
     event_hash_event_id: str
+    event_received_at: str
+    event_received_at_event_id: str
     response: dict
     project_policy: dict
 
@@ -111,7 +113,7 @@ def validate_project_policy(policy, binding):
     return policy
 
 
-def validate_event(event):
+def validate_event(event, *, received_at=None):
     require(isinstance(event, dict), "event must be an object")
     op = event.get("op")
     require(isinstance(op, str) and op in {"init", "add", "observe", "prepare", "issue", "ack", "result", "reconcile", "retire", "report", "status", "recover", "rebind", "register", "summary"}, "invalid event op")
@@ -154,14 +156,27 @@ def validate_event(event):
         require(string(event["detail"]) and len(event["detail"]) <= 2000, "report detail must be 1-2000 characters")
         require(string(event["source"]) and len(event["source"]) <= 512, "report source link must be bounded")
         require(isinstance(event["evidence"], list) and len(event["evidence"]) <= 16 and all(string(v) and len(v) <= 512 for v in event["evidence"]), "report evidence must be at most 16 bounded links")
+        require(string(event["occurred_at"]) and len(event["occurred_at"]) <= 64,
+                "report occurred_at must be at most 64 characters")
         try:
             occurred = datetime.fromisoformat(event["occurred_at"].replace("Z", "+00:00"))
             require(occurred.tzinfo is not None, "report occurred_at requires timezone")
-            occurred.astimezone(timezone.utc)
+            occurred_utc = occurred.astimezone(timezone.utc)
         except (TypeError, ValueError, AttributeError, OverflowError) as exc:
             raise InvalidEvent("invalid report occurred_at") from exc
+        if received_at is None:
+            received_at = datetime.now(timezone.utc)
+        elif isinstance(received_at, str):
+            received_at = datetime.fromisoformat(received_at)
+        require(isinstance(received_at, datetime) and received_at.tzinfo is not None,
+                "report receipt time must be timezone-aware")
+        require(occurred_utc <= received_at.astimezone(timezone.utc) + timedelta(minutes=5),
+                "report occurred_at exceeds five-minute future tolerance")
+        canonical_occurred_at = occurred_utc.isoformat(timespec="microseconds").replace("+00:00", "Z")
         for optional in ("claim_id", "dispatch_id"):
             require(optional not in event or string(event[optional]), f"{optional} must be nonempty when present")
+    else:
+        canonical_occurred_at = None
     if op == "register":
         require(set(event) == {"op", "event_id", "project_id", "root", "worker", "new_thread_id", "expected_workers", "evidence"}, "register requires exactly the documented fields")
         require(worker_role(event.get("worker")), "register requires a valid worker role")
@@ -192,6 +207,7 @@ def validate_event(event):
         require(string(event.get("source_digest")) and string(event.get("scope_digest")), "source_digest and scope_digest required")
     if op in {"ack", "result"}:
         validate_file(event.get("receipt"))
+    return canonical_occurred_at
 
 
 def validate_file(value):
@@ -348,7 +364,10 @@ def receipt_file(model, event):
 def transition(state):
     model = copy.deepcopy(state.get("model", {}))
     event = state["event"]
-    validate_event(event)
+    received_at = (state.get("event_received_at")
+                   if state.get("event_received_at_event_id") == event.get("event_id")
+                   else None)
+    validate_event(event, received_at=received_at)
     op = event["op"]
     response = {"action": "OK"}
     project_policy = state.get("project_policy")
@@ -580,9 +599,12 @@ def apply_event(db, event, *, guard_context=None, project_policy=None):
     guard_context; historical replay/reuse/reconciliation does not. No promise
     of exactly-once delivery across MCP transport.
     """
-    validate_event(event)
+    event_received_at = datetime.now(timezone.utc).isoformat()
+    canonical_occurred_at = validate_event(event, received_at=event_received_at)
     event_hash = event_fingerprint(event)
     persisted_event = redact_report_event(event) if event["op"] == "report" else event
+    if event["op"] == "report":
+        persisted_event["occurred_at"] = canonical_occurred_at
     if project_policy is not None:
         binding = event["project"] if event["op"] == "init" else event
         validate_project_policy(project_policy, binding)
@@ -612,11 +634,15 @@ def apply_event(db, event, *, guard_context=None, project_policy=None):
             before = graph.get_state(config).values
             candidate = transition({"model": before.get("model", {}), "event": persisted_event, "event_hash": event_hash,
                                     "event_hash_event_id": event.get("event_id", ""),
+                                    "event_received_at": event_received_at,
+                                    "event_received_at_event_id": event.get("event_id", ""),
                                     "project_policy": project_policy})
             compute_readiness({**candidate, "event": event})
             guard = None
             inputs = {"event": persisted_event, "event_hash": event_hash,
-                      "event_hash_event_id": event.get("event_id", "")}
+                      "event_hash_event_id": event.get("event_id", ""),
+                      "event_received_at": event_received_at,
+                      "event_received_at_event_id": event.get("event_id", "")}
             if event["op"] == "register":
                 inputs["project_policy"] = project_policy
             if event["op"] in {"prepare", "issue"} and candidate["response"]["action"] != "REPLAY":

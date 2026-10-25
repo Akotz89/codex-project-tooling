@@ -60,7 +60,7 @@ def test_report_cli_retry_conflict_late_order_and_restart(tmp_path):
 
 def test_report_api_paginates_newest_first_and_marks_global_latest(h):
     h.add()
-    newest = datetime.now(timezone.utc)
+    newest = datetime.now(timezone.utc) - timedelta(minutes=3)
     for index in range(3):
         apply_event(h.db, report(h, f"page-{index}", occurred_at=(newest + timedelta(minutes=index)).isoformat()))
     first = apply_event(h.db, {**h.binding, "op": "summary", "report_limit": 2})
@@ -146,6 +146,54 @@ def test_report_rejects_utc_conversion_overflow_before_checkpoint(h):
     assert h.db.read_bytes() == before
     summary = apply_event(h.db, {**h.binding, "op": "summary"})
     assert summary["bounds"]["total_reports"] == 0
+
+
+def test_report_rejects_overlong_timestamp_before_checkpoint(h):
+    h.add()
+    before = h.db.read_bytes()
+    overlong = "2026-10-25T00:00:00." + "1" * 100_000 + "Z"
+    with pytest.raises(InvalidEvent, match="64 characters"):
+        apply_event(h.db, report(h, "report-overlong-timestamp", occurred_at=overlong))
+    assert h.db.read_bytes() == before
+    assert apply_event(h.db, {**h.binding, "op": "summary"})["bounds"]["total_reports"] == 0
+
+
+def test_report_canonicalizes_utc_timestamp_and_accepts_small_future_skew(h):
+    h.add()
+    occurred_utc = datetime.now(timezone.utc) + timedelta(minutes=2)
+    offset = timezone(timedelta(hours=-5))
+    raw_timestamp = occurred_utc.astimezone(offset).isoformat()
+    event = report(h, "report-canonical-time", occurred_at=raw_timestamp)
+    assert apply_event(h.db, event)["action"] == "REPORTED"
+
+    expected = occurred_utc.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    summary = apply_event(h.db, {**h.binding, "op": "summary"})
+    stored = summary["reports"][0]["occurred_at"]
+    assert stored == expected
+    assert len(stored) <= 64 and stored.endswith("Z")
+    assert summary["tasks"][0]["latest_report"]["occurred_at"] == expected
+    assert apply_event(h.db, event)["action"] == "REPLAY"
+
+    summary_path = h.root / "canonical-summary.json"
+    summary_path.write_text(json.dumps({**h.binding, "op": "summary"}))
+    restarted = subprocess.run([sys.executable, "-m", "project_coordinator.cli", "--db", str(h.db),
+                                "summary", "--input", str(summary_path)],
+                               capture_output=True, text=True, check=True)
+    assert json.loads(restarted.stdout)["reports"][0]["occurred_at"] == expected
+    with pytest.raises(InvalidEvent, match="conflicting payload"):
+        apply_event(h.db, {**event, "occurred_at": expected})
+
+
+def test_report_rejects_timestamps_over_five_minutes_ahead(h):
+    h.add()
+    too_far = (datetime.now(timezone.utc) + timedelta(minutes=6)).isoformat()
+    timestamps = [too_far, "9999-12-31T23:59:59Z"]
+    for index, timestamp in enumerate(timestamps):
+        before = h.db.read_bytes()
+        with pytest.raises(InvalidEvent, match="five-minute future tolerance"):
+            apply_event(h.db, report(h, f"report-future-{index}", occurred_at=timestamp))
+        assert h.db.read_bytes() == before
+    assert apply_event(h.db, {**h.binding, "op": "summary"})["bounds"]["total_reports"] == 0
 
 
 def test_concurrent_report_retry_is_idempotent(h):

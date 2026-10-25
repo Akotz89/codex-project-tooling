@@ -488,6 +488,7 @@ def test_schema_accepts_safe_project_roles_and_explicit_project_policy():
     schema = json.loads((Path(__file__).resolve().parents[1] / 'schema.json').read_text(), object_pairs_hook=unique_keys)
     assert 'register' in schema['properties']['op']['enum']
     assert 'report' in schema['properties']['op']['enum']
+    assert schema['properties']['occurred_at']['maxLength'] == 64
     assert schema['properties']['report_offset']['minimum'] == 0
     assert schema['properties']['report_limit']['maximum'] == 100
     assert schema['properties']['worker']['pattern'] == '^[a-z][a-z0-9_-]*$'

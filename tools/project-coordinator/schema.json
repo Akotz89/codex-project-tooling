@@ -49,7 +49,7 @@
     "reporter": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,63}$"},
     "reporter_thread_id": {"type": "string", "minLength": 1},
     "kind": {"enum": ["lifecycle", "progress", "blocker", "handoff", "result"]},
-    "occurred_at": {"type": "string", "format": "date-time"},
+    "occurred_at": {"type": "string", "format": "date-time", "maxLength": 64},
     "detail": {"type": "string", "minLength": 1, "maxLength": 2000},
     "source": {"type": "string", "minLength": 1, "maxLength": 512},
     "claim_id": {"type": "string", "minLength": 1},
