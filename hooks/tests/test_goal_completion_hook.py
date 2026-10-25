@@ -268,6 +268,10 @@ class GoalCompletionHookTests(unittest.TestCase):
         self.assertIn('"source_kind":"current_user_orchestration_goal"', context)
         self.assertIn('"review_decision_sha256":"334a7f828dab1a05e2e4d11e942354c8de490cd0ba64d80f9ef5a25bbe9b0b77"', context)
         self.assertIn('"original_scope_sha256":"c2ae210370c7266d6fe08e2c5537e0b528c7a86144ad09295030193e069703cc"', context)
+        readiness_scope_hash = fixture["_fixture"]["expected_original_scope_sha256"][
+            "call_20058c2e2a7d4b478923593016b3e0ad"
+        ]
+        self.assertIn(f'"original_scope_sha256":"{readiness_scope_hash}"', context)
         self.assertIn('"scope_authority":"historical_non_authoritative"', context)
         self.assertIn('"original_scope_summary":"Exact WoW_TOU_enUS_20080829 then login/menu only; oldreadiness phase completed. Not current .388.7 first-session scope or standing futurelegal consent."', context)
         self.assertNotIn("TERMINAL-READBACK.json", context)
