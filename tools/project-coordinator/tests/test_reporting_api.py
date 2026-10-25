@@ -31,6 +31,112 @@ def report(h, event_id, *, occurred_at=None, state="working", **changes):
             "claim_id": "global:bead-1", **changes}
 
 
+def project_report(h, event_id, *, reporter="worker-1", occurred_at=None, **changes):
+    return {**h.binding, "op": "project_report", "event_id": event_id,
+            "work_item": "https://linear.example/issue/REAL-123", "reporter": reporter,
+            "reporter_thread_id": h.workers.get(reporter, "unregistered-thread"), "kind": "progress",
+            "occurred_at": occurred_at or datetime.now(timezone.utc).isoformat(),
+            "state": "in progress", "detail": "Observed project work", "source": "https://linear.example/issue/REAL-123",
+            "evidence": ["https://evidence.example/actual-result"], **changes}
+
+
+def test_coordinator_and_registered_project_roles_keep_separate_five_worker_map(tmp_path):
+    h = Harness(tmp_path, workers={f"worker-{i}": f"thread{i}" for i in range(1, 6)})
+    h.add()
+    original_workers = json.dumps(h.call("summary")["project"]["workers"], sort_keys=True, separators=(",", ":")).encode()
+    role_threads = {"product_owner": "actual-product-owner-thread", "scrum_master": "actual-scrum-master-thread"}
+    policy = {"schema_version": 1, "project_id": h.binding["project_id"], "root": str(h.root),
+              "worker_registrations": [],
+              "project_report_registrations": [{"role": role, "thread_id": thread} for role, thread in role_threads.items()],
+              "legacy_leaseless_beads": []}
+    observations = [project_report(h, "root-observation", reporter="coordinator", reporter_thread_id="root"),
+                    *(project_report(h, f"{role}-observation", reporter=role, reporter_thread_id=thread)
+                      for role, thread in role_threads.items()),
+                    *(project_report(h, f"{role}-observation", reporter=role, reporter_thread_id=thread)
+                      for role, thread in h.workers.items())]
+    observations[0]["detail"] = "Authorization: Bearer project-secret-marker"
+    path = tmp_path / "project-report.json"
+    event = observations[1]
+    path.write_text(json.dumps({k: v for k, v in event.items() if k != "op"}))
+    policy_path = tmp_path / "project-policy.json"
+    policy_path.write_text(json.dumps(policy))
+    result = subprocess.run([sys.executable, "-m", "project_coordinator.cli", "--db", str(h.db), "project-report", "--input", str(path), "--project-policy", str(policy_path)],
+                            capture_output=True, text=True, check=True)
+    assert json.loads(result.stdout)["action"] == "PROJECT_REPORTED"
+    root_path = tmp_path / "root-report.json"
+    root_path.write_text(json.dumps({k: v for k, v in observations[0].items() if k != "op"}))
+    root_result = subprocess.run([sys.executable, "-m", "project_coordinator.cli", "--db", str(h.db), "project-report", "--input", str(root_path)],
+                                 capture_output=True, text=True, check=True)
+    assert json.loads(root_result.stdout)["action"] == "PROJECT_REPORTED"
+    assert apply_event(h.db, observations[0])["action"] == "REPLAY"
+    for observation in observations[1:]:
+        role_policy = policy if observation["reporter"] in role_threads else None
+        action = apply_event(h.db, observation, project_policy=role_policy)["action"]
+        assert action == ("REPLAY" if observation["event_id"] == event["event_id"] else "PROJECT_REPORTED")
+        assert apply_event(h.db, observation, project_policy=role_policy)["action"] == "REPLAY"
+    with pytest.raises(InvalidEvent, match="conflicting payload"):
+        apply_event(h.db, {**observations[1], "state": "changed"}, project_policy=policy)
+    with pytest.raises(InvalidEvent, match="coordinator reporter thread binding mismatch"):
+        apply_event(h.db, {**observations[0], "event_id": "root-wrong-thread", "reporter_thread_id": "spoofed-root"})
+    with pytest.raises(InvalidEvent, match="coordinator reporter thread binding mismatch"):
+        apply_event(h.db, {**observations[0], "event_id": "root-spoof", "reporter_thread_id": role_threads["product_owner"]})
+    with pytest.raises(InvalidEvent, match="thread binding mismatch|not registered"):
+        apply_event(h.db, {**observations[1], "event_id": "po-wrong-thread", "reporter_thread_id": "wrong-thread"}, project_policy=policy)
+    with pytest.raises(InvalidEvent, match="project worker reporter thread binding mismatch"):
+        apply_event(h.db, {**observations[3], "event_id": "worker-wrong-thread", "reporter_thread_id": "wrong-thread"})
+    with pytest.raises(InvalidEvent, match="1-16 bounded evidence"):
+        apply_event(h.db, project_report(h, "no-evidence", evidence=[]))
+    apply_event(h.db, {**observations[1], "event_id": "older-project-observation",
+                       "occurred_at": (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()}, project_policy=policy)
+    summary = apply_event(h.db, {**h.binding, "op": "summary"})
+    project_reports = {r["event_id"]: r for r in summary["project_reports"]}
+    assert project_reports["product_owner-observation"]["work_item"] == event["work_item"]
+    assert project_reports["product_owner-observation"]["reporter"] == "product_owner"
+    assert project_reports["product_owner-observation"]["stale"] is False
+    assert project_reports["older-project-observation"]["stale"] is True
+    assert "project-secret-marker" not in json.dumps(summary)
+    assert summary["project"]["workers"] == h.workers
+    assert json.dumps(summary["project"]["workers"], sort_keys=True, separators=(",", ":")).encode() == original_workers
+    assert "product_owner" not in summary["project"]["workers"] and "scrum_master" not in summary["project"]["workers"]
+    assert {report["reporter"] for report in summary["project_reports"]} == {"coordinator", *role_threads, *h.workers}
+    assert summary["reports"] == []
+    assert summary["tasks"][0].get("latest_report") is None
+    assert summary["tasks"][0]["status"] == "READY"
+    assert summary["bounds"]["total_project_reports"] == 9
+
+
+def test_project_report_api_paginates_and_old_checkpoint_defaults_to_empty(h):
+    h.add()
+    base = datetime.now(timezone.utc) - timedelta(minutes=2)
+    for index in range(3):
+        role = f"role_{index + 1}"
+        policy = {"schema_version": 1, "project_id": h.binding["project_id"], "root": str(h.root),
+                  "worker_registrations": [],
+                  "project_report_registrations": [{"role": role, "thread_id": f"project-thread-{index + 1}"}],
+                  "legacy_leaseless_beads": []}
+        apply_event(h.db, project_report(h, f"project-page-{index}", reporter=role,
+                                         reporter_thread_id=f"project-thread-{index + 1}",
+                                         occurred_at=(base + timedelta(minutes=index)).isoformat()), project_policy=policy)
+    page = apply_event(h.db, {**h.binding, "op": "summary", "project_report_limit": 2})
+    assert [r["event_id"] for r in page["project_reports"]] == ["project-page-2", "project-page-1"]
+    older = apply_event(h.db, {**h.binding, "op": "summary", "project_report_offset": 2, "project_report_limit": 2})
+    assert [r["event_id"] for r in older["project_reports"]] == ["project-page-0"]
+    assert older["project_reports"][0]["stale"] is False
+    assert older["bounds"]["previous_project_report_offset"] == 0
+    # A pre-feature checkpoint has no project_reports key; summary remains query-only and compatible.
+    with sqlite3.connect(h.db) as conn:
+        saver = SqliteSaver(conn)
+        graph = build_graph(saver)
+        config = {"configurable": {"thread_id": "project-coordinator-v1"}}
+        state = graph.get_state(config)
+        values = dict(state.values)
+        values["model"].pop("project_reports", None)
+        graph.update_state(config, {"model": values["model"]})
+    old = apply_event(h.db, {**h.binding, "op": "summary"})
+    assert old["project_reports"] == []
+    assert old["bounds"]["total_project_reports"] == 0
+
+
 def test_report_cli_retry_conflict_late_order_and_restart(tmp_path):
     h = Harness(tmp_path)
     h.add()
@@ -249,6 +355,7 @@ def test_loopback_api_auth_binding_read_only_and_browser_view(h):
     h.add()
     apply_event(h.db, report(h, "api-report", state="blocked", kind="blocker",
                               detail='Authorization: Basic synthetic-api-secret; password="two word api secret"'))
+    apply_event(h.db, project_report(h, "api-project-report", reporter="coordinator", reporter_thread_id="root", state="observed"))
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler(str(h.db), h.binding["project_id"], h.binding["root"], "x" * 32))
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -259,11 +366,13 @@ def test_loopback_api_auth_binding_read_only_and_browser_view(h):
         with pytest.raises(HTTPError) as unauth:
             urlopen(base + "/api/status")
         assert unauth.value.code == 401
-        request = Request(base + "/api/status?limit=100", headers={"Authorization": "Bearer " + "x" * 32})
+        request = Request(base + "/api/status?limit=100&project_report_offset=0&project_report_limit=10", headers={"Authorization": "Bearer " + "x" * 32})
         response = json.loads(urlopen(request).read())
         assert response["project"]["project_id"] == h.binding["project_id"]
         assert response["reports"][0]["state"] == "blocked"
         assert response["reports"][0]["source"] == "https://example.test/task"
+        assert response["project_reports"][0]["work_item"] == "https://linear.example/issue/REAL-123"
+        assert "Project observations" in page
         body = json.dumps(response)
         assert "synthetic-api-secret" not in body and "two word api secret" not in body
         assert "prompt" not in json.dumps(response) and "native_request" not in json.dumps(response)

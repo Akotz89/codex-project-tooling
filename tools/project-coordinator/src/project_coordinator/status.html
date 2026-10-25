@@ -14,11 +14,11 @@ body{font:15px system-ui,sans-serif;max-width:1100px;margin:2rem auto;padding:0 
 <main id="view"></main>
 <script>
 const token=document.querySelector('#token'),view=document.querySelector('#view'),freshness=document.querySelector('#freshness');
-let taskOffset=0,reportOffset=0;
+let taskOffset=0,reportOffset=0,projectReportOffset=0;
 function node(tag,text){const el=document.createElement(tag);el.textContent=text;return el}
-function button(text,offset,kind){const el=node('button',text);el.onclick=()=>{if(kind==='task')taskOffset=offset;else reportOffset=offset;refresh()};return el}
+function button(text,offset,kind){const el=node('button',text);el.onclick=()=>{if(kind==='task')taskOffset=offset;else if(kind==='project-report')projectReportOffset=offset;else reportOffset=offset;refresh()};return el}
 async function refresh(){view.replaceChildren();try{
- const query=new URLSearchParams({offset:taskOffset,limit:100,report_offset:reportOffset,report_limit:100});
+ const query=new URLSearchParams({offset:taskOffset,limit:100,report_offset:reportOffset,report_limit:100,project_report_offset:projectReportOffset,project_report_limit:100});
  const r=await fetch(`/api/status?${query}`,{headers:{Authorization:`Bearer ${token.value}`},cache:'no-store'});
  if(!r.ok)throw Error(`API returned ${r.status}`);
  const data=await r.json(),bounds=data.bounds;
@@ -38,6 +38,14 @@ async function refresh(){view.replaceChildren();try{
  if(bounds.omitted_reports)reportNav.append(node('span',` ${bounds.omitted_reports} reports on other pages.`));
  view.append(reportNav);
  for(const report of data.reports){const section=document.createElement('section');section.append(node('h3',`${report.kind} · ${report.task_id} · ${report.reporter} (${report.reporter_thread_id||'unknown'}) · ${report.state}${report.stale?' · stale':''}`),node('p',`${report.detail} — occurred ${report.occurred_at}; recorded ${report.recorded_at}`));for(const ref of [report.source,...(report.evidence||[])]){if(typeof ref!=='string')continue;try{const u=new URL(ref,location.href);if(['http:','https:'].includes(u.protocol)){const a=node('a',ref);a.href=u.href;a.rel='noreferrer noopener';section.append(a,node('br',''))}}catch{}}view.append(section)}
+ const projectReportNav=document.createElement('nav');projectReportNav.setAttribute('aria-label','Project report pages');
+ const projectFirst=bounds.total_project_reports?bounds.project_report_offset+1:0,projectLast=bounds.project_report_offset+data.project_reports.length;
+ projectReportNav.append(node('span',`Project observations ${projectFirst}–${projectLast} of ${bounds.total_project_reports} newest-first`));
+ if(bounds.previous_project_report_offset!==null)projectReportNav.append(button('Newer project observations',bounds.previous_project_report_offset,'project-report'));
+ if(bounds.next_project_report_offset!==null)projectReportNav.append(button('Older project observations',bounds.next_project_report_offset,'project-report'));
+ if(bounds.omitted_project_reports)projectReportNav.append(node('span',` ${bounds.omitted_project_reports} project observations on other pages.`));
+ view.append(projectReportNav);
+ for(const report of data.project_reports){const section=document.createElement('section');section.append(node('h3',`${report.kind} · ${report.reporter} (${report.reporter_thread_id}) · ${report.state}${report.stale?' · stale':''}`),node('p',`${report.work_item} — ${report.detail} — occurred ${report.occurred_at}; recorded ${report.recorded_at}`));for(const ref of [report.source,...(report.evidence||[])]){if(typeof ref!=='string')continue;try{const u=new URL(ref,location.href);if(['http:','https:'].includes(u.protocol)){const a=node('a',ref);a.href=u.href;a.rel='noreferrer noopener';section.append(a,node('br',''))}}catch{}}view.append(section)}
  }catch(e){freshness.textContent=e.message}}
 document.querySelector('#refresh').onclick=refresh;
 </script>

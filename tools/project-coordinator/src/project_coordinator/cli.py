@@ -22,7 +22,7 @@ def reject_constant(value):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", required=True)
-    parser.add_argument("command", choices=["init", "add", "observe", "prepare", "issue", "ack", "result", "reconcile", "retire", "report", "recover", "status", "rebind", "register", "summary", "serve"])
+    parser.add_argument("command", choices=["init", "add", "observe", "prepare", "issue", "ack", "result", "reconcile", "retire", "report", "project-report", "recover", "status", "rebind", "register", "summary", "serve"])
     parser.add_argument("--input", help="JSON event body; command supplies op")
     parser.add_argument("--project-id")
     parser.add_argument("--root")
@@ -47,7 +47,7 @@ def main():
             with open(args.project_policy) as stream:
                 project_policy = json.load(stream, object_pairs_hook=unique_object, parse_constant=reject_constant)
         require(isinstance(event, dict), "event must be an object")
-        event["op"] = args.command
+        event["op"] = args.command.replace("-", "_")
         flags = (args.beads_dir, args.beads_assignee, args.bd_executable)
         guard = None
         if any(value is not None for value in flags):
