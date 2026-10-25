@@ -270,6 +270,18 @@
             "additionalProperties": false
           }
         },
+        "project_report_registrations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["role", "thread_id"],
+            "properties": {
+              "role": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,63}$", "not": {"const": "coordinator"}},
+              "thread_id": {"type": "string", "minLength": 1}
+            },
+            "additionalProperties": false
+          }
+        },
         "legacy_leaseless_beads": {
           "type": "array",
           "items": {

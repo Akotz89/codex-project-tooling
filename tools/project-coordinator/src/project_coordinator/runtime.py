@@ -80,7 +80,7 @@ def event_fingerprint(event):
 
 def validate_project_policy(policy, binding):
     fields = {"schema_version", "project_id", "root", "worker_registrations", "legacy_leaseless_beads"}
-    require(isinstance(policy, dict) and set(policy) == fields,
+    require(isinstance(policy, dict) and frozenset(policy) in {frozenset(fields), frozenset(fields | {"project_report_registrations"})},
             "project policy requires exactly the documented fields")
     require(type(policy["schema_version"]) is int and policy["schema_version"] == 1,
             "unsupported project policy schema")
@@ -105,6 +105,21 @@ def validate_project_policy(policy, binding):
         require(role not in roles and thread_id not in thread_ids, "duplicate worker registration policy")
         roles.add(role)
         thread_ids.add(thread_id)
+    project_registrations = policy.get("project_report_registrations", [])
+    require(isinstance(project_registrations, list), "project_report_registrations must be a list")
+    project_roles, project_thread_ids = set(), set()
+    for item in project_registrations:
+        require(isinstance(item, dict) and set(item) == {"role", "thread_id"},
+                "project report registration requires role and thread_id")
+        role, thread_id = item["role"], item["thread_id"]
+        require(worker_role(role) and role != "coordinator" and native_thread_id(thread_id),
+                "invalid project report registration")
+        require(role not in project_roles and thread_id not in project_thread_ids,
+                "duplicate project report registration")
+        project_roles.add(role)
+        project_thread_ids.add(thread_id)
+    require(project_roles.isdisjoint(roles) and project_thread_ids.isdisjoint(thread_ids),
+            "project report registrations must be separate from worker registrations")
     legacy = policy["legacy_leaseless_beads"]
     require(isinstance(legacy, list), "legacy_leaseless_beads must be a list")
     pairs = set()
@@ -471,8 +486,18 @@ def transition(state):
             model.setdefault("reports", []).append(report)
             response = {"action": "REPORTED", "event_id": event["event_id"], "recorded_at": recorded}
         elif op == "project_report":
-            require(event["reporter"] in model["project"]["workers"], "project reporter is not registered")
-            require(event["reporter_thread_id"] == model["project"]["workers"][event["reporter"]], "project reporter thread binding mismatch")
+            if event["reporter"] == "coordinator":
+                require(event["reporter_thread_id"] == model["project"]["coordinator_thread_id"], "coordinator reporter thread binding mismatch")
+            elif event["reporter"] in model["project"]["workers"]:
+                require(event["reporter_thread_id"] == model["project"]["workers"][event["reporter"]], "project worker reporter thread binding mismatch")
+            else:
+                require(event["reporter"] not in model["project"]["workers"]
+                        and event["reporter_thread_id"] not in [model["project"]["coordinator_thread_id"], *model["project"]["workers"].values()],
+                        "project report registrations must be separate from coordinator and task workers")
+                policy = validate_project_policy(state.get("project_policy"), event) if state.get("project_policy") is not None else None
+                require(policy is not None and any(item["role"] == event["reporter"] and item["thread_id"] == event["reporter_thread_id"]
+                                                   for item in policy.get("project_report_registrations", [])),
+                        "project reporter is not registered")
             report = redact_project_report_event(event)
             report["occurred_at"] = canonical_report_at
             report["recorded_at"] = datetime.now(timezone.utc).isoformat()
@@ -688,7 +713,7 @@ def apply_event(db, event, *, guard_context=None, project_policy=None):
                       "event_hash_event_id": event.get("event_id", ""),
                       "event_received_at": event_received_at,
                       "event_received_at_event_id": event.get("event_id", "")}
-            if event["op"] == "register":
+            if event["op"] in {"register", "project_report"}:
                 inputs["project_policy"] = project_policy
             if event["op"] in {"prepare", "issue"} and candidate["response"]["action"] != "REPLAY":
                 task = before["model"]["tasks"][event["task_id"]]
