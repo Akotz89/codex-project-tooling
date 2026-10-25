@@ -479,6 +479,9 @@ def test_schema_accepts_safe_project_roles_and_explicit_project_policy():
     from pathlib import Path
     schema = json.loads((Path(__file__).resolve().parents[1] / 'schema.json').read_text())
     assert 'register' in schema['properties']['op']['enum']
+    assert 'report' in schema['properties']['op']['enum']
+    assert schema['properties']['report_offset']['minimum'] == 0
+    assert schema['properties']['report_limit']['maximum'] == 100
     assert schema['properties']['worker']['pattern'] == '^[a-z][a-z0-9_-]*$'
     assert schema['$defs']['task']['properties']['worker']['pattern'] == '^[a-z][a-z0-9_-]*$'
     assert schema['$defs']['project']['properties']['workers']['minProperties'] == 1
