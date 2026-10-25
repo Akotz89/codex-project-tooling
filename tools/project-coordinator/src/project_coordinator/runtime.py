@@ -66,6 +66,14 @@ def redact_report_event(event):
     return event
 
 
+def redact_project_report_event(event):
+    event = copy.deepcopy(event)
+    for field in ("state", "detail", "work_item", "source"):
+        event[field] = redact_report_text(event[field])
+    event["evidence"] = [redact_report_text(link) for link in event["evidence"]]
+    return event
+
+
 def event_fingerprint(event):
     return hashlib.sha256(json.dumps(event, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
@@ -116,7 +124,7 @@ def validate_project_policy(policy, binding):
 def validate_event(event, *, received_at=None):
     require(isinstance(event, dict), "event must be an object")
     op = event.get("op")
-    require(isinstance(op, str) and op in {"init", "add", "observe", "prepare", "issue", "ack", "result", "reconcile", "retire", "report", "status", "recover", "rebind", "register", "summary"}, "invalid event op")
+    require(isinstance(op, str) and op in {"init", "add", "observe", "prepare", "issue", "ack", "result", "reconcile", "retire", "report", "project_report", "status", "recover", "rebind", "register", "summary"}, "invalid event op")
     if op not in {"status", "recover", "summary"}:
         require(string(event.get("event_id")), "event_id required")
     if op == "init":
@@ -145,6 +153,9 @@ def validate_event(event, *, received_at=None):
         require(type(event.get("limit", 50)) is int and 1 <= event.get("limit", 50) <= 100, "invalid status limit")
         require(type(event.get("report_offset", 0)) is int and event.get("report_offset", 0) >= 0, "invalid report offset")
         require(type(event.get("report_limit", 50)) is int and 1 <= event.get("report_limit", 50) <= 100, "invalid report limit")
+        require(type(event.get("project_report_offset", 0)) is int and event.get("project_report_offset", 0) >= 0, "invalid project report offset")
+        require(type(event.get("project_report_limit", 50)) is int and 1 <= event.get("project_report_limit", 50) <= 100, "invalid project report limit")
+    canonical_occurred_at = None
     if op == "report":
         fields = {"op", "event_id", "project_id", "root", "task_id", "reporter", "reporter_thread_id", "kind", "occurred_at", "state", "detail", "source", "evidence", "claim_id", "dispatch_id"}
         require(set(event) <= fields and fields - {"dispatch_id"} <= set(event), "report requires only the documented fields")
@@ -175,8 +186,32 @@ def validate_event(event, *, received_at=None):
         canonical_occurred_at = occurred_utc.isoformat(timespec="microseconds").replace("+00:00", "Z")
         for optional in ("claim_id", "dispatch_id"):
             require(optional not in event or string(event[optional]), f"{optional} must be nonempty when present")
-    else:
-        canonical_occurred_at = None
+    if op == "project_report":
+        fields = {"op", "event_id", "project_id", "root", "work_item", "reporter", "reporter_thread_id", "kind", "occurred_at", "state", "detail", "source", "evidence"}
+        require(set(event) == fields, "project_report requires exactly the documented fields")
+        require(worker_role(event["reporter"]) and native_thread_id(event["reporter_thread_id"]), "invalid project reporter identity")
+        require(event["kind"] in {"lifecycle", "progress", "blocker", "handoff", "result"}, "invalid report kind")
+        require(string(event["work_item"]) and len(event["work_item"]) <= 512, "project report requires a bounded work-item reference")
+        require(string(event["state"]) and len(event["state"]) <= 512, "project report state must be at most 512 characters")
+        require(string(event["detail"]) and len(event["detail"]) <= 2000, "project report detail must be 1-2000 characters")
+        require(string(event["source"]) and len(event["source"]) <= 512, "project report source link must be bounded")
+        require(isinstance(event["evidence"], list) and 1 <= len(event["evidence"]) <= 16 and all(string(v) and len(v) <= 512 for v in event["evidence"]), "project report requires 1-16 bounded evidence links")
+        require(string(event["occurred_at"]) and len(event["occurred_at"]) <= 64, "project report occurred_at must be at most 64 characters")
+        try:
+            occurred = datetime.fromisoformat(event["occurred_at"].replace("Z", "+00:00"))
+            require(occurred.tzinfo is not None, "project report occurred_at requires timezone")
+            occurred_utc = occurred.astimezone(timezone.utc)
+        except (TypeError, ValueError, AttributeError, OverflowError) as exc:
+            raise InvalidEvent("invalid project report occurred_at") from exc
+        if received_at is None:
+            received_at = datetime.now(timezone.utc)
+        elif isinstance(received_at, str):
+            received_at = datetime.fromisoformat(received_at)
+        require(isinstance(received_at, datetime) and received_at.tzinfo is not None, "project report receipt time must be timezone-aware")
+        require(occurred_utc <= received_at.astimezone(timezone.utc) + timedelta(minutes=5), "project report occurred_at exceeds five-minute future tolerance")
+        canonical_project_report_at = occurred_utc.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    if op != "project_report":
+        canonical_project_report_at = None
     if op == "register":
         require(set(event) == {"op", "event_id", "project_id", "root", "worker", "new_thread_id", "expected_workers", "evidence"}, "register requires exactly the documented fields")
         require(worker_role(event.get("worker")), "register requires a valid worker role")
@@ -207,7 +242,7 @@ def validate_event(event, *, received_at=None):
         require(string(event.get("source_digest")) and string(event.get("scope_digest")), "source_digest and scope_digest required")
     if op in {"ack", "result"}:
         validate_file(event.get("receipt"))
-    return canonical_occurred_at
+    return canonical_project_report_at if op == "project_report" else canonical_occurred_at
 
 
 def validate_file(value):
@@ -367,7 +402,7 @@ def transition(state):
     received_at = (state.get("event_received_at")
                    if state.get("event_received_at_event_id") == event.get("event_id")
                    else None)
-    validate_event(event, received_at=received_at)
+    canonical_report_at = validate_event(event, received_at=received_at)
     op = event["op"]
     response = {"action": "OK"}
     project_policy = state.get("project_policy")
@@ -401,7 +436,7 @@ def transition(state):
         require(str(Path(event.get("root", "")).resolve()) == model["project"]["root"], "root binding mismatch")
         # An earlier ISSUING transition may have exposed a tool request. Never repeat it.
         for task in model["tasks"].values():
-            if op not in {"rebind", "register", "report"} and task["status"] == "ISSUING":
+            if op not in {"rebind", "register", "report", "project_report"} and task["status"] == "ISSUING":
                 task["status"] = "UNKNOWN"
                 task["reason"] = "native send uncertain; reconcile retained receipts"
         if op == "add":
@@ -435,6 +470,14 @@ def transition(state):
             report["recorded_at"] = recorded
             model.setdefault("reports", []).append(report)
             response = {"action": "REPORTED", "event_id": event["event_id"], "recorded_at": recorded}
+        elif op == "project_report":
+            require(event["reporter"] in model["project"]["workers"], "project reporter is not registered")
+            require(event["reporter_thread_id"] == model["project"]["workers"][event["reporter"]], "project reporter thread binding mismatch")
+            report = redact_project_report_event(event)
+            report["occurred_at"] = canonical_report_at
+            report["recorded_at"] = datetime.now(timezone.utc).isoformat()
+            model.setdefault("project_reports", []).append(report)
+            response = {"action": "PROJECT_REPORTED", "event_id": event["event_id"], "recorded_at": report["recorded_at"]}
         elif op == "register":
             policy = validate_project_policy(project_policy, event)
             require(any(item["worker"] == event["worker"] and item["thread_id"] == event["new_thread_id"]
@@ -602,8 +645,10 @@ def apply_event(db, event, *, guard_context=None, project_policy=None):
     event_received_at = datetime.now(timezone.utc).isoformat()
     canonical_occurred_at = validate_event(event, received_at=event_received_at)
     event_hash = event_fingerprint(event)
-    persisted_event = redact_report_event(event) if event["op"] == "report" else event
+    persisted_event = redact_report_event(event) if event["op"] == "report" else redact_project_report_event(event) if event["op"] == "project_report" else event
     if event["op"] == "report":
+        persisted_event["occurred_at"] = canonical_occurred_at
+    if event["op"] == "project_report":
         persisted_event["occurred_at"] = canonical_occurred_at
     if project_policy is not None:
         binding = event["project"] if event["op"] == "init" else event
@@ -724,6 +769,13 @@ def compact_status(state, event, checkpoint_id=None, pending=()):
     report_start = max(0, report_end - report_limit)
     report_page = list(reversed(reports[report_start:report_end]))
     bounded_reports = [bounded({**{k: v for k, v in report.items() if k in {"event_id", "task_id", "reporter", "reporter_thread_id", "kind", "occurred_at", "recorded_at", "state", "detail", "source", "evidence", "claim_id", "dispatch_id"}}, "stale": latest_report_by_task[report["task_id"]]["event_id"] != report["event_id"]}, "reports") for report in report_page]
+    project_reports = sorted(model.get("project_reports", []), key=lambda r: (datetime.fromisoformat(r["occurred_at"].replace("Z", "+00:00")).astimezone(timezone.utc), r["event_id"]))
+    latest_project_report = {(r["reporter"], r["work_item"]): r for r in project_reports}
+    project_report_offset, project_report_limit = event.get("project_report_offset", 0), event.get("project_report_limit", 50)
+    project_report_end = max(0, len(project_reports) - project_report_offset)
+    project_report_start = max(0, project_report_end - project_report_limit)
+    project_report_page = list(reversed(project_reports[project_report_start:project_report_end]))
+    bounded_project_reports = [bounded({**{k: r[k] for k in ("event_id", "work_item", "reporter", "reporter_thread_id", "kind", "occurred_at", "recorded_at", "state", "detail", "source", "evidence")}, "stale": latest_project_report[(r["reporter"], r["work_item"])]["event_id"] != r["event_id"]}, "project_reports") for r in project_report_page]
     for task in page:
         latest = latest_report_by_task.get(task["id"])
         if latest:
@@ -734,7 +786,7 @@ def compact_status(state, event, checkpoint_id=None, pending=()):
             "project": bounded(project, "project"),
             "workers": bounded({k: {"state": model["workers"][k]["state"]}
                                  for k in sorted(roles) if k in model["workers"]}, "workers"),
-            "tasks": page, "reports": bounded_reports, "observed_at": datetime.now(timezone.utc).isoformat(),
+            "tasks": page, "reports": bounded_reports, "project_reports": bounded_project_reports, "observed_at": datetime.now(timezone.utc).isoformat(),
             "resumed_checkpoint": False, "recovery_required": bool(pending) or bool(uncertain),
             "pending_checkpoint": bool(pending), "uncertain_held_dispatches": uncertain,
             "bounds": {"offset": offset, "limit": limit, "total_tasks": len(tasks),
@@ -743,6 +795,10 @@ def compact_status(state, event, checkpoint_id=None, pending=()):
                        "total_reports": len(reports), "omitted_reports": max(0, len(reports) - len(bounded_reports)),
                        "next_report_offset": report_offset + report_limit if report_offset + report_limit < len(reports) else None,
                        "previous_report_offset": max(0, report_offset - report_limit) if report_offset > 0 else None,
+                       "project_report_offset": project_report_offset, "project_report_limit": project_report_limit,
+                       "total_project_reports": len(project_reports), "omitted_project_reports": max(0, len(project_reports) - len(bounded_project_reports)),
+                       "next_project_report_offset": project_report_offset + project_report_limit if project_report_offset + project_report_limit < len(project_reports) else None,
+                       "previous_project_report_offset": max(0, project_report_offset - project_report_limit) if project_report_offset > 0 else None,
                        "string_chars": 512, "list_items": 32, "worker_role_count": len(all_roles),
                        "omitted_worker_roles": len(all_roles - roles), "truncated_fields": sorted(truncated)}}
 

@@ -24,13 +24,16 @@ All other commands require common binding `{ "project_id":"P-example", "root":"/
 | retire | `task_id`, exact `source_digest` and `scope_digest`, `quiescent:true`, `evidence`; only a never-dispatched WAIT/READY task with no dispatch binding or lease can become terminal RETIRED |
 | register | `worker`, `new_thread_id`, the complete `expected_workers` map, and `evidence`; additive compare-and-swap registration requires an explicit project policy |
 | rebind | `worker`, `expected_old_thread_id`, `new_thread_id`, `evidence`; compare-and-swap replacement, requiring no held/uncertain dispatch and no observed BUSY worker |
-| summary | common binding; optional task `offset`/`limit` and independent newest-first report `report_offset`/`report_limit` (each limit defaults to50 and is capped at100) |
+| summary | common binding; optional task `offset`/`limit`, task-report `report_offset`/`report_limit`, and project-report `project_report_offset`/`project_report_limit` (each limit defaults to50 and is capped at100) |
 | report | `task_id`, bound `reporter` worker role and `reporter_thread_id`, `kind`, timezone-aware ISO `occurred_at` (at most 64 characters and no more than five minutes ahead of server receipt; stored as canonical UTC), `state` (at most 512 characters), `detail`, a `source` link, `evidence` links, and exact `claim_id`; optional `dispatch_id` must match the bound task |
+| project-report | `work_item` reference, exact registered `reporter` and `reporter_thread_id`, `kind`, timezone-aware ISO `occurred_at`, `state`, `detail`, a `source` reference, and 1–16 evidence links; a project-scope observation does not change task ownership/status, dispatch state, or Root acceptance |
 | status / recover | common binding only; existing full response/recovery semantics |
 
 Every input is a JSON object, not a JSON string. CLI command supplies `op`. Inputs and receipts must contain no credentials or full logs.
 
 `report` appends owner-attributed progress to the coordinator's existing checkpoint model. Identical event IDs replay without another row; conflicting reuse fails. Each stored row includes its event time and server recording time. The bounded summary returns up to 100 reports newest-first and each returned task's latest event-time report; late reports stay attributed in history and are marked stale without replacing newer projection state. `report_offset` and `report_limit` page through older reports; bounds include previous/next offsets and the total report count. Submission is optional telemetry: producers should surface failures and retry the same event but never block task execution or convert reported results into Root acceptance.
+
+`project-report` provides the same optional telemetry path for an exact role/thread already present in the project worker registration map, including PO, Scrum Master, and child-native roles. It requires a real work-item reference plus evidence links and stores separately from task-owner reports. `project_report_offset` and `project_report_limit` page the query-only summary and browser view. Existing checkpoints without project observations remain compatible; missing `project_reports` is treated as empty. Reuse the exact event and `event_id` on retry. No producer wiring, chat attribution, report-failure gate, or acceptance signal is added.
 
 The query API and browser view run explicitly against the existing configured database and project binding:
 

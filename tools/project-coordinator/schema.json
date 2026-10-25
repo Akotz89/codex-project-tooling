@@ -93,6 +93,9 @@
     },
     "report_offset": {"type": "integer", "minimum": 0},
     "report_limit": {"type": "integer", "minimum": 1, "maximum": 100},
+    "project_report_offset": {"type": "integer", "minimum": 0},
+    "project_report_limit": {"type": "integer", "minimum": 1, "maximum": 100},
+    "work_item": {"type": "string", "minLength": 1, "maxLength": 512},
     "expected_workers": {
       "$ref": "#/$defs/project/properties/workers"
     }
@@ -622,6 +625,20 @@
         "propertyNames": {
           "enum": ["op", "event_id", "project_id", "root", "task_id", "reporter", "reporter_thread_id", "kind", "occurred_at", "state", "detail", "source", "evidence", "claim_id", "dispatch_id"]
         }
+      }
+    },
+    {
+      "if": {"properties": {"op": {"const": "project_report"}}},
+      "then": {
+        "required": ["event_id", "project_id", "root", "work_item", "reporter", "reporter_thread_id", "kind", "occurred_at", "state", "detail", "source", "evidence"],
+        "properties": {
+          "kind": {"enum": ["lifecycle", "progress", "blocker", "handoff", "result"]},
+          "state": {"type": "string", "minLength": 1, "maxLength": 512},
+          "detail": {"type": "string", "minLength": 1, "maxLength": 2000},
+          "source": {"type": "string", "minLength": 1, "maxLength": 512},
+          "evidence": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "minLength": 1, "maxLength": 512}}
+        },
+        "propertyNames": {"enum": ["op", "event_id", "project_id", "root", "work_item", "reporter", "reporter_thread_id", "kind", "occurred_at", "state", "detail", "source", "evidence"]}
       }
     }
   ]

@@ -11,7 +11,7 @@ test('requires the coordinator unauthenticated 401 response without credentials'
     request = {url, options};
     return {status:401, headers:{get:()=>'application/json; charset=utf-8'}, text:async()=>' {"error":"unauthorized or unknown route"} '};
   });
-  assert.equal(request.url, 'http://127.0.0.1:19001/api/status?offset=0&limit=100&report_offset=0&report_limit=100');
+  assert.equal(request.url, 'http://127.0.0.1:19001/api/status?offset=0&limit=100&report_offset=0&report_limit=100&project_report_offset=0&project_report_limit=100');
   assert.equal(request.options.credentials, 'omit');
   assert.equal(request.options.method, 'GET');
   assert.deepEqual(request.options.headers, {Accept:'application/json'});

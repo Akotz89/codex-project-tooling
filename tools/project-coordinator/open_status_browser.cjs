@@ -85,7 +85,7 @@ function coordinatorResponseMatches(status, contentType, body) {
 }
 
 async function preflightCoordinator(url, request = fetch) {
-  const endpoint = new URL('api/status?offset=0&limit=100&report_offset=0&report_limit=100', url).href;
+  const endpoint = new URL('api/status?offset=0&limit=100&report_offset=0&report_limit=100&project_report_offset=0&project_report_limit=100', url).href;
   const response = await request(endpoint, {
     method: 'GET', credentials: 'omit', headers: {Accept: 'application/json'},
     cache: 'no-store', redirect: 'error', signal: AbortSignal.timeout(3000),
@@ -305,7 +305,7 @@ async function main(argv = process.argv.slice(2), input = process.stdin) {
     const visibleBefore = document.body.innerText;
     const freshness = document.querySelector('#freshness')?.innerText || '';
     const projectHeading = document.querySelector('#view h2')?.innerText || '';
-    const response = await fetch('/api/status?offset=0&limit=100&report_offset=0&report_limit=100', {
+    const response = await fetch('/api/status?offset=0&limit=100&report_offset=0&report_limit=100&project_report_offset=0&project_report_limit=100', {
       headers: {Authorization: 'Bearer ' + ${JSON.stringify(token)}}, credentials: 'omit', cache: 'no-store', redirect: 'error'
     });
     if (!response.ok) throw new Error('status request rejected');

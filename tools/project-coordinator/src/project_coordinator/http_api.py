@@ -39,15 +39,19 @@ def handler(db: str, project_id: str, root: str, token: str):
                 return
             try:
                 query = parse_qs(parsed.query, strict_parsing=True) if parsed.query else {}
-                if set(query) - {"offset", "limit", "report_offset", "report_limit"} or any(len(v) != 1 for v in query.values()):
+                if set(query) - {"offset", "limit", "report_offset", "report_limit", "project_report_offset", "project_report_limit"} or any(len(v) != 1 for v in query.values()):
                     raise ValueError("invalid query")
                 offset = int(query.get("offset", ["0"])[0])
                 limit = int(query.get("limit", ["50"])[0])
                 report_offset = int(query.get("report_offset", ["0"])[0])
                 report_limit = int(query.get("report_limit", ["50"])[0])
+                project_report_offset = int(query.get("project_report_offset", ["0"])[0])
+                project_report_limit = int(query.get("project_report_limit", ["50"])[0])
                 view = apply_event(db, {"op": "summary", "project_id": project_id, "root": root,
                                         "offset": offset, "limit": limit,
-                                        "report_offset": report_offset, "report_limit": report_limit})
+                                        "report_offset": report_offset, "report_limit": report_limit,
+                                        "project_report_offset": project_report_offset,
+                                        "project_report_limit": project_report_limit})
                 self.send_body(200, "application/json; charset=utf-8", json.dumps(view, separators=(",", ":")).encode())
             except (InvalidEvent, ValueError):
                 self.send_body(400, "application/json", b'{"error":"invalid status request"}')
