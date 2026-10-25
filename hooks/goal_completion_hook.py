@@ -38,9 +38,18 @@ _ASSIGNMENT_FIELDS = (
 _MODE_FIELDS = ("mode", "reviewer_thread", "provenance")
 _QUESTION_FIELDS = (
     "question_id", "original_at", "original_thread", "original_task",
-    "state", "consumed_evidence", "disposition",
+    "original_scope", "state", "consumed_evidence", "disposition",
 )
-_SAFE_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}\Z")
+_PROVENANCE_REQUIRED_FIELDS = {"source_thread", "source_kind", "review_decision"}
+_SAFE_TOKEN = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._:/@_+-]{0,255}\Z")
+_PROVENANCE_FIELDS = {
+    "actor", "at", "claim", "dispatch", "direct_user", "handoff_id", "kind",
+    "message_id", "mode", "provenance_id", "question_id", "reply_id",
+    "reviewer_thread", "scope_digest", "source", "source_digest", "task",
+    "thread", "timestamp", "turn_id", "type", "user_message_id",
+    "source_thread", "source_kind", "review_decision", "review_decision_sha256",
+    "limits",
+}
 _MAX_JSON_BYTES = 2 * 1024 * 1024
 
 CONTEXT = (
@@ -65,8 +74,108 @@ def linear_skill_path():
     return root / "skills" / "linear-project-execution" / "SKILL.md"
 
 
-def _safe_value(value):
-    return value if isinstance(value, str) and _SAFE_VALUE.fullmatch(value) else None
+def _safe_text(value, limit=512):
+    if (not isinstance(value, str) or not value or len(value) > limit
+            or value != value.strip() or not all(char.isprintable() for char in value)
+            or any(char in value for char in ("`", "$", "<", ">", "|", "&", "\\"))
+            or "{{" in value or "}}" in value
+            or re.search(r"(?i)\b(?:https?|file|javascript):", value)):
+        return None
+    return value
+
+
+def _safe_path(value, root):
+    text = _safe_text(value)
+    if text is None:
+        return None
+    path = Path(text)
+    if any(part in (".", "..") for part in path.parts):
+        return None
+    try:
+        candidate = path if path.is_absolute() else root / path
+        candidate.resolve(strict=False).relative_to(root.resolve(strict=True))
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return text
+
+
+def _safe_field(key, value, root):
+    if value is None:
+        return None
+    if key.endswith("_digest"):
+        return value if isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{64}", value) else None
+    if key in {"plan", "source", "scope"}:
+        return _safe_path(value, root)
+    if key == "review_decision":
+        return _safe_path(value, root)
+    if key == "limits":
+        return _safe_text(value)
+    if key in {"mode", "state", "disposition", "kind", "type"}:
+        return _safe_text(value)
+    if key in {"direct_user"} and isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value if _SAFE_TOKEN.fullmatch(value) else None
+    return None
+
+
+def _field_metadata(record, fields, root):
+    result = {field: _safe_field(field, record.get(field), root) for field in fields}
+    missing = [field for field in fields if field not in record]
+    nulls = [field for field in fields if field in record and record[field] is None]
+    invalid = [field for field in fields if field in record and record[field] is not None
+               and result[field] is None and field not in {"original_scope", "consumed_evidence"}]
+    unknown = sorted(key for key in record if key not in fields and key not in {
+        "original_scope", "consumed_evidence",
+    } and isinstance(key, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", key))
+    result.update({
+        "missing_fields": missing,
+        "null_fields": nulls,
+        "invalid_fields": invalid,
+        "unknown_fields": unknown,
+    })
+    return result
+
+
+def _safe_provenance(value, root, depth=0):
+    if isinstance(value, str):
+        return _safe_text(value)
+    if not isinstance(value, dict) or depth >= 4:
+        return None
+    result = {}
+    unknown = []
+    invalid = []
+    nulls = []
+    redacted = []
+    for key, item in value.items():
+        if key == "direct_user_quote":
+            # The source projection marks this value as redacted; never echo it.
+            redacted.append(key)
+            continue
+        if key not in _PROVENANCE_FIELDS:
+            if isinstance(key, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", key):
+                unknown.append(key)
+            continue
+        if isinstance(item, dict):
+            sanitized = _safe_provenance(item, root, depth + 1)
+        elif isinstance(item, list):
+            sanitized = [_safe_field(key, child, root) for child in item]
+            sanitized = [child for child in sanitized if child is not None]
+        else:
+            sanitized = _safe_field(key, item, root)
+        if item is None:
+            result[key] = None
+            nulls.append(key)
+        elif sanitized is None:
+            invalid.append(key)
+        else:
+            result[key] = sanitized
+    result["unknown_fields"] = sorted(unknown)
+    result["invalid_fields"] = sorted(invalid)
+    result["null_fields"] = sorted(nulls)
+    result["redacted_fields"] = sorted(redacted)
+    result["missing_fields"] = sorted(_PROVENANCE_REQUIRED_FIELDS - set(value))
+    return result
 
 
 def _inside(root, path):
@@ -134,7 +243,9 @@ def _project_root(cwd):
 
 
 def _load_coordination_context(payload):
-    session_id = _safe_value(payload.get("session_id"))
+    session_id = payload.get("session_id")
+    if not isinstance(session_id, str) or not _SAFE_TOKEN.fullmatch(session_id):
+        session_id = None
     if not session_id:
         raise ValueError("missing session id")
     root = _project_root(payload.get("cwd"))
@@ -145,7 +256,7 @@ def _load_coordination_context(payload):
     }
     if not isinstance(binding, dict) or set(binding) != required:
         raise ValueError("invalid binding shape")
-    if binding["schema"] != _BINDING_SCHEMA or not _safe_value(binding["project_id"]):
+    if binding["schema"] != _BINDING_SCHEMA or not isinstance(binding["project_id"], str) or not _SAFE_TOKEN.fullmatch(binding["project_id"]):
         raise ValueError("invalid binding identity")
     state_path = binding["state_path"]
     if (not isinstance(state_path, str) or not state_path or Path(state_path).is_absolute()
@@ -161,47 +272,83 @@ def _load_coordination_context(payload):
     matches = [item for item in assignments if item.get("thread") == session_id]
     if len(matches) != 1:
         raise ValueError("assignment not uniquely bound")
-    if (not _safe_value(matches[0].get("task"))
-            or any(not re.fullmatch(r"[0-9a-fA-F]{64}", matches[0].get(key, ""))
-                   for key in ("source_digest", "scope_digest"))):
-        raise ValueError("assignment provenance incomplete")
-    assignment = {key: _safe_value(matches[0].get(key)) for key in _ASSIGNMENT_FIELDS}
-    assignment = {key: value for key, value in assignment.items() if value is not None}
+    assignment = _field_metadata(matches[0], _ASSIGNMENT_FIELDS, root)
     mode_value = _pointer(state, binding["mode_pointer"])
-    if (not isinstance(mode_value, dict) or not _safe_value(mode_value.get("mode"))
-            or not _safe_value(mode_value.get("provenance"))):
+    if not isinstance(mode_value, dict):
         raise ValueError("invalid mode attribution")
-    mode = {key: _safe_value(mode_value.get(key)) for key in _MODE_FIELDS}
-    mode = {key: value for key, value in mode.items() if value is not None}
+    mode = {key: _safe_field(key, mode_value.get(key), root) for key in _MODE_FIELDS}
+    provenance = mode_value.get("provenance")
+    mode["provenance"] = _safe_provenance(provenance, root) if isinstance(provenance, dict) else _safe_text(provenance)
+    mode["missing_fields"] = [key for key in _MODE_FIELDS if key not in mode_value]
+    mode["null_fields"] = [key for key in _MODE_FIELDS if key in mode_value and mode_value[key] is None]
+    mode["invalid_fields"] = [key for key in _MODE_FIELDS if key in mode_value
+                               and mode_value[key] is not None and mode[key] is None]
+    mode["unknown_fields"] = sorted(key for key in mode_value if key not in _MODE_FIELDS
+                                     and isinstance(key, str)
+                                     and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", key))
     questions = _pointer(state, binding["consumed_questions_pointer"])
-    if not isinstance(questions, list) or len(questions) > 256:
+    if not isinstance(questions, (list, dict)):
         raise ValueError("invalid consumed question list")
+    if isinstance(questions, dict):
+        question_records = []
+        for question_id, question in questions.items():
+            if not isinstance(question, dict):
+                question_records.append((question_id, {}, True))
+            else:
+                record = dict(question)
+                if "question_id" not in record:
+                    record["question_id"] = question_id
+                question_records.append((question_id, record, False))
+    else:
+        question_records = [(None, question, not isinstance(question, dict)) for question in questions]
     consumed = []
-    for question in questions:
+    for question_id, question, invalid_record in question_records:
         if not isinstance(question, dict):
-            raise ValueError("invalid consumed question")
-        if question.get("state") not in ("consumed", "answered", "closed"):
-            continue
-        item = {key: _safe_value(question.get(key)) for key in _QUESTION_FIELDS}
-        item = {key: value for key, value in item.items() if value is not None}
+            question = {}
+        item = _field_metadata(question, _QUESTION_FIELDS, root)
+        item["question_id"] = _safe_field("question_id", question.get("question_id"), root)
+        item["question_map_key"] = item["question_id"] if question_id is not None else None
+        item["original_task"] = question.get("original_task") if question.get("original_task") is None else item["original_task"]
+        item.pop("original_scope", None)
+        item.pop("consumed_evidence", None)
+        item["original_scope_sha256"] = None
+        item["consumed_evidence_sha256"] = None
+        if invalid_record:
+            item["invalid_record"] = True
         evidence = question.get("consumed_evidence")
         if evidence is not None:
             encoded_evidence = json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()
-            item.pop("consumed_evidence", None)
             item["consumed_evidence_sha256"] = hashlib.sha256(encoded_evidence).hexdigest()
         original_scope = question.get("original_scope")
-        required_question = ("question_id", "original_at", "original_thread", "original_task", "state", "disposition")
-        if original_scope is None or any(key not in item for key in required_question):
-            raise ValueError("consumed question scope incomplete")
-        encoded = json.dumps(original_scope, sort_keys=True, separators=(",", ":")).encode()
-        item["original_scope_sha256"] = hashlib.sha256(encoded).hexdigest()
-        if item:
+        if original_scope is not None:
+            encoded = json.dumps(original_scope, sort_keys=True, separators=(",", ":")).encode()
+            item["original_scope_sha256"] = hashlib.sha256(encoded).hexdigest()
+            if isinstance(original_scope, str):
+                summary = _safe_text(original_scope)
+                if summary is not None:
+                    item["original_scope_summary"] = summary
+                    item["scope_authority"] = "historical_non_authoritative"
+        if question_id is not None and item["question_id"] is None:
+            item["invalid_fields"].append("question_id")
+        if (question.get("original_task") is None and "original_task" in question
+                and "original_task" not in item["null_fields"]):
+            item["null_fields"].append("original_task")
+        reasons = []
+        if item.get("original_thread") is not None and item["original_thread"] == assignment.get("thread"):
+            reasons.append("original_thread")
+        item["related_to_current_assignment"] = bool(reasons)
+        item["relation_reasons"] = reasons
+        if item["related_to_current_assignment"]:
             consumed.append(item)
-    consumed = sorted(consumed, key=lambda item: item.get("original_at", ""), reverse=True)[:3]
-    observed_at = _safe_value(_pointer(state, binding["observed_at_pointer"]))
+    try:
+        observed_at_value = _pointer(state, binding["observed_at_pointer"])
+    except (ValueError, KeyError, IndexError, TypeError):
+        observed_at_value = None
+    observed_at = _safe_field("original_at", observed_at_value, root)
     return {
         "project_id": binding["project_id"],
         "observed_at": observed_at,
+        "missing_fields": [] if observed_at is not None else ["observed_at"],
         "assignment": assignment,
         "mode": mode,
         "consumed_questions": consumed,
@@ -210,7 +357,9 @@ def _load_coordination_context(payload):
 
 def _coordination_observation(payload):
     event = payload.get("hook_event_name")
-    if event == "SessionStart" and payload.get("source") != "compact":
+    if event == "SessionStart" and payload.get("source") not in {
+        "startup", "resume", "clear", "compact", "fork",
+    }:
         return ""
     if event not in ("SessionStart", "UserPromptSubmit"):
         return ""

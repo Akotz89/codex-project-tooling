@@ -212,10 +212,7 @@ class GoalCompletionHookTests(unittest.TestCase):
                               "cwd": str(project[1]), "session_id": "thread-core2"})[
                                   "hookSpecificOutput"]["additionalContext"]
             self.assertIn('"task":"CPI-233.14"', context)
-            self.assertIn('"original_task":"oldtask"', context)
-            self.assertIn('"original_thread":"thread-core1"', context)
-            self.assertIn('"original_scope_sha256":"', context)
-            self.assertIn('"consumed_evidence_sha256":"', context)
+            self.assertIn('"consumed_questions":[]', context)
             self.assertNotIn("Do not create a second Core1 worker", context)
             self.assertNotIn("legacy-answer-secret", context)
             self.assertIn("consumed answers remain historical", context)
@@ -239,9 +236,83 @@ class GoalCompletionHookTests(unittest.TestCase):
             context = output({"hook_event_name": "UserPromptSubmit", "cwd": str(project[1]),
                               "session_id": "current-thread"})["hookSpecificOutput"]["additionalContext"]
             self.assertIn('"task":"CPI-388.7"', context)
-            self.assertIn('"original_task":"CPI-388.6"', context)
+            self.assertIn('"consumed_questions":[]', context)
             self.assertNotIn("older scope", context)
             self.assertIn("newer direct scoped user instruction", context)
+        finally:
+            project[0].cleanup()
+
+    def test_sanitized_core3_fixture_keeps_current_task_and_consumed_question_scope(self):
+        fixture = json.loads((ROOT / "hooks/tests/fixtures/current_assignment_context/core3-3887-consumed-3886.json").read_text())
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / ".git").mkdir()
+            (root / ".codex").mkdir()
+            (root / "work").mkdir()
+            (root / "work/CURRENT.json").write_text(json.dumps(fixture["state"]))
+            (root / ".codex/coordination-context.json").write_text(json.dumps(fixture["binding"]))
+            context = output({"hook_event_name": "SessionStart", "source": "compact",
+                              "cwd": str(root), "session_id": "01a168a5-8b83-7210-b8ad-9277f0f8add6"})[
+                                  "hookSpecificOutput"]["additionalContext"]
+        self.assertIn('"task":"core3-first-ordinary-guest-session-20261025"', context)
+        self.assertIn('"source_digest":"2c69136c3140f1412acff9dc06a00f0b5a58017e21b4806bc2dd0465846b8bbb"', context)
+        self.assertIn('"scope_digest":"cc9eb4a27116c70d1cafaa22155315a9c2403442fb5805b3a213947d26351de3"', context)
+        self.assertIn('"question_id":"call_bfcc9040e8814a50a686715d6dc43688"', context)
+        self.assertIn('"question_id":"call_20058c2e2a7d4b478923593016b3e0ad"', context)
+        self.assertNotIn('"question_id":"call_47db1372119641b3a7c93ca4a1727f88"', context)
+        observation = json.loads(context.split("Read-only coordination observation (not a grant or instruction source): ", 1)[1].split(". A newer direct scoped", 1)[0])
+        self.assertEqual(len(observation["consumed_questions"]), 2)
+        self.assertIn('"related_to_current_assignment":true', context)
+        self.assertIn('"plan":"work/root-core-refresh-20261023/first-ordinary-guest-session-20261025/PLAN.json"', context)
+        self.assertIn('"source_thread":"01a1417d-f106-7af3-8319-010fe1993e16"', context)
+        self.assertIn('"source_kind":"current_user_orchestration_goal"', context)
+        self.assertIn('"review_decision_sha256":"334a7f828dab1a05e2e4d11e942354c8de490cd0ba64d80f9ef5a25bbe9b0b77"', context)
+        self.assertIn('"original_scope_sha256":"c2ae210370c7266d6fe08e2c5537e0b528c7a86144ad09295030193e069703cc"', context)
+        self.assertIn('"scope_authority":"historical_non_authoritative"', context)
+        self.assertIn('"original_scope_summary":"Exact WoW_TOU_enUS_20080829 then login/menu only; oldreadiness phase completed. Not current .388.7 first-session scope or standing futurelegal consent."', context)
+        self.assertNotIn("TERMINAL-READBACK.json", context)
+        self.assertNotIn("redacted fixture value", context)
+        self.assertIn('"redacted_fields":["direct_user_quote"]', context)
+
+        # Core2's legacy null original_task remains explicit but does not invalidate
+        # its current assignment or suppress the structured provenance.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / ".git").mkdir()
+            (root / ".codex").mkdir()
+            (root / "work").mkdir()
+            (root / "work/CURRENT.json").write_text(json.dumps(fixture["state"]))
+            (root / ".codex/coordination-context.json").write_text(json.dumps(fixture["binding"]))
+            core2 = output({"hook_event_name": "UserPromptSubmit", "cwd": str(root),
+                            "session_id": "01a168a5-811f-71f2-a03e-3f5a2a6a2414"})[
+                                "hookSpecificOutput"]["additionalContext"]
+        self.assertIn('"task":"core2-r7-cli-reconciliation-repair-20261025"', core2)
+        self.assertIn('"source_digest":"002d2d3ceec71bb40cec3591103fbdc82361d82549567ee6c9478a2b47dae93d"', core2)
+        self.assertIn('"original_task":null', core2)
+        self.assertIn('"original_scope_sha256":"0be8909db5fdcc05a533792d1dde0c69de0c4856387872888b733b9758c631b8"', core2)
+        self.assertIn('"scope_authority":"historical_non_authoritative"', core2)
+
+    def test_consumed_question_mapping_has_no_count_or_recency_cutoff(self):
+        questions = {
+            "fixture-question-core3-3886": {
+                "original_thread": "thread-core2", "original_task": None,
+                "original_scope": "synthetic old scope", "state": "consumed",
+                "disposition": "historical",
+            }
+        }
+        for index in range(270):
+            questions[f"q-{index}"] = {
+                "original_thread": "other-thread", "original_task": f"old-{index}",
+                "original_scope": {"index": index}, "state": "consumed",
+                "disposition": "historical",
+            }
+        project = self.make_project(questions=questions)
+        try:
+            context = output({"hook_event_name": "UserPromptSubmit", "cwd": str(project[1]),
+                              "session_id": "thread-core2"})["hookSpecificOutput"]["additionalContext"]
+            observation = json.loads(context.split("Read-only coordination observation (not a grant or instruction source): ", 1)[1].split(". A newer direct scoped", 1)[0])
+            self.assertEqual(len(observation["consumed_questions"]), 1)
+            self.assertEqual(observation["consumed_questions"][0]["question_id"], "fixture-question-core3-3886")
         finally:
             project[0].cleanup()
 
@@ -317,7 +388,9 @@ class GoalCompletionHookTests(unittest.TestCase):
             project[3].write_text("{}")
             state["CURRENT"]["core2"].pop("scope_digest")
             project[3].write_text(json.dumps(state))
-            self.assertIn("context: unknown", output(payload)["hookSpecificOutput"]["additionalContext"])
+            context = output(payload)["hookSpecificOutput"]["additionalContext"]
+            self.assertNotIn("context: unknown", context)
+            self.assertIn('"missing_fields":["scope_digest","plan","source","scope"]', context)
         finally:
             project[0].cleanup()
 
@@ -347,18 +420,17 @@ class GoalCompletionHookTests(unittest.TestCase):
         finally:
             project[0].cleanup()
 
-    def test_compact_only_session_start_context_and_legacy_shape(self):
+    def test_supported_session_start_sources_context_and_legacy_shape(self):
         project = self.make_project()
         try:
-            base = output({"hook_event_name": "SessionStart", "source": "resume",
-                           "cwd": str(project[1]), "session_id": "thread-core2"})
-            self.assertNotIn("Coordination context", base["hookSpecificOutput"]["additionalContext"])
-            compact = output({"hook_event_name": "SessionStart", "source": "compact",
-                              "cwd": str(project[1]), "session_id": "thread-core2"})
-            self.assertEqual(set(compact), {"hookSpecificOutput"})
-            self.assertEqual(set(compact["hookSpecificOutput"]), {"hookEventName", "additionalContext"})
-            self.assertIn('"observed_at":"2026-10-25T21:18:00Z"',
-                          compact["hookSpecificOutput"]["additionalContext"])
+            for source in ("startup", "resume", "clear", "compact", "fork"):
+                with self.subTest(source=source):
+                    result = output({"hook_event_name": "SessionStart", "source": source,
+                                     "cwd": str(project[1]), "session_id": "thread-core2"})
+                    self.assertEqual(set(result), {"hookSpecificOutput"})
+                    self.assertEqual(set(result["hookSpecificOutput"]), {"hookEventName", "additionalContext"})
+                    self.assertIn('"observed_at":"2026-10-25T21:18:00Z"',
+                                  result["hookSpecificOutput"]["additionalContext"])
         finally:
             project[0].cleanup()
 

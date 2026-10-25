@@ -1,0 +1,102 @@
+{
+  "_fixture": {
+    "kind": "sanitized real-shape projection from Root task evidence; not live CURRENT or CARRY",
+    "projection_path": "work/root-core-refresh-20261023/current-assignment-context-repair-20261025/SANITIZED-CURRENT-PROJECTION.json",
+    "projection_sha256": "57fb749b257d4e0477f53074d4c626190ab4eeed69b3ceace43299791ace479d",
+    "read_clarification_path": "work/root-core-refresh-20261023/current-assignment-context-repair-20261025/ROOT-SCOPED-READ-CLARIFICATION.json",
+    "read_clarification_sha256": "c1dca0577285787a6edf69273a550106c664e937e60fd2e706a64caf0ac1a292",
+    "expected_original_scope_sha256": {
+      "call_47db1372119641b3a7c93ca4a1727f88": "0be8909db5fdcc05a533792d1dde0c69de0c4856387872888b733b9758c631b8",
+      "call_20058c2e2a7d4b478923593016b3e0ad": "1840ae888dcf12f21902950e00206a3de513844b2a9fe8035c4409351b3c06db",
+      "call_bfcc9040e8814a50a686715d6dc43688": "c2ae210370c7266d6fe08e2c5537e0b528c7a86144ad09295030193e069703cc"
+    },
+    "notice": "Sanitized real-shape coordination projection only; no raw user prompt/answer, secrets, runtime payload or authority fabrication. original_scope values are existing Root-authored non-secret summaries; provenance quote value is explicitly redacted fixture text."
+  },
+  "binding": {
+    "schema": "CODEX_COORDINATION_CONTEXT_BINDING_V1",
+    "project_id": "P-CPI-10",
+    "state_path": "work/CURRENT.json",
+    "assignment_pointers": [
+      "/CURRENT/core2",
+      "/CURRENT/core3"
+    ],
+    "mode_pointer": "/CURRENT/authorization_mode",
+    "consumed_questions_pointer": "/CURRENT/consumed_questions",
+    "observed_at_pointer": "/CURRENT/observed_at"
+  },
+  "state": {
+    "CURRENT": {
+      "core2": {
+        "thread": "01a168a5-811f-71f2-a03e-3f5a2a6a2414",
+        "task": "core2-r7-cli-reconciliation-repair-20261025",
+        "actor": "codex:01a168a5-811f-71f2-a03e-3f5a2a6a2414:core2-cpi225-r6-live-pending-cli-20261025",
+        "claim": "global-cpi-225.29",
+        "dispatch": "a6220f3b-8b68-4592-b71a-ce7706f2cf69",
+        "source_digest": "002d2d3ceec71bb40cec3591103fbdc82361d82549567ee6c9478a2b47dae93d",
+        "scope_digest": "c98cb771b1a100c66ca7e5e7ad696efa6c95319b6abf0a98150f52326d9fe563",
+        "plan": "work/root-core-refresh-20261023/r7-cli-reconciliation-repair-20261025/PLAN.json",
+        "source": "work/root-core-refresh-20261023/r7-cli-reconciliation-repair-20261025/SOURCE.json",
+        "scope": "work/root-core-refresh-20261023/r7-cli-reconciliation-repair-20261025/SCOPE.json",
+        "state": "New packet-aware CLI source repair ISSUING a6220f3b; claim .225.29 exact actor/futurelease verified, native send next. Prior233.14 integration is COMPLETE1f1d0ba5/leasefalse and closed; old Core1 question remains consumed history."
+      },
+      "core3": {
+        "thread": "01a168a5-8b83-7210-b8ad-9277f0f8add6",
+        "task": "core3-first-ordinary-guest-session-20261025",
+        "actor": "codex:01a168a5-8b83-7210-b8ad-9277f0f8add6:cpi388-first-ordinary-session-manager-20261025",
+        "claim": "global-cpi-388.7",
+        "dispatch": "7b681019-fd42-4142-b6b8-208db3a4fef9",
+        "source_digest": "2c69136c3140f1412acff9dc06a00f0b5a58017e21b4806bc2dd0465846b8bbb",
+        "scope_digest": "cc9eb4a27116c70d1cafaa22155315a9c2403442fb5805b3a213947d26351de3",
+        "plan": "work/root-core-refresh-20261023/first-ordinary-guest-session-20261025/PLAN.json",
+        "source": "work/root-core-refresh-20261023/first-ordinary-guest-session-20261025/SOURCE.json",
+        "scope": "work/root-core-refresh-20261023/first-ordinary-guest-session-20261025/SCOPE.json",
+        "state": "Current full first-private-session task .388.7, not completed menu-only388.6. Actual manager is doing read-only private route/account privacy prerequisites but still unnecessarily awaiting a new permission answer. Root delegated phase review already approved; no worker/account/login/gameplay yet."
+      },
+      "authorization_mode": {
+        "mode": "blanket_delegated",
+        "reviewer_thread": "01a1417d-f106-7af3-8319-010fe1993e16",
+        "provenance": {
+          "source_thread": "01a1417d-f106-7af3-8319-010fe1993e16",
+          "source_kind": "current_user_orchestration_goal",
+          "review_decision": "work/root-core-refresh-20261023/first-ordinary-guest-session-20261025/ROOT-DELEGATED-PHASE-REVIEW.json",
+          "review_decision_sha256": "334a7f828dab1a05e2e4d11e942354c8de490cd0ba64d80f9ef5a25bbe9b0b77",
+          "limits": "Existing accepted project only. Does not override a genuine later user pause, new legal consent or security boundary; no fabricated fresh human answer.",
+          "direct_user_quote": "[redacted fixture value; string type preserved, not a user instruction]"
+        }
+      },
+      "consumed_questions": {
+        "[\"request_user_input_async\",\"call_47db1372119641b3a7c93ca4a1727f88\",0]": {
+          "question_id": "call_47db1372119641b3a7c93ca4a1727f88",
+          "original_at": "2026-10-23T19:43:16.916Z",
+          "original_thread": "01a168a5-811f-71f2-a03e-3f5a2a6a2414",
+          "original_task": null,
+          "original_scope": "One additional assessed Core1 correction worker in the original October23 scope; exact old task ID not inferred.",
+          "state": "consumed",
+          "consumed_evidence": "work/root-core-refresh-20261023/authorization-mode-repair-20261025/PM-STALE-QUESTION-COMPACTION-EVIDENCE.json",
+          "disposition": "AlreadyconsumedCore1correction; noCore2Core1launchauthority. Mayremainlastdirecthumanpayloadin inheritedcontext, notfreshgrant ornewenqueuedanswerproof."
+        },
+        "[\"request_user_input_async\",\"call_20058c2e2a7d4b478923593016b3e0ad\",0]": {
+          "question_id": "call_20058c2e2a7d4b478923593016b3e0ad",
+          "original_at": "2026-10-25T17:42:46.320Z",
+          "original_thread": "01a168a5-8b83-7210-b8ad-9277f0f8add6",
+          "original_task": "core3-hyperv-client-readiness-20261025",
+          "original_scope": "EULA only in existing guest, then stop at next prompt/menu; completed readinesstask, not globalprojectpause.",
+          "state": "consumed",
+          "consumed_evidence": "work/root-core-refresh-20261023/hyperv-client-readiness-20261025/worker/eula-acceptance-20261025/TERMINAL-READBACK.json",
+          "disposition": "Historical answered question scoped only to completed originaltask. No newgrant or pause of currenttask inferred."
+        },
+        "[\"request_user_input_async\",\"call_bfcc9040e8814a50a686715d6dc43688\",0]": {
+          "question_id": "call_bfcc9040e8814a50a686715d6dc43688",
+          "original_at": "2026-10-25T17:54:58.070Z",
+          "original_thread": "01a168a5-8b83-7210-b8ad-9277f0f8add6",
+          "original_task": "core3-hyperv-client-readiness-20261025",
+          "original_scope": "Exact WoW_TOU_enUS_20080829 then login/menu only; oldreadiness phase completed. Not current .388.7 first-session scope or standing futurelegal consent.",
+          "state": "consumed",
+          "consumed_evidence": "work/root-core-refresh-20261023/hyperv-client-readiness-20261025/worker/eula-acceptance-20261025/TERMINAL-READBACK.json",
+          "disposition": "Historical answered question scoped only to completed originaltask. No newgrant or pause of currenttask inferred."
+        }
+      },
+      "observed_at": "2026-10-25T21:41:49.667088+00:00"
+    }
+  }
+}
