@@ -122,6 +122,32 @@ def test_report_secrets_are_redacted_before_checkpoint_and_wal(h):
         apply_event(h.db, {**event, "detail": "changed"})
 
 
+def test_report_state_limit_and_bounded_latest_projection(h):
+    h.add()
+    accepted = report(h, "report-state-boundary", state="x" * 512)
+    assert apply_event(h.db, accepted)["action"] == "REPORTED"
+    summary = apply_event(h.db, {**h.binding, "op": "summary"})
+    latest_state = summary["tasks"][0]["latest_report"]["state"]
+    assert len(latest_state) <= 512
+
+    before = h.db.read_bytes()
+    with pytest.raises(InvalidEvent, match="512 characters"):
+        apply_event(h.db, report(h, "report-state-too-long", state="x" * 513))
+    assert h.db.read_bytes() == before
+    assert apply_event(h.db, {**h.binding, "op": "summary"})["tasks"][0]["latest_report"]["event_id"] == accepted["event_id"]
+
+
+def test_report_rejects_utc_conversion_overflow_before_checkpoint(h):
+    h.add()
+    before = h.db.read_bytes()
+    invalid = report(h, "report-utc-overflow", occurred_at="0001-01-01T00:00:00+14:00")
+    with pytest.raises(InvalidEvent, match="invalid report occurred_at"):
+        apply_event(h.db, invalid)
+    assert h.db.read_bytes() == before
+    summary = apply_event(h.db, {**h.binding, "op": "summary"})
+    assert summary["bounds"]["total_reports"] == 0
+
+
 def test_concurrent_report_retry_is_idempotent(h):
     h.add()
     event = report(h, "concurrent-report")

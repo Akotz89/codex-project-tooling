@@ -50,10 +50,8 @@
     "reporter_thread_id": {"type": "string", "minLength": 1},
     "kind": {"enum": ["lifecycle", "progress", "blocker", "handoff", "result"]},
     "occurred_at": {"type": "string", "format": "date-time"},
-    "state": {"type": "string", "minLength": 1},
     "detail": {"type": "string", "minLength": 1, "maxLength": 2000},
     "source": {"type": "string", "minLength": 1, "maxLength": 512},
-    "evidence": {"type": "array", "maxItems": 16, "items": {"type": "string", "minLength": 1, "maxLength": 512}},
     "claim_id": {"type": "string", "minLength": 1},
     "dispatch_id": {
       "type": "string"
@@ -72,16 +70,6 @@
       "minLength": 1,
       "maxLength": 64,
       "pattern": "^[a-z][a-z0-9_-]*$"
-    },
-    "state": {
-      "enum": [
-        "IDLE",
-        "BUSY",
-        "UNKNOWN"
-      ]
-    },
-    "evidence": {
-      "type": "string"
     },
     "quiescent": {
       "type": "boolean"
@@ -353,7 +341,15 @@
           "evidence",
           "project_id",
           "root"
-        ]
+        ],
+        "properties": {
+          "state": {
+            "enum": ["IDLE", "BUSY", "UNKNOWN"]
+          },
+          "evidence": {
+            "type": "string"
+          }
+        }
       }
     },
     {
@@ -372,7 +368,10 @@
           "scope_digest",
           "project_id",
           "root"
-        ]
+        ],
+        "properties": {
+          "evidence": {"type": "string", "minLength": 1}
+        }
       }
     },
     {
@@ -448,7 +447,10 @@
           "evidence",
           "project_id",
           "root"
-        ]
+        ],
+        "properties": {
+          "evidence": {"type": "string", "minLength": 1}
+        }
       }
     },
     {
@@ -541,7 +543,10 @@
           "expected_old_thread_id",
           "new_thread_id",
           "evidence"
-        ]
+        ],
+        "properties": {
+          "evidence": {"type": "string", "minLength": 1}
+        }
       }
     },
     {
@@ -610,6 +615,10 @@
       },
       "then": {
         "required": ["event_id", "project_id", "root", "task_id", "reporter", "reporter_thread_id", "kind", "occurred_at", "state", "detail", "source", "evidence", "claim_id"],
+        "properties": {
+          "state": {"type": "string", "minLength": 1, "maxLength": 512},
+          "evidence": {"type": "array", "maxItems": 16, "items": {"type": "string", "minLength": 1, "maxLength": 512}}
+        },
         "propertyNames": {
           "enum": ["op", "event_id", "project_id", "root", "task_id", "reporter", "reporter_thread_id", "kind", "occurred_at", "state", "detail", "source", "evidence", "claim_id", "dispatch_id"]
         }

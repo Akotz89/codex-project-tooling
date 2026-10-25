@@ -149,14 +149,16 @@ def validate_event(event):
         require(worker_role(event["reporter"]), "invalid report reporter")
         require(native_thread_id(event["reporter_thread_id"]), "invalid report reporter thread")
         require(event["kind"] in {"lifecycle", "progress", "blocker", "handoff", "result"}, "invalid report kind")
-        require(string(event["task_id"]) and string(event["state"]), "report task_id and state required")
+        require(string(event["task_id"]) and string(event["state"]) and len(event["state"]) <= 512,
+                "report task_id and state required; state must be at most 512 characters")
         require(string(event["detail"]) and len(event["detail"]) <= 2000, "report detail must be 1-2000 characters")
         require(string(event["source"]) and len(event["source"]) <= 512, "report source link must be bounded")
         require(isinstance(event["evidence"], list) and len(event["evidence"]) <= 16 and all(string(v) and len(v) <= 512 for v in event["evidence"]), "report evidence must be at most 16 bounded links")
         try:
             occurred = datetime.fromisoformat(event["occurred_at"].replace("Z", "+00:00"))
             require(occurred.tzinfo is not None, "report occurred_at requires timezone")
-        except (TypeError, ValueError, AttributeError) as exc:
+            occurred.astimezone(timezone.utc)
+        except (TypeError, ValueError, AttributeError, OverflowError) as exc:
             raise InvalidEvent("invalid report occurred_at") from exc
         for optional in ("claim_id", "dispatch_id"):
             require(optional not in event or string(event[optional]), f"{optional} must be nonempty when present")
@@ -699,7 +701,9 @@ def compact_status(state, event, checkpoint_id=None, pending=()):
     for task in page:
         latest = latest_report_by_task.get(task["id"])
         if latest:
-            task["latest_report"] = {**{k: latest[k] for k in ("event_id", "reporter", "kind", "occurred_at", "recorded_at", "state")}, "stale": False}
+            task["latest_report"] = bounded(
+                {**{k: latest[k] for k in ("event_id", "reporter", "kind", "occurred_at", "recorded_at", "state")}, "stale": False},
+                f"tasks.{task['id']}.latest_report")
     return {"action": "OK", "checkpoint_id": checkpoint_id,
             "project": bounded(project, "project"),
             "workers": bounded({k: {"state": model["workers"][k]["state"]}
