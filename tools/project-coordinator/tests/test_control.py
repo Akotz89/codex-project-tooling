@@ -477,13 +477,38 @@ def test_cli_register_replay_and_summary(h):
 
 def test_schema_accepts_safe_project_roles_and_explicit_project_policy():
     from pathlib import Path
-    schema = json.loads((Path(__file__).resolve().parents[1] / 'schema.json').read_text())
+
+    def unique_keys(pairs):
+        result = {}
+        for key, value in pairs:
+            assert key not in result, f'duplicate JSON key: {key}'
+            result[key] = value
+        return result
+
+    schema = json.loads((Path(__file__).resolve().parents[1] / 'schema.json').read_text(), object_pairs_hook=unique_keys)
     assert 'register' in schema['properties']['op']['enum']
+    assert 'report' in schema['properties']['op']['enum']
+    assert schema['properties']['occurred_at']['maxLength'] == 64
+    assert schema['properties']['report_offset']['minimum'] == 0
+    assert schema['properties']['report_limit']['maximum'] == 100
     assert schema['properties']['worker']['pattern'] == '^[a-z][a-z0-9_-]*$'
     assert schema['$defs']['task']['properties']['worker']['pattern'] == '^[a-z][a-z0-9_-]*$'
     assert schema['$defs']['project']['properties']['workers']['minProperties'] == 1
     assert '^[a-z][a-z0-9_-]{0,63}$' in schema['$defs']['project']['properties']['workers']['patternProperties']
     assert schema['$defs']['projectPolicy']['additionalProperties'] is False
+    report = next(rule['then'] for rule in schema['allOf'] if rule['if']['properties']['op'].get('const') == 'report')
+    assert report['properties']['state'] == {'type': 'string', 'minLength': 1, 'maxLength': 512}
+    assert report['properties']['evidence']['type'] == 'array'
+    assert report['properties']['evidence']['items'] == {'type': 'string', 'minLength': 1, 'maxLength': 512}
+    observe = next(rule['then'] for rule in schema['allOf'] if rule['if']['properties']['op'].get('const') == 'observe')
+    assert observe['properties']['state']['enum'] == ['IDLE', 'BUSY', 'UNKNOWN']
+    assert observe['properties']['evidence']['type'] == 'string'
+    for op in ('prepare', 'reconcile', 'rebind', 'retire', 'register'):
+        rule = next(rule['then'] for rule in schema['allOf'] if rule['if']['properties']['op'].get('const') == op)
+        assert rule['properties']['evidence']['type'] == 'string'
+        assert rule['properties']['evidence']['minLength'] == 1
+    status = next(rule['then'] for rule in schema['allOf'] if rule['if']['properties']['op'].get('const') == 'status')
+    assert set(status['required']) == {'project_id', 'root'}
     rule = next(rule['then'] for rule in schema['allOf'] if rule['if']['properties']['op'].get('const') == 'register')
     assert rule['properties']['new_thread_id']['type'] == 'string'
     assert 'worker' not in rule['properties']

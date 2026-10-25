@@ -21,7 +21,8 @@
         "status",
         "rebind",
         "summary",
-        "register"
+        "register",
+        "report"
       ]
     },
     "event_id": {
@@ -45,6 +46,13 @@
     "task_id": {
       "type": "string"
     },
+    "reporter": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,63}$"},
+    "reporter_thread_id": {"type": "string", "minLength": 1},
+    "kind": {"enum": ["lifecycle", "progress", "blocker", "handoff", "result"]},
+    "occurred_at": {"type": "string", "format": "date-time", "maxLength": 64},
+    "detail": {"type": "string", "minLength": 1, "maxLength": 2000},
+    "source": {"type": "string", "minLength": 1, "maxLength": 512},
+    "claim_id": {"type": "string", "minLength": 1},
     "dispatch_id": {
       "type": "string"
     },
@@ -62,16 +70,6 @@
       "minLength": 1,
       "maxLength": 64,
       "pattern": "^[a-z][a-z0-9_-]*$"
-    },
-    "state": {
-      "enum": [
-        "IDLE",
-        "BUSY",
-        "UNKNOWN"
-      ]
-    },
-    "evidence": {
-      "type": "string"
     },
     "quiescent": {
       "type": "boolean"
@@ -93,6 +91,8 @@
       "minimum": 1,
       "maximum": 100
     },
+    "report_offset": {"type": "integer", "minimum": 0},
+    "report_limit": {"type": "integer", "minimum": 1, "maximum": 100},
     "expected_workers": {
       "$ref": "#/$defs/project/properties/workers"
     }
@@ -341,7 +341,15 @@
           "evidence",
           "project_id",
           "root"
-        ]
+        ],
+        "properties": {
+          "state": {
+            "enum": ["IDLE", "BUSY", "UNKNOWN"]
+          },
+          "evidence": {
+            "type": "string"
+          }
+        }
       }
     },
     {
@@ -360,7 +368,10 @@
           "scope_digest",
           "project_id",
           "root"
-        ]
+        ],
+        "properties": {
+          "evidence": {"type": "string", "minLength": 1}
+        }
       }
     },
     {
@@ -436,7 +447,10 @@
           "evidence",
           "project_id",
           "root"
-        ]
+        ],
+        "properties": {
+          "evidence": {"type": "string", "minLength": 1}
+        }
       }
     },
     {
@@ -529,7 +543,10 @@
           "expected_old_thread_id",
           "new_thread_id",
           "evidence"
-        ]
+        ],
+        "properties": {
+          "evidence": {"type": "string", "minLength": 1}
+        }
       }
     },
     {
@@ -587,6 +604,23 @@
             "expected_workers",
             "evidence"
           ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "op": {"const": "report"}
+        }
+      },
+      "then": {
+        "required": ["event_id", "project_id", "root", "task_id", "reporter", "reporter_thread_id", "kind", "occurred_at", "state", "detail", "source", "evidence", "claim_id"],
+        "properties": {
+          "state": {"type": "string", "minLength": 1, "maxLength": 512},
+          "evidence": {"type": "array", "maxItems": 16, "items": {"type": "string", "minLength": 1, "maxLength": 512}}
+        },
+        "propertyNames": {
+          "enum": ["op", "event_id", "project_id", "root", "task_id", "reporter", "reporter_thread_id", "kind", "occurred_at", "state", "detail", "source", "evidence", "claim_id", "dispatch_id"]
         }
       }
     }

@@ -22,14 +22,24 @@ def reject_constant(value):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", required=True)
-    parser.add_argument("command", choices=["init", "add", "observe", "prepare", "issue", "ack", "result", "reconcile", "retire", "recover", "status", "rebind", "register", "summary"])
-    parser.add_argument("--input", required=True, help="JSON event body; command supplies op")
+    parser.add_argument("command", choices=["init", "add", "observe", "prepare", "issue", "ack", "result", "reconcile", "retire", "report", "recover", "status", "rebind", "register", "summary", "serve"])
+    parser.add_argument("--input", help="JSON event body; command supplies op")
+    parser.add_argument("--project-id")
+    parser.add_argument("--root")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--beads-dir", help="Explicit global Beads directory; required for new prepare/issue")
     parser.add_argument("--beads-assignee", help="Exact claimed execution actor")
     parser.add_argument("--bd-executable", help="Absolute path to the supported bd executable")
     parser.add_argument("--project-policy", help="Explicit project-bound registration and legacy-claim policy JSON")
     args = parser.parse_args()
     try:
+        if args.command == "serve":
+            require(args.host in {"127.0.0.1", "localhost"}, "API host must be loopback")
+            require(args.project_id and args.root, "serve requires --project-id and --root")
+            from .http_api import serve
+            return serve(args.db, args.project_id, args.root, args.host, args.port)
+        require(args.input, "--input required")
         with open(args.input) as stream:
             event = json.load(stream, object_pairs_hook=unique_object, parse_constant=reject_constant)
         project_policy = None

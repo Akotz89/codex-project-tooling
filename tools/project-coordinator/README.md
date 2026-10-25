@@ -24,10 +24,23 @@ All other commands require common binding `{ "project_id":"P-example", "root":"/
 | retire | `task_id`, exact `source_digest` and `scope_digest`, `quiescent:true`, `evidence`; only a never-dispatched WAIT/READY task with no dispatch binding or lease can become terminal RETIRED |
 | register | `worker`, `new_thread_id`, the complete `expected_workers` map, and `evidence`; additive compare-and-swap registration requires an explicit project policy |
 | rebind | `worker`, `expected_old_thread_id`, `new_thread_id`, `evidence`; compare-and-swap replacement, requiring no held/uncertain dispatch and no observed BUSY worker |
-| summary | common binding; optional `offset` (default0), `limit` (default50, max100) |
+| summary | common binding; optional task `offset`/`limit` and independent newest-first report `report_offset`/`report_limit` (each limit defaults to50 and is capped at100) |
+| report | `task_id`, bound `reporter` worker role and `reporter_thread_id`, `kind`, timezone-aware ISO `occurred_at` (at most 64 characters and no more than five minutes ahead of server receipt; stored as canonical UTC), `state` (at most 512 characters), `detail`, a `source` link, `evidence` links, and exact `claim_id`; optional `dispatch_id` must match the bound task |
 | status / recover | common binding only; existing full response/recovery semantics |
 
 Every input is a JSON object, not a JSON string. CLI command supplies `op`. Inputs and receipts must contain no credentials or full logs.
+
+`report` appends owner-attributed progress to the coordinator's existing checkpoint model. Identical event IDs replay without another row; conflicting reuse fails. Each stored row includes its event time and server recording time. The bounded summary returns up to 100 reports newest-first and each returned task's latest event-time report; late reports stay attributed in history and are marked stale without replacing newer projection state. `report_offset` and `report_limit` page through older reports; bounds include previous/next offsets and the total report count. Submission is optional telemetry: producers should surface failures and retry the same event but never block task execution or convert reported results into Root acceptance.
+
+The query API and browser view run explicitly against the existing configured database and project binding:
+
+```text
+PROJECT_COORDINATOR_TOKEN='<at-least-24-character-secret>' project-coordinator --db work/<run>/state/coordinator.sqlite serve --project-id P-example --root /canonical/project --host 127.0.0.1 --port 8765
+```
+
+The service binds only to loopback, requires bearer authentication for `GET /api/status`, rejects writes, and accepts only bounded task `offset`/`limit` and report `report_offset`/`report_limit` query parameters. Database path, project ID and root come from process configuration, never the request. The root page is a reusable static view; its password field stays in memory and is not saved to browser storage. No cross-origin access is enabled. The API reads through the same query-only `summary` path and does not create or migrate a database.
+
+Report submission requires the exact bound task owner: `reporter` must equal the task's assigned `worker`, and `reporter_thread_id` must equal that role's exact current project binding. PO, Scrum Master, and child-native roles can report as themselves only after explicit project registration/binding and task ownership. This package does not wire those callers, install hooks, or read chat history. Eligible producers should submit after a supported collaboration action using the actual event time, source/evidence links, and bound Beads claim; add the dispatch ID when it exists. Reuse the exact JSON and `event_id` on retry. Record lifecycle, progress, blocker, handoff, or result as observed. Producers must keep work running if report delivery is offline, retain the retryable event locally, and distinguish result reports from independent acceptance.
 
 `retire` preserves the task and its original source/scope identity, records the event and evidence reference, and leaves dependents blocked because only COMPLETE satisfies a dependency. It rejects any task outside WAIT/READY or with a dispatch ID, pinned dispatch thread, or lease. The event must match the bound project/root and exact task digests, and explicitly set `quiescent:true`; the caller must ensure its evidence reference supports that claim. Retired IDs cannot be prepared or issued again, and `add` cannot replace them; replacement work uses a distinct task ID.
 
