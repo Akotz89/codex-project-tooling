@@ -638,6 +638,24 @@ def test_worker_receives_current_terminal_task_state_not_old_blocker(h):
                                   "reasons": [],
                                   "revision": update["revision"]}]
     assert update["updates"][0]["event_id"] != "obsolete-blocker"
+    assert h.call("bundle", task_id="A", role="worker-1", thread_id="thread1")["directed_reports"] == []
+    assert h.call("bundle", task_id="A")["directed_reports"] == []
+
+
+def test_task_bundle_suppresses_directed_instruction_after_retirement(h):
+    add(h, "retired", worker="worker-2", linear_ref="CPI-417")
+    apply_event(h.db, {**h.binding, "op": "project_report", "event_id": "retired-task-instruction",
+                       "work_item": "CPI-417", "reporter": "coordinator", "reporter_thread_id": "root",
+                       "kind": "handoff", "occurred_at": datetime.now(timezone.utc).isoformat(),
+                       "state": "current", "detail": "Instruction for a queued task",
+                       "source": "linear:CPI-417", "evidence": ["evidence:retire"],
+                       "recipients": ["worker-2"]})
+    task = read_model(h.db, h.binding)[0]["tasks"]["retired"]
+    h.call("retire", task_id="retired", source_digest=task["source_digest"],
+           scope_digest=task["scope_digest"], quiescent=True, evidence="evidence:retirement")
+
+    assert h.call("bundle", task_id="retired", role="worker-2", thread_id="thread2")["directed_reports"] == []
+    assert h.call("bundle", task_id="retired")["directed_reports"] == []
 
 
 def test_assignment_update_is_delivered_once_to_the_assigned_role(h):
