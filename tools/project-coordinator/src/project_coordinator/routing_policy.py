@@ -11,7 +11,11 @@ class SavedPolicy(TypedDict):
 class PolicySupport(TypedDict):
     state: str
     combined_supported: bool
+    capability_supported: bool
     reason: str | None
+    models: dict[str, list[str]]
+    selection_valid: bool
+    selection_repairable: bool
 
 
 class PolicyWrite(TypedDict, total=False):
@@ -42,12 +46,27 @@ def valid_support(value: Any) -> bool:
         return False
     if "reason" in value and value["reason"] is not None and not isinstance(value["reason"], str):
         return False
+    if any(key in value and not isinstance(value[key], bool)
+           for key in ("capability_supported", "selection_valid", "selection_repairable")):
+        return False
+    if "reason_code" in value and not isinstance(value["reason_code"], str):
+        return False
     if "catalog_generated_at" in value and not isinstance(value["catalog_generated_at"], str):
         return False
     if "models" in value and (not isinstance(value["models"], dict) or any(
             not isinstance(model, str) or not isinstance(efforts, list)
             or any(not isinstance(effort, str) for effort in efforts)
             for model, efforts in value["models"].items())):
+        return False
+    if value.get("selection_repairable") is True:
+        models = value.get("models")
+        if (value["state"] != "unsupported" or value["combined_supported"]
+                or value.get("capability_supported") is not True
+                or value.get("selection_valid") is not False
+                or value.get("reason_code") != "saved_selection_outside_ceiling"
+                or not isinstance(models, dict) or not any(models.values())):
+            return False
+    if value["state"] == "supported" and value.get("selection_valid", True) is not True:
         return False
     return True
 

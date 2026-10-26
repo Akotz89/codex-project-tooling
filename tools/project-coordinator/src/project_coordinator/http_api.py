@@ -204,7 +204,7 @@ def handler(db: str, project_id: str, root: str, token: str, participant_tokens=
                     support = routing_provider.support()
                     if not valid_support(support):
                         raise ValueError("routing provider returned invalid support state")
-                    if not support.get("combined_supported"):
+                    if not support.get("combined_supported") and not support.get("selection_repairable"):
                         self.send_body(409, "application/json", json.dumps({"state":"unsupported", "support":support}).encode())
                         return
                     result = routing_provider.compare_and_swap(body["revision"], {"model":body["model"], "effort":body["effort"]})

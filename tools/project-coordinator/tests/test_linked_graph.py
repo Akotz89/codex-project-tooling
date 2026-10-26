@@ -910,6 +910,41 @@ def test_routing_policy_api_rejects_malformed_input_and_provider_success(h):
         server.shutdown(); server.server_close(); thread.join(timeout=2)
 
 
+def test_routing_policy_api_allows_only_permitted_repair_of_invalid_saved_selection(h):
+    class Provider:
+        def __init__(self): self.saved = None
+        def read_policy(self): return {"model": "gpt-6-luna", "effort": "high", "revision": "r0"}
+        def support(self):
+            return {"state": "unsupported", "combined_supported": False, "capability_supported": True,
+                    "selection_valid": False,
+                    "selection_repairable": True, "reason_code": "saved_selection_outside_ceiling",
+                    "models": {"gpt-6-luna": ["medium"]}, "reason": "saved selection is outside the ceiling"}
+        def compare_and_swap(self, revision, selection):
+            assert revision == "r0" and selection == {"model": "gpt-6-luna", "effort": "medium"}
+            self.saved = selection
+            return {"state": "saved", "saved": True, "applied": False, "revision": "r1"}
+
+    owner = "owner-routing-token-that-is-long-enough"
+    provider = Provider()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler(str(h.db), h.binding["project_id"], h.binding["root"], owner, routing_provider=provider))
+    thread = Thread(target=server.serve_forever, daemon=True); thread.start()
+    base = f"http://127.0.0.1:{server.server_port}/api/routing-policy"
+    headers = {"Authorization": f"Bearer {owner}", "Content-Type": "application/json"}
+    try:
+        read = json.loads(urlopen(Request(base, headers=headers)).read())
+        assert read["policy"]["effort"] == "high"
+        assert read["support"]["capability_supported"] is True
+        assert read["support"]["selection_valid"] is False
+        assert read["support"]["models"] == {"gpt-6-luna": ["medium"]}
+        write = Request(base, data=json.dumps({"revision": "r0", "model": "gpt-6-luna", "effort": "medium"}).encode(),
+                        method="POST", headers=headers)
+        result = json.loads(urlopen(write).read())
+        assert result["saved"] is True and result["applied"] is False
+        assert provider.saved == {"model": "gpt-6-luna", "effort": "medium"}
+    finally:
+        server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+
 def test_non_ascii_authorization_and_configured_tokens_are_rejected_safely(h):
     owner = "safe-owner-token-that-is-long-enough"
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler(str(h.db), h.binding["project_id"], h.binding["root"], owner))
@@ -959,11 +994,14 @@ def test_browser_preserves_routing_write_outcome_after_support_refresh():
     assert "Saved. Applied: ${result.applied?'yes':'no'}." in load
     assert "conflict=result.state==='failed'&&result.error==='revision conflict'" in load
     assert "await loadRouting(outcome)" in load
-    assert "model.disabled=effort.disabled=save.disabled=!supported" in load
+    assert "selectable=supported||repairable" in load
+    assert "model.disabled=effort.disabled=save.disabled=!selectable" in load
     assert "outcome?`${outcome} Refresh failed: ${e.message}`:e.message" in load
     assert '<select id="routing-model" disabled></select>' in page
     assert '<select id="routing-effort" disabled></select>' in page
     assert "data.support?.models||{}" in load and "choices[model.value]" in load
+    assert "data.support?.capability_supported&&data.support?.selection_repairable" in load
+    assert "Consumer and capabilities support the permitted pairs, but the saved selection is outside the current ceiling" in load
 
 
 def test_browser_exposes_directed_instruction_and_opens_selected_task_detail():

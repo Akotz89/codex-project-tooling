@@ -21,8 +21,8 @@ async function api(path){const r=await fetch(path,{headers:{Authorization:`Beare
 async function loadRouting(outcome=''){
  const state=document.querySelector('#routing-state'),model=document.querySelector('#routing-model'),effort=document.querySelector('#routing-effort'),save=document.querySelector('#routing-save');
  try{
-  const data=await api('/api/routing-policy'),supported=Boolean(data.support?.combined_supported);
-  const supportMessage=supported?'Saved policy is supported.':'Combined model and effort saving is unsupported by the installed consumer.';
+  const data=await api('/api/routing-policy'),supported=Boolean(data.support?.combined_supported),repairable=Boolean(data.support?.capability_supported&&data.support?.selection_repairable),selectable=supported||repairable;
+  const supportMessage=repairable?'Consumer and capabilities support the permitted pairs, but the saved selection is outside the current ceiling. Choose a permitted pair to repair it; execution remains unsupported until then.':supported?'Saved policy is supported.':'Combined model and effort saving is unsupported by the installed consumer.';
   state.textContent=outcome?`${outcome} ${supportMessage}`:supportMessage;
   const choices=data.support?.models||{};
   model.replaceChildren(...Object.keys(choices).map(value=>new Option(value,value)));
@@ -30,7 +30,7 @@ async function loadRouting(outcome=''){
   model.onchange=updateEfforts;
   model.value=choices[data.policy?.model]?data.policy.model:Object.keys(choices)[0]||'';
   updateEfforts();effort.value=(choices[model.value]||[]).includes(data.policy?.effort)?data.policy.effort:effort.options[0]?.value||'';
-  model.disabled=effort.disabled=save.disabled=!supported;
+  model.disabled=effort.disabled=save.disabled=!selectable;
   save.onclick=async()=>{
    save.disabled=true;
    try{
