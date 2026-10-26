@@ -888,6 +888,28 @@ def test_routing_policy_api_is_owner_only_and_refuses_unsupported_writes(h):
         server.shutdown(); server.server_close(); thread.join(timeout=2)
 
 
+def test_routing_policy_api_rejects_malformed_input_and_provider_success(h):
+    class Provider:
+        def read_policy(self): return {"model": None, "effort": None, "revision": "r0"}
+        def support(self): return {"combined_supported": True, "state": "supported"}
+        def compare_and_swap(self, revision, selection):
+            return {"state": "failed", "saved": True, "applied": False, "revision": "r1"}
+    owner = "owner-routing-token-that-is-long-enough"
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler(str(h.db), h.binding["project_id"], h.binding["root"], owner, routing_provider=Provider()))
+    thread = Thread(target=server.serve_forever, daemon=True); thread.start()
+    base = f"http://127.0.0.1:{server.server_port}/api/routing-policy"
+    headers = {"Authorization": f"Bearer {owner}", "Content-Type": "application/json"}
+    try:
+        malformed = Request(base, data=json.dumps({"revision":"r0", "model":["gpt-6-luna"], "effort":"medium"}).encode(), method="POST", headers=headers)
+        with pytest.raises(HTTPError) as rejected: urlopen(malformed)
+        assert rejected.value.code == 400
+        invalid_result = Request(base, data=json.dumps({"revision":"r0", "model":"gpt-6-luna", "effort":"medium"}).encode(), method="POST", headers=headers)
+        with pytest.raises(HTTPError) as rejected: urlopen(invalid_result)
+        assert rejected.value.code == 400
+    finally:
+        server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+
 def test_non_ascii_authorization_and_configured_tokens_are_rejected_safely(h):
     owner = "safe-owner-token-that-is-long-enough"
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler(str(h.db), h.binding["project_id"], h.binding["root"], owner))
@@ -926,6 +948,7 @@ def test_browser_renders_saved_routing_controls_and_disables_unsupported_policy(
     assert "Combined model and effort saving is unsupported" in page
     assert "save.disabled=model.disabled=effort.disabled=true" in page
     assert "fetch('/api/routing-policy'" in page
+    assert "finally{save.disabled=!supported}" not in page
 
 
 def test_browser_exposes_directed_instruction_and_opens_selected_task_detail():

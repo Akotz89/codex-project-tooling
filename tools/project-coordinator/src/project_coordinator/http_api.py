@@ -9,7 +9,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from .runtime import InvalidEvent, apply_event, read_declared_reference, read_model, task_bundle, read_updates, worker_role, validate_project_policy
-from .routing_policy import valid_policy, valid_support
+from .routing_policy import valid_policy, valid_support, valid_write
 
 
 PAGE = Path(__file__).with_name("status.html")
@@ -196,6 +196,11 @@ def handler(db: str, project_id: str, root: str, token: str, participant_tokens=
                     body = json.loads(self.rfile.read(length), object_pairs_hook=_unique_object)
                     if not isinstance(body, dict) or set(body) != {"revision", "model", "effort"}:
                         raise ValueError("invalid policy request")
+                    if (not isinstance(body["revision"], str) or not body["revision"]
+                            or not isinstance(body["model"], str) or not body["model"]
+                            or not isinstance(body["effort"], str) or not body["effort"]
+                            or max(map(len, body.values())) > 256):
+                        raise ValueError("invalid policy request values")
                     support = routing_provider.support()
                     if not valid_support(support):
                         raise ValueError("routing provider returned invalid support state")
@@ -203,9 +208,9 @@ def handler(db: str, project_id: str, root: str, token: str, participant_tokens=
                         self.send_body(409, "application/json", json.dumps({"state":"unsupported", "support":support}).encode())
                         return
                     result = routing_provider.compare_and_swap(body["revision"], {"model":body["model"], "effort":body["effort"]})
-                    if not isinstance(result, dict) or not isinstance(result.get("saved"), bool):
+                    if not valid_write(result):
                         raise ValueError("routing provider returned invalid write state")
-                    self.send_body(200 if result.get("saved") else 409, "application/json", json.dumps(result, separators=(",", ":")).encode())
+                    self.send_body(200 if result["state"] == "saved" else 409, "application/json", json.dumps(result, separators=(",", ":")).encode())
                 except (InvalidEvent, OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
                     self.send_body(400, "application/json", b'{"error":"invalid policy request"}')
                 return

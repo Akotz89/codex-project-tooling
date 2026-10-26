@@ -36,5 +36,27 @@ def valid_policy(value: Any) -> bool:
 
 
 def valid_support(value: Any) -> bool:
-    return (isinstance(value, dict) and isinstance(value.get("combined_supported"), bool)
-            and value.get("state") in {"supported", "unsupported"})
+    if (not isinstance(value, dict) or not isinstance(value.get("combined_supported"), bool)
+            or value.get("state") not in {"supported", "unsupported"}
+            or (value["state"] == "supported") != value["combined_supported"]):
+        return False
+    if "reason" in value and value["reason"] is not None and not isinstance(value["reason"], str):
+        return False
+    if "catalog_generated_at" in value and not isinstance(value["catalog_generated_at"], str):
+        return False
+    if "models" in value and (not isinstance(value["models"], dict) or any(
+            not isinstance(model, str) or not isinstance(efforts, list)
+            or any(not isinstance(effort, str) for effort in efforts)
+            for model, efforts in value["models"].items())):
+        return False
+    return True
+
+
+def valid_write(value: Any) -> bool:
+    if (not isinstance(value, dict) or value.get("state") not in {"saved", "failed", "unsupported"}
+            or not isinstance(value.get("saved"), bool) or not isinstance(value.get("applied"), bool)
+            or not isinstance(value.get("revision"), str) or not value["revision"]
+            or ("error" in value and not isinstance(value["error"], str))):
+        return False
+    return ((value["state"] == "saved") == value["saved"]
+            and (value["saved"] or not value["applied"]))
