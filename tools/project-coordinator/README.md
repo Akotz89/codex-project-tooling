@@ -4,6 +4,18 @@ Local LangGraph StateGraph (`transition → readiness`) with synchronous SqliteS
 
 Run `uv sync --locked` then `project-coordinator --db work/<run>/state/coordinator.sqlite COMMAND --input EVENT.json`. Every command outputs compact JSON; errors exit 2. Import `project_coordinator.apply_event(db,event, *, guard_context=None, project_policy=None)` with the same contract plus `op`; new prepare/issue transitions require the explicit guard context below.
 
+## Saved routing provider
+
+`serve` may receive `--routing-policy-provider PATH`. The resolved module must
+remain under the bound `--root` and export `create_provider(project_root)` with
+typed `read_policy`, `support`, and revision-checked `compare_and_swap` methods.
+The owner-only `/api/routing-policy` GET and POST routes use this provider;
+participant credentials cannot read or write it. Policy remains caller-owned
+and is never stored in coordinator SQLite. A provider must report unsupported
+unless it can prove the installed consumer enforces both model and effort.
+Other CLI commands do not load this module. Existing `--project-policy` remains
+limited to report-role and legacy-claim registration.
+
 ## Exact event contract
 
 Every mutating command requires a unique `event_id` string. Identical event IDs and canonical payloads return REPLAY; altered payloads with the same ID are rejected. A replay never exposes native arguments again. Status/summary/recover need no event ID.

@@ -864,6 +864,30 @@ def test_owner_bearer_cannot_be_reused_as_participant_credential(h):
               token=owner, participant_tokens={"worker-1": owner})
 
 
+def test_routing_policy_api_is_owner_only_and_refuses_unsupported_writes(h):
+    class Provider:
+        def __init__(self): self.policy = {"model": None, "effort": None, "revision": "r0"}
+        def read_policy(self): return dict(self.policy)
+        def support(self): return {"combined_supported": False, "state": "unsupported"}
+        def compare_and_swap(self, revision, selection): raise AssertionError("unsupported write reached provider")
+    provider = Provider()
+    owner = "owner-routing-token-that-is-long-enough"
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler(str(h.db), h.binding["project_id"], h.binding["root"], owner, routing_provider=provider))
+    thread = Thread(target=server.serve_forever, daemon=True); thread.start()
+    base = f"http://127.0.0.1:{server.server_port}/api/routing-policy"
+    try:
+        with pytest.raises(HTTPError) as denied: urlopen(base)
+        assert denied.value.code == 401
+        request = Request(base, headers={"Authorization": f"Bearer {owner}"})
+        assert json.loads(urlopen(request).read())["support"]["state"] == "unsupported"
+        write = Request(base, data=json.dumps({"revision":"r0", "model":"gpt-6-luna", "effort":"medium"}).encode(),
+                        method="POST", headers={"Authorization": f"Bearer {owner}", "Content-Type":"application/json"})
+        with pytest.raises(HTTPError) as refused: urlopen(write)
+        assert refused.value.code == 409 and provider.read_policy()["revision"] == "r0"
+    finally:
+        server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+
 def test_non_ascii_authorization_and_configured_tokens_are_rejected_safely(h):
     owner = "safe-owner-token-that-is-long-enough"
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler(str(h.db), h.binding["project_id"], h.binding["root"], owner))
@@ -894,6 +918,14 @@ def test_browser_renders_project_report_source_and_evidence_links():
     assert r"if(/^https?:\/\//i.test(ref))u=new URL(ref)" in append_links
     assert "appendLinks(card,[ref.path],taskId)" in page
     assert "setAttribute('role','img')" in page and "Dependency graph with ${nodes.length} nodes" in page
+
+
+def test_browser_renders_saved_routing_controls_and_disables_unsupported_policy():
+    page = Path(runtime.__file__).with_name("status.html").read_text()
+    assert "Saved routing policy" in page
+    assert "Combined model and effort saving is unsupported" in page
+    assert "save.disabled=model.disabled=effort.disabled=true" in page
+    assert "fetch('/api/routing-policy'" in page
 
 
 def test_browser_exposes_directed_instruction_and_opens_selected_task_detail():

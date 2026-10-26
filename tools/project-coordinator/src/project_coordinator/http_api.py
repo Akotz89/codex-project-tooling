@@ -9,12 +9,13 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from .runtime import InvalidEvent, apply_event, read_declared_reference, read_model, task_bundle, read_updates, worker_role, validate_project_policy
+from .routing_policy import valid_policy, valid_support
 
 
 PAGE = Path(__file__).with_name("status.html")
 
 
-def handler(db: str, project_id: str, root: str, token: str, participant_tokens=None, project_policy=None):
+def handler(db: str, project_id: str, root: str, token: str, participant_tokens=None, project_policy=None, routing_provider=None):
     participant_tokens = participant_tokens or {}
 
     def token_matches(candidate, expected):
@@ -75,7 +76,7 @@ def handler(db: str, project_id: str, root: str, token: str, participant_tokens=
             auth = self.headers.get("Authorization", "")
             actor = participant_role(auth)
             owner = token_matches(auth, f"Bearer {token}")
-            known = parsed.path in {"/api/status", "/api/graph", "/api/updates"} or parsed.path.startswith("/api/tasks/")
+            known = parsed.path in {"/api/status", "/api/graph", "/api/updates", "/api/routing-policy"} or parsed.path.startswith("/api/tasks/")
             if not known:
                 self.send_body(404, "application/json", b'{"error":"unauthorized or unknown route"}')
                 return
@@ -84,6 +85,18 @@ def handler(db: str, project_id: str, root: str, token: str, participant_tokens=
                 self.send_body(401, "application/json", b'{"error":"unauthorized or unknown route"}')
                 return
             try:
+                if parsed.path == "/api/routing-policy":
+                    if not owner or routing_provider is None:
+                        self.send_body(404 if routing_provider is None else 401, "application/json", b'{"error":"unavailable"}')
+                        return
+                    support = routing_provider.support()
+                    policy = routing_provider.read_policy()
+                    if not valid_policy(policy) or not valid_support(support):
+                        raise ValueError("routing provider returned an invalid typed result")
+                    result = {"policy": policy, "support": support,
+                              "revision": policy.get("revision") if isinstance(policy, dict) else None}
+                    self.send_body(200, "application/json; charset=utf-8", json.dumps(result, separators=(",", ":")).encode())
+                    return
                 query = parse_qs(parsed.query, strict_parsing=True) if parsed.query else {}
                 allowed = {"offset", "limit", "report_offset", "report_limit", "project_report_offset", "project_report_limit", "role", "thread_id", "after_revision"}
                 if set(query) - allowed or any(len(v) != 1 for v in query.values()):
@@ -168,6 +181,34 @@ def handler(db: str, project_id: str, root: str, token: str, participant_tokens=
 
         def do_POST(self):
             route = urlsplit(self.path).path
+            if route == "/api/routing-policy":
+                auth = self.headers.get("Authorization", "")
+                if not auth.startswith("Bearer ") or not token_matches(auth[7:], token):
+                    self.send_body(401, "application/json", b'{"error":"unauthorized"}')
+                    return
+                if routing_provider is None:
+                    self.send_body(404, "application/json", b'{"error":"unavailable"}')
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if length < 1 or length > 8192:
+                        raise ValueError("invalid body length")
+                    body = json.loads(self.rfile.read(length), object_pairs_hook=_unique_object)
+                    if not isinstance(body, dict) or set(body) != {"revision", "model", "effort"}:
+                        raise ValueError("invalid policy request")
+                    support = routing_provider.support()
+                    if not valid_support(support):
+                        raise ValueError("routing provider returned invalid support state")
+                    if not support.get("combined_supported"):
+                        self.send_body(409, "application/json", json.dumps({"state":"unsupported", "support":support}).encode())
+                        return
+                    result = routing_provider.compare_and_swap(body["revision"], {"model":body["model"], "effort":body["effort"]})
+                    if not isinstance(result, dict) or not isinstance(result.get("saved"), bool):
+                        raise ValueError("routing provider returned invalid write state")
+                    self.send_body(200 if result.get("saved") else 409, "application/json", json.dumps(result, separators=(",", ":")).encode())
+                except (InvalidEvent, OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+                    self.send_body(400, "application/json", b'{"error":"invalid policy request"}')
+                return
             if route not in {"/api/participant/report", "/api/participant/project-report"}:
                 self.send_response(405)
                 self.send_header("Allow", "GET")
@@ -242,7 +283,7 @@ def _unique_object(pairs):
     return result
 
 
-def serve(db: str, project_id: str, root: str, host: str, port: int, token: str | None = None, participant_tokens=None, project_policy=None):
+def serve(db: str, project_id: str, root: str, host: str, port: int, token: str | None = None, participant_tokens=None, project_policy=None, routing_provider=None):
     token = token or os.environ.get("PROJECT_COORDINATOR_TOKEN")
     if (not isinstance(token, str) or len(token) < 24 or not token.isascii()
             or any(ord(char) < 33 or ord(char) > 126 for char in token)):
@@ -273,7 +314,7 @@ def serve(db: str, project_id: str, root: str, host: str, port: int, token: str 
             allowed_roles.update(item["role"] for item in policy.get("project_report_registrations", []))
         if set(participant_tokens) - allowed_roles:
             raise InvalidEvent("participant tokens include an unregistered role")
-    server = ThreadingHTTPServer((host, port), handler(db, project_id, root, token, participant_tokens, project_policy))
+    server = ThreadingHTTPServer((host, port), handler(db, project_id, root, token, participant_tokens, project_policy, routing_provider))
     try:
         print(f"owner status API listening on http://{host}:{server.server_port}/", flush=True)
         server.serve_forever()
