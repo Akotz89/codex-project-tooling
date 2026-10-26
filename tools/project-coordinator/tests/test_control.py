@@ -326,6 +326,8 @@ def test_register_preserves_all_old_bytes_and_skips_external_readiness(h, monkey
     assert response['action'] == 'REGISTERED' and 'native_request' not in response
     assert after['project']['workers'].pop('researcher') == REGISTERED_THREAD
     assert after['workers'].pop('researcher') == {'state': 'UNKNOWN', 'evidence': register_event(h)['evidence']}
+    assert after['revision'] == before['revision'] + 1
+    after['revision'] = before['revision']
     audit = after['events'].pop('register-researcher')
     assert audit['action'] == 'REGISTERED'
     assert canonical_bytes(after) == canonical_bytes(before)
@@ -487,6 +489,7 @@ def test_schema_accepts_safe_project_roles_and_explicit_project_policy():
 
     schema = json.loads((Path(__file__).resolve().parents[1] / 'schema.json').read_text(), object_pairs_hook=unique_keys)
     assert 'register' in schema['properties']['op']['enum']
+    assert 'refresh_references' in schema['properties']['op']['enum']
     assert 'report' in schema['properties']['op']['enum']
     assert schema['properties']['occurred_at']['maxLength'] == 64
     assert schema['properties']['report_offset']['minimum'] == 0
@@ -497,9 +500,15 @@ def test_schema_accepts_safe_project_roles_and_explicit_project_policy():
     assert '^[a-z][a-z0-9_-]{0,63}$' in schema['$defs']['project']['properties']['workers']['patternProperties']
     assert schema['$defs']['projectPolicy']['additionalProperties'] is False
     report = next(rule['then'] for rule in schema['allOf'] if rule['if']['properties']['op'].get('const') == 'report')
+    assert [shape['type'] for shape in schema['properties']['evidence']['oneOf']] == ['string', 'array']
     assert report['properties']['state'] == {'type': 'string', 'minLength': 1, 'maxLength': 512}
     assert report['properties']['evidence']['type'] == 'array'
+    assert report['properties']['evidence']['minItems'] == 1
     assert report['properties']['evidence']['items'] == {'type': 'string', 'minLength': 1, 'maxLength': 512}
+    refresh = next(rule['then'] for rule in schema['allOf'] if rule['if']['properties']['op'].get('const') == 'refresh_references')
+    assert set(refresh['required']) == {'event_id', 'project_id', 'root', 'task_id', 'source_digest', 'scope_digest',
+                                        'expected_reference_revision', 'expected_reference_digest',
+                                        'reference_revision', 'references'}
     observe = next(rule['then'] for rule in schema['allOf'] if rule['if']['properties']['op'].get('const') == 'observe')
     assert observe['properties']['state']['enum'] == ['IDLE', 'BUSY', 'UNKNOWN']
     assert observe['properties']['evidence']['type'] == 'string'
