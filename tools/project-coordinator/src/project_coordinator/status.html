@@ -12,27 +12,38 @@
 <button id="refresh">Refresh</button>
 <p id="freshness" class="muted" aria-live="polite">Not yet loaded.</p>
 <main id="view"></main>
-<section id="routing"><h2>Saved routing policy</h2><p id="routing-state" aria-live="polite">Loading support state…</p><label>Model <input id="routing-model" disabled></label><label>Effort <input id="routing-effort" disabled></label><button id="routing-save" disabled>Save model and effort</button></section>
+<section id="routing"><h2>Saved routing policy</h2><p id="routing-state" aria-live="polite">Loading support state…</p><label>Model <select id="routing-model" disabled></select></label><label>Effort <select id="routing-effort" disabled></select></label><button id="routing-save" disabled>Save model and effort</button></section>
 <script>
 const token=document.querySelector('#token'),view=document.querySelector('#view'),freshness=document.querySelector('#freshness');
 let taskOffset=0,reportOffset=0,projectReportOffset=0,selectedTask='';
 function node(tag,text){const el=document.createElement(tag);el.textContent=text;return el}
 async function api(path){const r=await fetch(path,{headers:{Authorization:`Bearer ${token.value}`},cache:'no-store'});if(!r.ok)throw Error(`API returned ${r.status}`);return r.json()}
-async function loadRouting(){
+async function loadRouting(outcome=''){
  const state=document.querySelector('#routing-state'),model=document.querySelector('#routing-model'),effort=document.querySelector('#routing-effort'),save=document.querySelector('#routing-save');
  try{
   const data=await api('/api/routing-policy'),supported=Boolean(data.support?.combined_supported);
-  state.textContent=supported?'Saved policy is supported.':'Combined model and effort saving is unsupported by the installed consumer.';
-  model.disabled=effort.disabled=save.disabled=!supported;model.value=data.policy?.model||'';effort.value=data.policy?.effort||'';
+  const supportMessage=supported?'Saved policy is supported.':'Combined model and effort saving is unsupported by the installed consumer.';
+  state.textContent=outcome?`${outcome} ${supportMessage}`:supportMessage;
+  const choices=data.support?.models||{};
+  model.replaceChildren(...Object.keys(choices).map(value=>new Option(value,value)));
+  const updateEfforts=()=>effort.replaceChildren(...(choices[model.value]||[]).map(value=>new Option(value,value)));
+  model.onchange=updateEfforts;
+  model.value=choices[data.policy?.model]?data.policy.model:Object.keys(choices)[0]||'';
+  updateEfforts();effort.value=(choices[model.value]||[]).includes(data.policy?.effort)?data.policy.effort:effort.options[0]?.value||'';
+  model.disabled=effort.disabled=save.disabled=!supported;
   save.onclick=async()=>{
    save.disabled=true;
    try{
     const response=await fetch('/api/routing-policy',{method:'POST',headers:{Authorization:`Bearer ${token.value}`,'Content-Type':'application/json'},body:JSON.stringify({revision:data.revision,model:model.value,effort:effort.value})});
-    const result=await response.json();state.textContent=result.state|| (response.ok?'Saved; application status is provider reported.':'Save failed or conflicted.');
-    await loadRouting();
+    const result=await response.json();
+    const conflict=result.state==='failed'&&result.error==='revision conflict';
+    const outcome=response.ok&&result.state==='saved'&&result.saved===true&&typeof result.applied==='boolean'
+     ?`Saved. Applied: ${result.applied?'yes':'no'}.`
+     :`Save ${conflict?'conflicted':result.state||'failed'}${result.error?`: ${result.error}`:''}.`;
+    await loadRouting(outcome);
    }catch(error){state.textContent=error.message;save.disabled=true}
   };
- }catch(e){state.textContent=e.message;save.disabled=model.disabled=effort.disabled=true}
+ }catch(e){state.textContent=outcome?`${outcome} Refresh failed: ${e.message}`:e.message;save.disabled=model.disabled=effort.disabled=true}
 }
 function nav(label,offset,kind){const el=node('button',label);el.onclick=()=>{if(kind==='tasks')taskOffset=offset;else if(kind==='reports')reportOffset=offset;else projectReportOffset=offset;refresh()};return el}
 function appendLinks(card,refs,taskId=null){for(const ref of refs){let u;try{if(/^https?:\/\//i.test(ref))u=new URL(ref)}catch{}if(u&&['http:','https:'].includes(u.protocol)){const a=node('a',ref);a.href=u.href;a.rel='noreferrer noopener';card.append(a,node('br',''));continue}if(taskId){const button=node('button','Download declared local evidence');button.onclick=async()=>{button.disabled=true;try{const bundle=await api(`/api/tasks/${encodeURIComponent(taskId)}/bundle`),declared=bundle.references.find(x=>x.path===ref);if(!declared){button.replaceWith(node('span',`Local evidence not declared for task: ${ref}`));return}const response=await fetch(`/api/tasks/${encodeURIComponent(taskId)}/references/${encodeURIComponent(declared.task_id)}/${encodeURIComponent(declared.id)}`,{headers:{Authorization:`Bearer ${token.value}`,Accept:'text/plain'},cache:'no-store'});if(!response.ok)throw Error(`Evidence returned ${response.status}`);const blob=await response.blob(),url=URL.createObjectURL(blob),a=node('a',`Download ${declared.path}`);a.href=url;a.download=declared.path.split('/').pop();a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);button.replaceWith(a)}catch(e){button.replaceWith(node('span',`Local evidence unavailable: ${e.message}`))}};card.append(button,node('br',''))}else card.append(node('span',`Local evidence not linked (no declared task reference): ${ref}`),node('br',''))}}

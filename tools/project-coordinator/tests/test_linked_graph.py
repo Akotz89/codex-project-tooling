@@ -951,6 +951,21 @@ def test_browser_renders_saved_routing_controls_and_disables_unsupported_policy(
     assert "finally{save.disabled=!supported}" not in page
 
 
+def test_browser_preserves_routing_write_outcome_after_support_refresh():
+    page = Path(runtime.__file__).with_name("status.html").read_text()
+    load = page.split("async function loadRouting", 1)[1].split("\nfunction nav", 1)[0]
+    assert "async function loadRouting(outcome='')" in page
+    assert "state.textContent=outcome?`${outcome} ${supportMessage}`:supportMessage" in load
+    assert "Saved. Applied: ${result.applied?'yes':'no'}." in load
+    assert "conflict=result.state==='failed'&&result.error==='revision conflict'" in load
+    assert "await loadRouting(outcome)" in load
+    assert "model.disabled=effort.disabled=save.disabled=!supported" in load
+    assert "outcome?`${outcome} Refresh failed: ${e.message}`:e.message" in load
+    assert '<select id="routing-model" disabled></select>' in page
+    assert '<select id="routing-effort" disabled></select>' in page
+    assert "data.support?.models||{}" in load and "choices[model.value]" in load
+
+
 def test_browser_exposes_directed_instruction_and_opens_selected_task_detail():
     page = Path(runtime.__file__).with_name("status.html").read_text()
     show_bundle = page.split("async function showBundle", 1)[1].split("\nasync function refresh", 1)[0]
