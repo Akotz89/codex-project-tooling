@@ -1071,7 +1071,7 @@ def transition(state):
             task.setdefault("references", [])
             for ref in task["references"]:
                 ref.setdefault("depends_on", [])
-                ref.setdefault("dependency_status", "unknown")
+                ref.setdefault("dependency_status", "dynamic" if ref["dynamic"] else "unknown")
             reject_reference_cycles(task["references"])
             known_ids = {ref["id"] for ref in task["references"]}
             require(all(dep["id"] in known_ids for ref in task["references"] if ref["dependency_status"] == "known"
@@ -1302,6 +1302,7 @@ def transition(state):
         if task is not None and response["action"] not in {"RECONCILE", "REUSE"}:
             task["revision"] = revision
             task["last_event_role"] = actor_role
+            task["last_event_id"] = event["event_id"]
         if op == "report" and model.get("reports"):
             model["reports"][-1]["revision"] = revision
         if op == "project_report" and model.get("project_reports"):
@@ -1317,10 +1318,22 @@ def compute_readiness(state):
     model = copy.deepcopy(state["model"])
     if state.get("event", {}).get("op") == "register":
         return {"model": model}
+    event = state.get("event", {})
+    event_id = event.get("event_id")
+    revision = model.get("revision", 0)
+    actor_role = event.get("reporter") or event.get("worker") or "coordinator"
     for task in model["tasks"].values():
         if task["status"] in {"WAIT", "READY"}:
-            task["reasons"] = readiness(model, task)
-            task["status"] = "WAIT" if task["reasons"] else "READY"
+            previous_status = task["status"]
+            previous_reasons = task.get("reasons", [])
+            reasons = readiness(model, task)
+            status = "WAIT" if reasons else "READY"
+            task["reasons"] = reasons
+            task["status"] = status
+            if event_id and (status != previous_status or reasons != previous_reasons):
+                task["revision"] = revision
+                task["last_event_role"] = actor_role
+                task["last_event_id"] = event_id
     return {"model": model}
 
 
@@ -1587,20 +1600,21 @@ def read_updates(model, event, project_policy=None):
         for task in model["tasks"].values():
             if (task.get("revision", 0) > after and task.get("last_event_role") != role
                     and task["id"] not in reports_by_task):
-                event_id = next((eid for eid, info in model.get("events", {}).items()
+                event_id = task.get("last_event_id") or next((eid for eid, info in model.get("events", {}).items()
                                  if info.get("task_id") == task["id"] and info.get("revision") == task["revision"]), None)
                 updates.append({"event_id": event_id, "task_id": task["id"],
                                 "role": task.get("last_event_role", "coordinator"), "kind": "task_state",
-                                "status": task["status"], "revision": task["revision"]})
+                                "status": task["status"], "reasons": task.get("reasons", []),
+                                "revision": task["revision"]})
     elif role in model["project"]["workers"]:
         require(model["project"]["workers"].get(role) == thread_id, "worker thread binding mismatch")
         updates = []
         for task_id, task in model["tasks"].items():
             if task["worker"] == role and task.get("revision", 0) > after and task.get("last_event_role") != role:
-                event_id = next((eid for eid, info in model.get("events", {}).items()
+                event_id = task.get("last_event_id") or next((eid for eid, info in model.get("events", {}).items()
                                  if info.get("task_id") == task_id and info.get("revision") == task["revision"]), None)
                 updates.append({"event_id": event_id, "task_id": task_id, "role": role, "status": task["status"],
-                                "revision": task["revision"], "kind": "task_state"})
+                                "reasons": task.get("reasons", []), "revision": task["revision"], "kind": "task_state"})
         relevant = {}
         for report in model.get("project_reports", []):
             task = next((t for t in model["tasks"].values() if work_item_matches(report.get("work_item"), t)), None)

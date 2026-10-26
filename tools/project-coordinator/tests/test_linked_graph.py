@@ -77,6 +77,16 @@ def test_null_hash_nondynamic_references_are_unavailable_even_when_files_exist(h
         "present": "unavailable", "missing": "unavailable", "dynamic": "dynamic"}
 
 
+def test_add_defaults_omitted_dynamic_dependency_status_to_dynamic(h):
+    add(h, "dynamic-default", references=[{
+        "id": "generated", "kind": "source", "path": "generated.py", "sha256": None,
+        "revision": None, "updated_at": None, "required": False, "dynamic": True,
+    }])
+    bundle = h.call("bundle", task_id="dynamic-default")
+    assert bundle["references"][0]["dependency_status"] == "dynamic"
+    assert {edge["status"] for edge in bundle["unknown_edges"]} == {"dynamic"}
+
+
 def test_legacy_task_is_unindexed_until_references_are_cas_attached_to_existing_dispatch(h):
     (h.root / "source.py").write_text("pinned source")
     h.add("legacy")
@@ -562,6 +572,7 @@ def test_worker_receives_current_terminal_task_state_not_old_blocker(h):
     assert update["changed"]
     assert update["updates"] == [{"event_id": update["updates"][0]["event_id"], "task_id": "A",
                                   "role": "worker-1", "kind": "task_state", "status": "COMPLETE",
+                                  "reasons": [],
                                   "revision": update["revision"]}]
     assert update["updates"][0]["event_id"] != "obsolete-blocker"
 
@@ -573,6 +584,27 @@ def test_assignment_update_is_delivered_once_to_the_assigned_role(h):
     assert update["changed"] and update["updates"][0]["task_id"] == "assigned"
     assert update["updates"][0]["kind"] == "task_state"
     assert not h.call("updates", role="worker-1", thread_id="thread1", after_revision=update["revision"])["changed"]
+
+
+def test_readiness_change_stamps_dependent_task_for_its_role_update(h):
+    add(h, "prerequisite", worker="worker-1")
+    add(h, "dependent", worker="worker-2", dependencies=["prerequisite"])
+    cursor = h.call("summary")["revision"]
+    dispatch = h.issue("prerequisite")
+    result = h.result(dispatch, "prerequisite")
+    model, _ = read_model(h.db, h.binding)
+    dependent = model["tasks"]["dependent"]
+    result_event_id = next(event_id for event_id, info in model["events"].items()
+                           if info.get("task_id") == "prerequisite" and info.get("revision") == result["revision"])
+    assert dependent["status"] == "READY"
+    assert dependent["revision"] == result["revision"]
+    assert dependent["last_event_id"] == result_event_id
+
+    update = h.call("updates", role="worker-2", thread_id="thread2", after_revision=cursor)
+    task_update = next(item for item in update["updates"] if item["task_id"] == "dependent")
+    assert update["changed"]
+    assert task_update["event_id"] == result_event_id
+    assert task_update["status"] == "READY" and task_update["revision"] == result["revision"]
 
 
 def test_participant_api_accepts_only_bound_own_report_and_retries_idempotently(h):

@@ -59,7 +59,10 @@
     "occurred_at": {"type": "string", "format": "date-time", "maxLength": 64},
     "detail": {"type": "string", "minLength": 1, "maxLength": 2000},
     "source": {"type": "string", "minLength": 1, "maxLength": 512},
-    "evidence": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "minLength": 1, "maxLength": 512}},
+    "evidence": {"oneOf": [
+      {"type": "string", "minLength": 1},
+      {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "minLength": 1, "maxLength": 512}}
+    ]},
     "claim_id": {"type": "string", "minLength": 1},
     "dispatch_id": {
       "type": "string"

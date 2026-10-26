@@ -500,6 +500,7 @@ def test_schema_accepts_safe_project_roles_and_explicit_project_policy():
     assert '^[a-z][a-z0-9_-]{0,63}$' in schema['$defs']['project']['properties']['workers']['patternProperties']
     assert schema['$defs']['projectPolicy']['additionalProperties'] is False
     report = next(rule['then'] for rule in schema['allOf'] if rule['if']['properties']['op'].get('const') == 'report')
+    assert [shape['type'] for shape in schema['properties']['evidence']['oneOf']] == ['string', 'array']
     assert report['properties']['state'] == {'type': 'string', 'minLength': 1, 'maxLength': 512}
     assert report['properties']['evidence']['type'] == 'array'
     assert report['properties']['evidence']['minItems'] == 1
