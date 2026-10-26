@@ -495,7 +495,7 @@ def test_root_directs_latest_updates_only_to_registered_project_roles(h):
               "reporter": "coordinator", "reporter_thread_id": "root", "kind": "result",
               "occurred_at": datetime.now(timezone.utc).isoformat(), "state": "current",
               "detail": "Latest accepted outcome", "source": "linear:CPI-415", "evidence": ["evidence:latest"],
-              "recipients": ["product_owner", "scrum_master"]}
+              "recipients": ["product_owner", "scrum_master", "worker-1"]}
     apply_event(h.db, {**common, "event_id": "root-directed-latest"}, project_policy=policy)
     po_model, _ = read_model(h.db, h.binding)
     from project_coordinator.runtime import read_updates
@@ -507,12 +507,29 @@ def test_root_directs_latest_updates_only_to_registered_project_roles(h):
     assert [item["event_id"] for item in sm["updates"]] == ["root-directed-latest"]
     assert not read_updates(po_model, {"role": "product_owner", "thread_id": "po-thread",
                                        "after_revision": po["revision"]}, project_policy=policy)["changed"]
+    worker = read_updates(po_model, {"role": "worker-1", "thread_id": "thread1", "after_revision": cursor},
+                         project_policy=policy)
+    assert [item["event_id"] for item in worker["updates"]] == ["root-directed-latest"]
+    assert not read_updates(po_model, {"role": "worker-1", "thread_id": "thread1",
+                                       "after_revision": worker["revision"]}, project_policy=policy)["changed"]
     bundle = apply_event(h.db, {**h.binding, "op": "bundle", "task_id": "A",
                                 "role": "product_owner", "thread_id": "po-thread"}, project_policy=policy)
     assert bundle["directed_reports"][0]["event_id"] == "root-directed-latest"
+    worker_bundle = apply_event(h.db, {**h.binding, "op": "bundle", "task_id": "A",
+                                       "role": "worker-1", "thread_id": "thread1"}, project_policy=policy)
+    directed = po_model["project_reports"][-1]
+    assert worker_bundle["directed_reports"] == [directed]
+    assert {key: worker_bundle["directed_reports"][0][key]
+            for key in ("state", "detail", "source", "evidence")} == {
+                key: common[key] for key in ("state", "detail", "source", "evidence")}
+    owner_bundle = apply_event(h.db, {**h.binding, "op": "bundle", "task_id": "A"}, project_policy=policy)
+    assert owner_bundle["directed_reports"] == [directed]
     with pytest.raises(InvalidEvent, match="caller binding"):
         apply_event(h.db, {**h.binding, "op": "bundle", "task_id": "A",
                            "role": "product_owner", "thread_id": "wrong"}, project_policy=policy)
+    with pytest.raises(InvalidEvent, match="task bundle role does not own"):
+        apply_event(h.db, {**h.binding, "op": "bundle", "task_id": "A",
+                           "role": "worker-2", "thread_id": "thread2"}, project_policy=policy)
     with pytest.raises(InvalidEvent, match="worker recipient must own"):
         apply_event(h.db, {**common, "event_id": "root-directed-wrong-worker", "recipients": ["worker-2"]},
                     project_policy=policy)
@@ -520,10 +537,13 @@ def test_root_directs_latest_updates_only_to_registered_project_roles(h):
     with pytest.raises(InvalidEvent, match="exactly one bound task"):
         apply_event(h.db, {**common, "event_id": "root-directed-ambiguous", "work_item": "CPI-415"},
                     project_policy=policy)
+    owner_token = "owner-token-long-enough-123456"
     po_token, sm_token = "product-owner-token-long-enough-123", "scrum-master-token-long-enough-123"
+    worker_token, other_worker_token = "worker-one-token-long-enough-123", "worker-two-token-long-enough-123"
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler(
-        str(h.db), h.binding["project_id"], h.binding["root"], "owner-token-long-enough-123456",
-        {"product_owner": po_token, "scrum_master": sm_token}, policy))
+        str(h.db), h.binding["project_id"], h.binding["root"], owner_token,
+        {"product_owner": po_token, "scrum_master": sm_token,
+         "worker-1": worker_token, "worker-2": other_worker_token}, policy))
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
     base = f"http://127.0.0.1:{server.server_port}"
@@ -540,6 +560,17 @@ def test_root_directs_latest_updates_only_to_registered_project_roles(h):
             f"{base}/api/tasks/A/bundle?role=product_owner&thread_id=po-thread",
             headers={"Authorization": f"Bearer {po_token}"})).read())
         assert role_bundle["directed_reports"][0]["event_id"] == "root-directed-latest"
+        owner_bundle = json.loads(urlopen(Request(f"{base}/api/tasks/A/bundle",
+                                                  headers={"Authorization": f"Bearer {owner_token}"})).read())
+        assert owner_bundle["directed_reports"] == [directed]
+        worker_role_bundle = json.loads(urlopen(Request(
+            f"{base}/api/tasks/A/bundle?role=worker-1&thread_id=thread1",
+            headers={"Authorization": f"Bearer {worker_token}"})).read())
+        assert worker_role_bundle["directed_reports"] == [directed]
+        with pytest.raises(HTTPError) as wrong_worker:
+            urlopen(Request(f"{base}/api/tasks/A/bundle?role=worker-2&thread_id=thread2",
+                            headers={"Authorization": f"Bearer {other_worker_token}"}))
+        assert wrong_worker.value.code == 400
         with pytest.raises(HTTPError) as unrelated_task:
             urlopen(Request(f"{base}/api/tasks/B/bundle?role=product_owner&thread_id=po-thread",
                             headers={"Authorization": f"Bearer {po_token}"}))
@@ -845,6 +876,23 @@ def test_browser_renders_project_report_source_and_evidence_links():
     assert r"if(/^https?:\/\//i.test(ref))u=new URL(ref)" in append_links
     assert "appendLinks(card,[ref.path],taskId)" in page
     assert "setAttribute('role','img')" in page and "Dependency graph with ${nodes.length} nodes" in page
+
+
+def test_browser_exposes_directed_instruction_and_opens_selected_task_detail():
+    page = Path(runtime.__file__).with_name("status.html").read_text()
+    show_bundle = page.split("async function showBundle", 1)[1].split("\nasync function refresh", 1)[0]
+    assert "bundle.directed_reports" in show_bundle
+    assert all(field in show_bundle for field in
+               ("report.state", "report.detail", "report.reporter", "report.reporter_thread_id",
+                "report.source", "report.evidence"))
+    assert "drawGraph(bundle.graph)" in show_bundle
+    assert "detail.focus({preventScroll:true})" in show_bundle
+    assert "detail.scrollIntoView({block:'start',behavior:'smooth'})" in show_bundle
+    refresh = page.split("async function refresh", 1)[1]
+    assert "document.createElement('details')" in refresh
+    assert "node('summary',`Full project graph" in refresh
+    assert "graphSection.addEventListener('toggle'" in refresh
+    assert "graphSection.append(drawGraph(graph.graph))" in refresh
 
 
 def test_browser_local_relative_path_uses_declared_download_control_not_panel_link():

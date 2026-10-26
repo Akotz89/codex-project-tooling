@@ -775,10 +775,11 @@ def task_bundle(model, task_id, *, role=None, thread_id=None, project_policy=Non
         task_view["source_coverage"] = "declared" if task_view.get("references") else "unindexed"
     required_unknown_edges = [edge for edge in unknown_edges if edge.get("required", True)]
     directed_reports = []
-    if role is not None and role not in model["project"]["workers"]:
+    recipient_role = role if role is not None else model["tasks"][task_id]["worker"]
+    if recipient_role is not None:
         latest = None
         for report in model.get("project_reports", []):
-            if (role in report.get("recipients", [])
+            if (recipient_role in report.get("recipients", [])
                     and work_item_matches(report.get("work_item"), model["tasks"][task_id])
                     and (latest is None or report.get("revision", 0) > latest.get("revision", 0))):
                 latest = report
