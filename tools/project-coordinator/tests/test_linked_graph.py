@@ -1,18 +1,22 @@
 from datetime import datetime, timezone
+import copy
 import json
 from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
+import sys
 from threading import Thread
 from http.server import ThreadingHTTPServer
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import pytest
+from langgraph.checkpoint.sqlite import SqliteSaver
 
 import project_coordinator.runtime as runtime
 from project_coordinator.http_api import handler, serve
-from project_coordinator.runtime import InvalidEvent, apply_event, digest, materialize_bundle, project_graph, read_model, task_bundle
+from project_coordinator.runtime import InvalidEvent, apply_event, build_graph, digest, materialize_bundle, project_graph, read_model, task_bundle
 from test_runtime import h
 
 
@@ -98,12 +102,17 @@ def test_legacy_task_is_unindexed_until_references_are_cas_attached_to_existing_
     assert any(edge["status"] == "unindexed" and edge["required"] for edge in before["unknown_edges"])
     assert before["reference_state"]["revision"] is None
 
-    # Exercise a pre-feature checkpoint shape where the references key never existed.
-    old_model, _ = read_model(h.db, h.binding)
-    old_model["tasks"]["legacy"].pop("references", None)
-    old_model["tasks"]["legacy"].pop("reference_revision", None)
-    old_model["tasks"]["legacy"].pop("reference_digest", None)
-    old_bundle = task_bundle(old_model, "legacy")
+    # Persist a pre-feature checkpoint shape, then use the supported CLI refresh path.
+    with sqlite3.connect(h.db, check_same_thread=False) as conn:
+        graph = build_graph(SqliteSaver(conn))
+        config = {"configurable": {"thread_id": "project-coordinator-v1"}}
+        old_model = copy.deepcopy(graph.get_state(config).values["model"])
+        for field in ("references", "reference_revision", "reference_digest"):
+            old_model["tasks"]["legacy"].pop(field, None)
+        graph.update_state(config, {"model": old_model}, as_node="readiness")
+    persisted, _ = read_model(h.db, h.binding)
+    assert "references" not in persisted["tasks"]["legacy"]
+    old_bundle = task_bundle(persisted, "legacy")
     assert old_bundle["tasks"][-1]["source_coverage"] == "unindexed"
     assert not old_bundle["freshness"]["current"]
 
@@ -114,9 +123,16 @@ def test_legacy_task_is_unindexed_until_references_are_cas_attached_to_existing_
              "expected_reference_revision": before["reference_state"]["revision"],
              "expected_reference_digest": before["reference_state"]["digest"],
              "reference_revision": "source-index-r1", "references": [ref]}
-    result = apply_event(h.db, event)
-    assert result["action"] == "REFERENCES_REFRESHED"
-    assert apply_event(h.db, event)["action"] == "REPLAY"
+    input_path = h.root / "refresh-references.json"
+    input_path.write_text(json.dumps(event))
+    command = [sys.executable, "-m", "project_coordinator.cli", "--db", str(h.db),
+               "refresh-references", "--input", str(input_path)]
+    result = subprocess.run(command, text=True, capture_output=True)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["action"] == "REFERENCES_REFRESHED"
+    replay = subprocess.run(command, text=True, capture_output=True)
+    assert replay.returncode == 0, replay.stderr
+    assert json.loads(replay.stdout)["action"] == "REPLAY"
     after = h.call("bundle", task_id="legacy")
     attached = after["tasks"][-1]
     assert attached["source_coverage"] == "declared"
@@ -140,6 +156,8 @@ def test_materialization_skips_optional_unknown_edges_and_rejects_required_unkno
     add(h, "optional-unknown", references=[optional_unknown, optional_dynamic])
     optional_bundle = h.call("bundle", task_id="optional-unknown")
     assert optional_bundle["freshness"]["current"]
+    assert optional_bundle["freshness"]["required_unknown_edges"] == 0
+    assert {edge["status"] for edge in optional_bundle["unknown_edges"]} == {"unknown", "dynamic"}
     materialized = materialize_bundle(str(h.root), optional_bundle, "optional-out")
     assert materialized["written"] == []
     assert {item["status"] for item in materialized["skipped"]} == {"unknown_dependency", "dynamic"}
@@ -153,6 +171,20 @@ def test_materialization_skips_optional_unknown_edges_and_rejects_required_unkno
     with pytest.raises(InvalidEvent, match="required unknown"):
         materialize_bundle(str(h.root), required_bundle, "required-out")
     assert not (h.root / "required-out").exists()
+
+    (h.root / "current.py").write_text("current")
+    current_input = reference(h.root, "consumer-current-input", "source", "current.py")
+    add(h, "required-prerequisite", references=[required_unknown])
+    add(h, "required-consumer", dependencies=["required-prerequisite"], references=[current_input])
+    transitive_bundle = h.call("bundle", task_id="required-consumer")
+    assert [task["id"] for task in transitive_bundle["tasks"]] == ["required-prerequisite", "required-consumer"]
+    assert transitive_bundle["freshness"]["required_gaps"] == 0
+    assert transitive_bundle["freshness"]["required_unknown_edges"] == 1
+    reference_statuses = {ref["id"]: ref["status"] for ref in transitive_bundle["references"]}
+    assert reference_statuses["consumer-current-input"] == "current"
+    with pytest.raises(InvalidEvent, match="required unknown"):
+        materialize_bundle(str(h.root), transitive_bundle, "required-transitive-out")
+    assert not (h.root / "required-transitive-out").exists()
 
 
 def test_declared_reference_graph_resolves_transitive_file_closure(h):
