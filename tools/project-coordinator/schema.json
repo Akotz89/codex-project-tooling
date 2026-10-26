@@ -10,6 +10,7 @@
       "enum": [
         "init",
         "add",
+        "refresh_references",
         "observe",
         "prepare",
         "issue",
@@ -22,7 +23,10 @@
         "rebind",
         "summary",
         "register",
-        "report"
+        "report",
+        "project_report",
+        "bundle",
+        "updates"
       ]
     },
     "event_id": {
@@ -46,12 +50,16 @@
     "task_id": {
       "type": "string"
     },
+    "role": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,63}$"},
+    "thread_id": {"type": "string", "minLength": 1},
+    "after_revision": {"type": "integer", "minimum": 0},
     "reporter": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,63}$"},
     "reporter_thread_id": {"type": "string", "minLength": 1},
-    "kind": {"enum": ["lifecycle", "progress", "blocker", "handoff", "result"]},
+    "kind": {"enum": ["ack", "lifecycle", "progress", "blocker", "handoff", "result"]},
     "occurred_at": {"type": "string", "format": "date-time", "maxLength": 64},
     "detail": {"type": "string", "minLength": 1, "maxLength": 2000},
     "source": {"type": "string", "minLength": 1, "maxLength": 512},
+    "evidence": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "minLength": 1, "maxLength": 512}},
     "claim_id": {"type": "string", "minLength": 1},
     "dispatch_id": {
       "type": "string"
@@ -96,6 +104,11 @@
     "project_report_offset": {"type": "integer", "minimum": 0},
     "project_report_limit": {"type": "integer", "minimum": 1, "maximum": 100},
     "work_item": {"type": "string", "minLength": 1, "maxLength": 512},
+    "recipients": {"type": "array", "items": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,63}$"}, "uniqueItems": true},
+    "expected_reference_revision": {"type": ["string", "null"]},
+    "expected_reference_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "reference_revision": {"type": "string", "minLength": 1},
+    "references": {"type": "array", "items": {"$ref": "#/$defs/reference"}},
     "expected_workers": {
       "$ref": "#/$defs/project/properties/workers"
     }
@@ -202,7 +215,28 @@
             "type": "string",
             "minLength": 1
           }
+        },
+        "references": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/reference"}
         }
+      },
+      "additionalProperties": false
+    },
+    "reference": {
+      "type": "object",
+      "required": ["id", "kind", "path", "sha256", "revision", "updated_at", "required", "dynamic"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "kind": {"enum": ["source", "schema", "config", "test", "artifact", "evidence", "cleanup"]},
+        "path": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+"},
+        "sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "revision": {"type": ["string", "null"]},
+        "updated_at": {"type": ["string", "null"], "format": "date-time"},
+        "required": {"type": "boolean"},
+        "dynamic": {"type": "boolean"},
+        "depends_on": {"type": "array", "items": {"type": "object", "required": ["id", "type"], "properties": {"id": {"type": "string", "minLength": 1}, "type": {"enum": ["imports", "schema_ref", "configures", "tests", "uses", "requires"]}}, "additionalProperties": false}},
+        "dependency_status": {"enum": ["known", "unknown", "dynamic", "unavailable"]}
       },
       "additionalProperties": false
     },
@@ -339,6 +373,17 @@
           "root"
         ]
       }
+    },
+    {
+      "if": {"properties": {"op": {"const": "refresh_references"}}},
+      "then": {
+        "required": ["event_id", "project_id", "root", "task_id", "source_digest", "scope_digest", "expected_reference_revision", "expected_reference_digest", "reference_revision", "references"],
+        "propertyNames": {"enum": ["op", "event_id", "project_id", "root", "task_id", "source_digest", "scope_digest", "expected_reference_revision", "expected_reference_digest", "reference_revision", "references"]}
+      }
+    },
+    {
+      "if": {"properties": {"op": {"const": "project_report"}}},
+      "then": {"required": ["event_id", "project_id", "root", "work_item", "reporter", "reporter_thread_id", "kind", "occurred_at", "state", "detail", "source", "evidence"]}
     },
     {
       "if": {
@@ -580,6 +625,14 @@
       }
     },
     {
+      "if": {"properties": {"op": {"const": "bundle"}}},
+      "then": {"required": ["task_id", "project_id", "root"], "properties": {"role": {"type": "string"}, "thread_id": {"type": "string"}}}
+    },
+    {
+      "if": {"properties": {"op": {"const": "updates"}}},
+      "then": {"required": ["role", "thread_id", "project_id", "root"], "properties": {"after_revision": {"type": "integer", "minimum": 0}}}
+    },
+    {
       "if": {
         "properties": {
           "op": {
@@ -632,10 +685,10 @@
         "required": ["event_id", "project_id", "root", "task_id", "reporter", "reporter_thread_id", "kind", "occurred_at", "state", "detail", "source", "evidence", "claim_id"],
         "properties": {
           "state": {"type": "string", "minLength": 1, "maxLength": 512},
-          "evidence": {"type": "array", "maxItems": 16, "items": {"type": "string", "minLength": 1, "maxLength": 512}}
+          "evidence": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "minLength": 1, "maxLength": 512}}
         },
-        "propertyNames": {
-          "enum": ["op", "event_id", "project_id", "root", "task_id", "reporter", "reporter_thread_id", "kind", "occurred_at", "state", "detail", "source", "evidence", "claim_id", "dispatch_id"]
+          "propertyNames": {
+          "enum": ["op", "event_id", "project_id", "root", "task_id", "reporter", "reporter_thread_id", "kind", "occurred_at", "state", "detail", "source", "evidence", "claim_id", "dispatch_id", "source_digest"]
         }
       }
     },
@@ -650,7 +703,7 @@
           "source": {"type": "string", "minLength": 1, "maxLength": 512},
           "evidence": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "minLength": 1, "maxLength": 512}}
         },
-        "propertyNames": {"enum": ["op", "event_id", "project_id", "root", "work_item", "reporter", "reporter_thread_id", "kind", "occurred_at", "state", "detail", "source", "evidence"]}
+        "propertyNames": {"enum": ["op", "event_id", "project_id", "root", "work_item", "reporter", "reporter_thread_id", "kind", "occurred_at", "state", "detail", "source", "evidence", "recipients"]}
       }
     }
   ]

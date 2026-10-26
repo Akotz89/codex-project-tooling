@@ -351,6 +351,11 @@ def test_report_requires_bound_project_owner_and_matching_claim(h):
             apply_event(h.db, report(h, f"bad-{message}", **changes))
 
 
+def test_report_evidence_runtime_validation_matches_schema_minimum(h):
+    with pytest.raises(InvalidEvent, match="1-16 bounded links"):
+        apply_event(h.db, report(h, "report-without-evidence", evidence=[]))
+
+
 def test_loopback_api_auth_binding_read_only_and_browser_view(h):
     h.add()
     apply_event(h.db, report(h, "api-report", state="blocked", kind="blocker",
