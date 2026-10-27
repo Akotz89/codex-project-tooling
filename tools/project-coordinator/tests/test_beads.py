@@ -7,7 +7,7 @@ import sys
 
 import pytest
 
-from project_coordinator.beads import check_beads
+from project_coordinator.beads import check_beads, read_status
 from project_coordinator.runtime import InvalidEvent, digest
 from test_runtime import h, project_policy
 
@@ -113,6 +113,59 @@ def test_guard_finds_task_beyond_first_page(h, guard):
     for index in range(105):
         h.add(f"0-{index:03}", "worker-2")
     assert check_beads(h.db, event(h), **options)["beads_id"] == "bead-1"
+
+
+def test_guard_ignores_unrelated_writer_paths_truncation(h, guard):
+    options, _, calls = guard
+    h.add("B", paths=[f"src/file-{index}.py" for index in range(143)])
+    snapshot = h.call("summary")
+    task = next(task for task in snapshot["tasks"] if task["id"] == "B")
+    assert len(task["writer_paths"]) == 32
+    assert "tasks.1.writer_paths" in snapshot["bounds"]["truncated_fields"]
+    before = digest(h.db)
+    assert check_beads(h.db, event(h, task_id="B"), **options)["beads_id"] == "bead-1"
+    assert len(calls) == 2
+    assert digest(h.db) == before
+
+
+@pytest.mark.parametrize("field", ["id", "beads_ref", "linear_ref"])
+def test_truncated_binding_identity_refuses_before_beads_or_graph_write(h, guard, monkeypatch, field):
+    from project_coordinator import apply_event
+
+    options, _, calls = guard
+    def truncated_status(db, request):
+        snapshot = read_status(db, request)
+        snapshot["bounds"]["truncated_fields"].append(f"tasks.0.{field}")
+        return snapshot
+
+    monkeypatch.setattr("project_coordinator.beads.read_status", truncated_status)
+    before = digest(h.db)
+    with pytest.raises(InvalidEvent, match="task binding is truncated"):
+        apply_event(h.db, event(h), guard_context=options)
+    assert not calls
+    assert digest(h.db) == before
+
+
+@pytest.mark.parametrize(("task_id", "beads_ref", "linear_ref", "message"), [
+    ("missing", "global:bead-1", "linear:test-1", "unknown task_id"),
+    ("B", "global:other", "linear:test-1", "identity mismatch"),
+    ("B", "global:bead-1", "linear:other", "Linear reference mismatch"),
+])
+def test_binding_identity_mismatch_refuses_before_acceptance_or_graph_write(
+    h, guard, task_id, beads_ref, linear_ref, message
+):
+    from project_coordinator import apply_event
+
+    options, _, calls = guard
+    if task_id != "missing":
+        h.call("add", task={"id": task_id, "worker": "worker-1", "linear_ref": linear_ref,
+                             "beads_ref": beads_ref, "prompt": "fixture", "source_digest": "source-1",
+                             "scope_digest": "scope-1", "writer_paths": [], "dependencies": []})
+    before = digest(h.db)
+    with pytest.raises(InvalidEvent, match=message):
+        apply_event(h.db, event(h, task_id=task_id), guard_context=options)
+    assert digest(h.db) == before
+    assert len(calls) == (0 if task_id == "missing" else 1)
 
 
 def test_cli_prepare_and_issue_check_actual_executable_each_time(h, tmp_path):

@@ -27,7 +27,8 @@ def task_binding(db, event):
         for index, task in enumerate(snapshot["tasks"], offset):
             if task["id"] == event["task_id"]:
                 prefix = f"tasks.{index}."
-                require(not any(field.startswith(prefix) for field in snapshot["bounds"]["truncated_fields"]),
+                binding_fields = {f"{prefix}{name}" for name in ("id", "beads_ref", "linear_ref")}
+                require(not binding_fields.intersection(snapshot["bounds"]["truncated_fields"]),
                         "task binding is truncated; Beads preflight cannot verify it")
                 return task, checkpoint
         offset = snapshot["bounds"]["next_offset"]
