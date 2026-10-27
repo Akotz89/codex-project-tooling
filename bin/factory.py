@@ -6,7 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 sys.dont_write_bytecode = True
-from install import sync, install_source, configure
+from install import sync, install_source, configure, validate_project_settings
 import consumer
 
 
@@ -27,6 +27,7 @@ def main() -> int:
         root = consumer.project_root()
         if consumer.MANIFEST.get("project_binding_required") and not options.scaffold_only:
             consumer.project_binding(root)
+        validate_project_settings(root)
         sync(root)
         if options.scaffold_only:
             print("Scaffold installed. Integration source is not configured or verified.")
@@ -35,6 +36,10 @@ def main() -> int:
         if revision:
             settings = install_source(options.source or consumer.MANIFEST["repository"],
                                       revision, options.cache, options.bun)
+            if (consumer.MANIFEST.get("project_binding_required")
+                    and "project_binding" not in settings):
+                settings["project_binding"] = consumer.project_binding(root)
+            validate_project_settings(root, settings)
             configure(root, settings)
         else:
             if options.source:

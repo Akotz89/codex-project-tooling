@@ -107,7 +107,8 @@ def native_caller_mapping(prepared, session_id):
 
 def validate(event, root, *, fresh=True, private_reader=None):
     from .consumer import shared_root, read_settings, project_binding, verify_source
-    from .jev_router import validate_allowed_models
+    from .jev_router import (validate_allowed_models, validate_allowed_efforts,
+                             validate_saved_routing_policy)
     root = shared_root(Path(root).resolve())
     if (not isinstance(event, dict) or not isinstance(event.get('cwd'), str)
             or shared_root(Path(event['cwd']).resolve()) != root):
@@ -118,8 +119,16 @@ def validate(event, root, *, fresh=True, private_reader=None):
     config = settings.get('jev_router', {})
     if not isinstance(config, dict):
         raise ValueError('native_project_policy_invalid')
+    if 'saved_routing_policy' in config:
+        raise ValueError('native_project_policy_invalid')
     current_models = validate_allowed_models(config['allowed_models']) if 'allowed_models' in config else None
+    current_efforts = validate_allowed_efforts(config['allowed_efforts']) if 'allowed_efforts' in config else None
     current_policy = {'allowed_models': current_models}
+    if current_efforts is not None:
+        current_policy['allowed_efforts'] = current_efforts
+    current_saved = validate_saved_routing_policy(settings['saved_routing_policy']) if settings.get('saved_routing_policy') is not None else None
+    if current_saved is not None:
+        current_policy['saved_routing_policy'] = current_saved
     arguments, locator, native = dispatch_input(event)
     path, prepared = (private_json if private_reader is None else private_reader)(root, locator)
     if native is not None and any(key in prepared for key in ('native_transport', 'native_task_name', 'native_request')):
@@ -143,7 +152,8 @@ def validate(event, root, *, fresh=True, private_reader=None):
         raise ValueError('native_capability_expired')
     receipt = prepared.get('receipt', {})
     pair = prepared.get('spawn_agent', {})
-    if ('project_model_policy' in prepared or 'allowed_models' in config):
+    if ('project_model_policy' in prepared or 'allowed_models' in config or 'allowed_efforts' in config
+            or 'saved_routing_policy' in settings):
         if prepared.get('project_model_policy') != current_policy or receipt.get('project_model_policy') != current_policy:
             raise ValueError('native_project_policy_binding_mismatch')
     if (receipt.get('capability_provenance') != 'caller_supplied_tool_metadata'
@@ -152,6 +162,9 @@ def validate(event, root, *, fresh=True, private_reader=None):
             or pair.get('fork_turns') != 'none'
             or not allowed_pair(pair.get('model'), pair.get('reasoning_effort'))
             or current_models is not None and pair.get('model') not in current_models
+            or current_efforts is not None and pair.get('reasoning_effort') not in current_efforts.get(pair.get('model'), [])
+            or current_saved is not None and
+               (pair.get('model'), pair.get('reasoning_effort')) != (current_saved['model'], current_saved['effort'])
             or not any(isinstance(row, dict) and
                        (row.get('model'), row.get('effort')) ==
                        (pair['model'], pair['reasoning_effort'])

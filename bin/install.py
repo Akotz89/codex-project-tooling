@@ -146,8 +146,13 @@ def validate_router_options(settings: dict) -> None:
     if "jev_router" not in settings:
         return
     router = settings["jev_router"]
-    if not isinstance(router, dict) or router.keys() - {"key_file", "jev_model"}:
-        raise ValueError("Invalid jev_router settings: expected key_file and/or jev_model options")
+    if not isinstance(router, dict) or router.keys() - {"key_file", "jev_model", "allowed_models", "allowed_efforts"}:
+        raise ValueError("Invalid jev_router settings: unsupported options")
+    from jev_router import validate_allowed_efforts, validate_allowed_models
+    if "allowed_models" in router:
+        validate_allowed_models(router["allowed_models"])
+    if "allowed_efforts" in router:
+        validate_allowed_efforts(router["allowed_efforts"])
     key_file = router.get("key_file")
     if key_file is not None and (not isinstance(key_file, str) or "\0" in key_file):
         raise ValueError("Invalid jev_router.key_file: expected a file reference")
@@ -156,24 +161,55 @@ def validate_router_options(settings: dict) -> None:
         raise ValueError("Invalid jev_router.jev_model: expected a supported model identifier")
 
 
+def validate_project_settings(root: Path, settings: dict | None = None, *, check_binding: bool = True) -> dict | None:
+    """Validate current persisted state before init can cause installer side effects."""
+    root = root.resolve()
+    path = within(consumer.shared_root(root), consumer.shared_root(root) / consumer.SETTINGS)
+    if settings is None:
+        if not path.exists():
+            return None
+        settings = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(settings, dict):
+        raise ValueError(f"Invalid consumer settings: {path}")
+    if check_binding and consumer.MANIFEST.get("project_binding_required"):
+        binding = consumer.project_binding(root)
+        if settings.get("project_binding") != binding:
+            raise ValueError("Project binding drift: root, local tracker address or context changed; explicitly reconfigure this project")
+    validate_router_options(settings)
+    if settings.get("saved_routing_policy") is not None:
+        from jev_router import (validate_allowed_efforts, validate_allowed_models,
+                                validate_saved_routing_policy)
+        saved = validate_saved_routing_policy(settings["saved_routing_policy"])
+        router = settings.get("jev_router", {})
+        models = validate_allowed_models(router["allowed_models"]) if "allowed_models" in router else None
+        efforts = validate_allowed_efforts(router["allowed_efforts"]) if "allowed_efforts" in router else None
+        if ((models is not None and saved["model"] not in models)
+                or (efforts is not None and saved["effort"] not in efforts.get(saved["model"], []))):
+            raise ValueError("saved routing pair is outside project ceilings")
+    return settings
+
+
 def configure(root: Path, settings: dict) -> None:
     settings = dict(settings)
     if consumer.MANIFEST.get("project_binding_required"):
         settings["project_binding"] = consumer.project_binding(root)
     path = within(consumer.shared_root(root), consumer.shared_root(root) / consumer.SETTINGS)
+    validate_project_settings(root, settings)
     if path.exists():
         previous = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(previous, dict):
-            raise ValueError(f"Invalid consumer settings: {path}")
-        validate_router_options(previous)
+        validate_project_settings(root, previous, check_binding=False)
         binding = settings.get("project_binding")
         prior_binding = previous.get("project_binding")
         if (isinstance(binding, dict) and isinstance(prior_binding, dict)
                 and all(prior_binding.get(key) == binding[key]
                         for key in ("root", "tracker", "project"))
-                and "jev_router" not in settings and "jev_router" in previous):
-            settings["jev_router"] = previous["jev_router"]
-    validate_router_options(settings)
+                ):
+            for key in ("jev_router", "operator_metadata"):
+                if key not in settings and key in previous:
+                    settings[key] = previous[key]
+            if settings.get("saved_routing_policy") is None and previous.get("saved_routing_policy") is not None:
+                settings["saved_routing_policy"] = previous["saved_routing_policy"]
+    validate_project_settings(root, settings)
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(".tmp")
     temp.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")

@@ -27,11 +27,27 @@ collection is explicit and project-local; no collector daemon is installed.
 
 For new project-bound native subagent preparations, `.factory/consumer.json` may
 set `jev_router.allowed_models` to a nonempty unique list from the shared worker
-policy, for example `"allowed_models": ["gpt-6-luna"]`. The receipt retains the
-capability identity and complete shared-policy pair set; Jev's Choice includes
-only currently supported pairs whose model is allowed. The hook rechecks the
-prepared policy against the current project setting before launch. With the setting absent, the shared model
-policy applies unchanged. Existing workers and coordinator settings are unaffected.
+policy, for example `"allowed_models": ["gpt-6-luna"]`, and optionally set
+`jev_router.allowed_efforts` as a per-model ceiling, for example
+`{"gpt-6-luna": ["medium", "high"]}`. Each explicit effort map must be
+nonempty and contain only shared-policy models with nonempty unique supported
+efforts. Omitting `allowed_efforts` preserves legacy behavior; an invalid
+explicit map refuses preparation. These fields are ceilings, not a saved model
+or effort selection. Jev's Choice receives only the intersection of fresh native
+capability pairs and both configured ceilings. The receipt preserves the full
+policy and capability identity, while the native hook rechecks the policy and
+pair against current project settings before launch. A native capability
+snapshot is atomically written to `.factory/routing-capabilities.json` using
+the metadata capture timestamp; it reports support and does not select a pair.
+Existing workers and coordinator settings are unaffected.
+
+An optional top-level `saved_routing_policy` may retain one exact
+`{"model": "gpt-6-luna", "effort": "medium"}` pair. It is stored separately
+from the nested `jev_router` ceilings and is honored only when it remains inside both ceilings and
+the fresh native capability set. Jev still assesses the task against that pair;
+the saved value is not an attributable human override. Without it, routing
+remains automatic. The receipt carries the saved pair independently, and the
+native hook denies launch if the current saved policy drifts.
 
 ## Scope and backlog bootstrap
 

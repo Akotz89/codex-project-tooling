@@ -37,6 +37,28 @@ def validate_allowed_models(models):
         raise ModelPolicyError('project allowed_models must be a nonempty unique list within shared worker policy')
     return list(models)
 
+def validate_allowed_efforts(efforts):
+    if (not isinstance(efforts, dict) or not efforts
+            or any(not isinstance(model, str) or model not in WORKER_EFFORTS
+                   or not isinstance(values, list) or not values
+                   or any(not isinstance(value, str) for value in values)
+                   or len(values) != len(set(values))
+                   or any(value not in WORKER_EFFORTS[model] for value in values)
+                   for model, values in efforts.items())):
+        raise ModelPolicyError('project allowed_efforts must map supported models to nonempty unique supported efforts')
+    return {model: list(values) for model, values in efforts.items()}
+
+def validate_saved_routing_policy(policy):
+    if (not isinstance(policy, dict) or set(policy) != {'model', 'effort'}
+            or not allowed_pair(policy.get('model'), policy.get('effort'))):
+        raise ModelPolicyError('saved_routing_policy must be one supported model-effort pair')
+    return {'model': policy['model'], 'effort': policy['effort']}
+
+def routing_policy_support():
+    return {'schema': 'routing-policy-support-v1',
+            'enforced_fields': ['allowed_models', 'allowed_efforts', 'saved_routing_policy'],
+            'enforcement_points': ['choose', 'prepare_subagent']}
+
 WORKER_EFFORTS = {
     'gpt-6-luna': {'low', 'medium', 'high', 'xhigh', 'max'},
     'gpt-6.1-sol': {'low', 'medium', 'high'},
@@ -538,7 +560,9 @@ def assert_actual_assessment(receipt, model, effort):
 
 
 def choose(task, catalog, credential, jev_model, deadline, *, ordinary=None,
-           capability_provenance=None, allowed_models=None, transport=http_choice, max_task_bytes=MAX_TASK_BYTES):
+           capability_provenance=None, allowed_models=None, allowed_efforts=None,
+           saved_routing_policy=None,
+           transport=http_choice, max_task_bytes=MAX_TASK_BYTES):
     assert_ordinary(ordinary)  # Cannot fall through missing-key or provider-error paths.
     started = time.monotonic()
     receipt = {'schema': 'CPI236TASKASSESSMENTV1', 'policy': 'direct_permitted_pair_choice_1',
@@ -548,18 +572,27 @@ def choose(task, catalog, credential, jev_model, deadline, *, ordinary=None,
         observed_pairs = (collaboration_capability_pairs(capability_provenance, credential=credential)
                           if capability_provenance is not None else eligible(catalog, time.time(), allow_empty=True))
         permitted_models = validate_allowed_models(allowed_models) if allowed_models is not None else None
+        permitted_efforts = validate_allowed_efforts(allowed_efforts) if allowed_efforts is not None else None
+        saved_pair = validate_saved_routing_policy(saved_routing_policy) if saved_routing_policy is not None else None
         pairs = ({key: row for key, row in observed_pairs.items()
-                  if row['model'] in permitted_models} if permitted_models is not None else observed_pairs)
+                  if (permitted_models is None or row['model'] in permitted_models)
+                  and (permitted_efforts is None or row['effort'] in permitted_efforts.get(row['model'], []))
+                  and (saved_pair is None or (row['model'], row['effort']) ==
+                       (saved_pair['model'], saved_pair['effort']))}
+                 if permitted_models is not None or permitted_efforts is not None or saved_pair is not None else observed_pairs)
         ordinary = dict(ordinary)
         if not any(row['model'] == ordinary['model'] and row['effort'] == ordinary['effort'] for row in observed_pairs.values()):
             raise ModelPolicyError('CPI236 ordinary worker pair is unavailable in the supported options; no fallback launch')
         pair_field = 'spawn_capability_pairs' if capability_provenance is not None else 'catalog_pairs'
         receipt.update(**{pair_field: [{'model': row['model'], 'effort': row['effort']} for _, row in sorted(observed_pairs.items())]},
                        ordinary_worker=ordinary)
-        if permitted_models is not None:
+        if permitted_models is not None or permitted_efforts is not None or saved_pair is not None:
             receipt.update(assessment_capability_pairs=[{'model': row['model'], 'effort': row['effort']}
                                                         for _, row in sorted(pairs.items())],
-                           project_allowed_models=permitted_models)
+                           project_allowed_models=permitted_models,
+                           project_allowed_efforts=permitted_efforts)
+            if saved_pair is not None:
+                receipt['project_saved_routing_policy'] = saved_pair
             if not pairs:
                 raise ModelPolicyError('project policy leaves no currently supported worker pair')
         if capability_provenance is None:
