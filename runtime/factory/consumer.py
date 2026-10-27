@@ -96,6 +96,36 @@ def read_settings(root: Path) -> dict:
     return settings
 
 
+def prepared_request(settings: dict, capability: dict) -> dict:
+    """Validate project routing ceilings and any saved pair against fresh native options."""
+    from .jev_router import (ModelPolicyError, collaboration_capability_pairs,
+                             validate_allowed_efforts, validate_allowed_models,
+                             validate_saved_routing_policy)
+    config = settings.get("jev_router", {})
+    if not isinstance(config, dict):
+        raise ModelPolicyError("invalid project router configuration")
+    if "saved_routing_policy" in config:
+        raise ModelPolicyError("saved_routing_policy must be configured at the project settings top level")
+    allowed_models = validate_allowed_models(config["allowed_models"]) if "allowed_models" in config else None
+    allowed_efforts = validate_allowed_efforts(config["allowed_efforts"]) if "allowed_efforts" in config else None
+    saved = validate_saved_routing_policy(settings["saved_routing_policy"]) if "saved_routing_policy" in settings else None
+    if saved is not None:
+        pairs = collaboration_capability_pairs(capability)
+        if not any((row["model"], row["effort"]) == (saved["model"], saved["effort"])
+                   and (allowed_models is None or row["model"] in allowed_models)
+                   and (allowed_efforts is None or row["effort"] in allowed_efforts.get(row["model"], []))
+                   for row in pairs.values()):
+            raise ModelPolicyError("saved routing pair is unavailable or outside project ceilings")
+    return {"allowed_models": allowed_models, "allowed_efforts": allowed_efforts,
+            "saved_routing_policy": saved}
+
+
+def routing_policy_support() -> dict:
+    return {"schema": "routing-policy-support-v1",
+            "enforced_fields": ["allowed_models", "allowed_efforts", "saved_routing_policy"],
+            "enforcement_points": ["prepared_request", "receipt", "native_hook"]}
+
+
 def project_binding(root: Path) -> dict:
     """Attest local routing facts; this neither accepts nor dispatches work."""
     root = shared_root(root)

@@ -193,6 +193,47 @@ class TypedAssessmentBridgeTests(unittest.TestCase):
                          {(m, e) for m, efforts in jev_router.WORKER_EFFORTS.items() for e in efforts})
         self.assertNotIn('same_account', seen[0]['state'])
         self.assertNotIn('identity', seen[0]['state'])
+        self.assertNotIn('project_saved_routing_policy', result['receipt'])
+
+    def test_saved_pair_is_separate_and_still_requires_jev_assessment(self):
+        saved = {'model': 'gpt-6.1-sol', 'effort': 'medium'}
+        with patch.object(bridge, 'read_credential', return_value='offline-test-token'):
+            selected = bridge.route(self.request(), ROOT, saved_routing_policy=saved,
+                transport=lambda p, *_: self.answer(p, model=saved['model'], effort=saved['effort']))
+            contradicted = bridge.route(self.request(), ROOT, saved_routing_policy=saved,
+                transport=lambda p, *_: self.answer(p, model='gpt-6-luna', effort='medium'))
+        self.assertEqual((selected['spawn_agent']['model'], selected['spawn_agent']['reasoning_effort']),
+                         (saved['model'], saved['effort']))
+        self.assertEqual(selected['receipt']['project_saved_routing_policy'], saved)
+        self.assertEqual(selected['receipt']['prepared_pair'], saved)
+        self.assertEqual(contradicted['status'], 'refused')
+        self.assertNotIn('spawn_agent', contradicted)
+
+        capability = self.capability()
+        self.assertEqual(consumer.prepared_request({'saved_routing_policy': saved}, capability),
+                         {'allowed_models': None, 'allowed_efforts': None, 'saved_routing_policy': saved})
+        for settings in (
+                {'saved_routing_policy': None},
+                {'saved_routing_policy': {'model': 'gpt-6.1-sol', 'effort': 'xhigh'}},
+                {'jev_router': {'allowed_efforts': {'gpt-6.1-sol': ['low']}},
+                 'saved_routing_policy': saved},
+                {'jev_router': {'allowed_models': ['gpt-6-luna']},
+                 'saved_routing_policy': saved},
+                {'jev_router': {'saved_routing_policy': saved}}):
+            with self.subTest(settings=settings), self.assertRaises(ValueError):
+                consumer.prepared_request(settings, capability)
+
+    def test_routing_policy_support_reports_match_provider_contract(self):
+        consumer_report = consumer.routing_policy_support()
+        router_report = jev_router.routing_policy_support()
+        self.assertEqual(consumer_report, {
+            'schema': 'routing-policy-support-v1',
+            'enforced_fields': ['allowed_models', 'allowed_efforts', 'saved_routing_policy'],
+            'enforcement_points': ['prepared_request', 'receipt', 'native_hook']})
+        self.assertEqual(router_report, {
+            'schema': 'routing-policy-support-v1',
+            'enforced_fields': ['allowed_models', 'allowed_efforts', 'saved_routing_policy'],
+            'enforcement_points': ['choose', 'prepare_subagent']})
 
     def test_failed_assessment_and_missing_credentials_have_no_spawn_arguments(self):
         for outcome in ['uncertain', 'insufficient_information']:
@@ -216,6 +257,92 @@ class TypedAssessmentBridgeTests(unittest.TestCase):
                 result = bridge.route(request, ROOT, transport=lambda *_: self.fail('transport must not run'))
             self.assertEqual(result['status'], 'refused')
             self.assertNotIn('spawn_agent', result)
+
+    def test_allowed_efforts_is_an_optional_validated_ceiling(self):
+        ceiling = {'gpt-6-luna': ['medium']}
+        with patch.object(bridge, 'read_credential', return_value='offline-test-token'):
+            selected = bridge.route(self.request(), ROOT, allowed_efforts=ceiling,
+                transport=lambda p, *_: self.answer(p, effort='medium'))
+            refused = bridge.route(self.request(), ROOT, allowed_efforts=ceiling,
+                transport=lambda p, *_: self.answer(p, effort='xhigh'))
+        self.assertEqual(selected['status'], 'selected')
+        self.assertEqual(selected['receipt']['project_allowed_efforts'], ceiling)
+        self.assertEqual(selected['receipt']['assessment_capability_pairs'],
+                         [{'model': 'gpt-6-luna', 'effort': 'medium'}])
+        self.assertEqual(refused['status'], 'refused')
+        self.assertNotIn('spawn_agent', refused)
+        for invalid in ({}, {'gpt-6-luna': []}, {'gpt-6-luna': ['medium', 'medium']},
+                        {'gpt-6-luna': ['ultra']}, {'gpt-6.1-sol': ['xhigh']},
+                        {'unknown-model': ['low']}, {'gpt-6-luna': ['medium', 3]}):
+            with self.subTest(invalid=invalid), patch.object(bridge, 'read_credential',
+                    side_effect=AssertionError('invalid policy must fail before credentials')):
+                result = bridge.route(self.request(), ROOT, allowed_efforts=invalid,
+                                      transport=lambda *_: self.fail('invalid policy reached Jev'))
+            self.assertEqual(result['status'], 'refused')
+            self.assertNotIn('spawn_agent', result)
+        with patch.object(bridge, 'read_credential', return_value='offline-test-token'):
+            legacy = bridge.route(self.request(), ROOT,
+                                  transport=lambda p, *_: self.answer(p, effort='xhigh'))
+        self.assertEqual(legacy['status'], 'selected')
+
+    def test_provider_capability_catalog_uses_capture_time_and_exact_schema(self):
+        from datetime import datetime, timezone
+        with tempfile.TemporaryDirectory(dir=TASK_WORK) as temp:
+            root = Path(temp)
+            (root / '.factory').mkdir()
+            captured = 2_000_000_000.25
+            capability = {**self.capability(), 'caller_id': 'native:fixture', 'captured_at': captured}
+            with patch.object(bridge.time, 'time', return_value=captured + 2):
+                catalog = bridge.publish_routing_capabilities(root, capability)
+            expected = {'generated_at': datetime.fromtimestamp(captured, timezone.utc).isoformat(),
+                        'models': {model: sorted(efforts) for model, efforts in jev_router.WORKER_EFFORTS.items()}}
+            destination = root / '.factory/routing-capabilities.json'
+            self.assertEqual(catalog, expected)
+            self.assertEqual(json.loads(destination.read_text()), expected)
+            self.assertEqual(set(json.loads(destination.read_text())), {'generated_at', 'models'})
+            second_capture = captured + 10
+            second_capability = {**capability, 'captured_at': second_capture,
+                                 'models': [{'model': 'gpt-6-luna', 'reasoning_efforts': ['medium']}]}
+            second_expected = {'generated_at': datetime.fromtimestamp(second_capture, timezone.utc).isoformat(),
+                               'models': {'gpt-6-luna': ['medium']}}
+            with patch.object(bridge.time, 'time', return_value=second_capture + 2):
+                replaced = bridge.publish_routing_capabilities(root, second_capability)
+            self.assertEqual(replaced, second_expected)
+            self.assertEqual(json.loads(destination.read_text()), second_expected)
+            self.assertEqual(set(json.loads(destination.read_text())), {'generated_at', 'models'})
+            prior = destination.read_bytes()
+            for bad_capture in (captured - 61, captured + 1, True, 'now'):
+                with self.subTest(captured=bad_capture), patch.object(bridge.time, 'time', return_value=captured):
+                    with self.assertRaises(ValueError):
+                        bridge.publish_routing_capabilities(root,
+                            {**capability, 'captured_at': bad_capture})
+                self.assertEqual(destination.read_bytes(), prior)
+            malformed = {**capability, 'models': [{'model': 'gpt-6-luna', 'reasoning_efforts': 'medium'}]}
+            with patch.object(bridge.time, 'time', return_value=captured):
+                with self.assertRaises(ValueError):
+                    bridge.publish_routing_capabilities(root, malformed)
+            self.assertEqual(destination.read_bytes(), prior)
+
+    def test_provider_capability_catalog_refuses_symlinked_or_escaping_paths(self):
+        with tempfile.TemporaryDirectory(dir=TASK_WORK) as temp:
+            base = Path(temp)
+            outside = base / 'outside'
+            outside.mkdir()
+            (outside / 'routing-capabilities.json').write_text('preserve')
+            root = base / 'project'
+            root.mkdir()
+            (root / '.factory').symlink_to(outside, target_is_directory=True)
+            capability = {**self.capability(), 'caller_id': 'native:fixture', 'captured_at': __import__('time').time()}
+            with self.assertRaises(ValueError):
+                bridge.publish_routing_capabilities(root, capability)
+            self.assertEqual((outside / 'routing-capabilities.json').read_text(), 'preserve')
+
+            (root / '.factory').unlink()
+            (root / '.factory').mkdir()
+            (root / '.factory/routing-capabilities.json').symlink_to(outside / 'routing-capabilities.json')
+            with self.assertRaises(ValueError):
+                bridge.publish_routing_capabilities(root, capability)
+            self.assertEqual((outside / 'routing-capabilities.json').read_text(), 'preserve')
 
     def test_final_spawn_arguments_intersect_native_capabilities_and_owner_caps(self):
         rows = [{'model': m, 'effort': e} for m, efforts in jev_router.WORKER_EFFORTS.items() for e in efforts]

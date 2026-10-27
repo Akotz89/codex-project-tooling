@@ -210,6 +210,15 @@ class ConsumerTests(Fixture):
     def test_actual_native_hook_rechecks_configured_source_before_allow(self):
         self.native_hook_source_boundary("spawn_agent")
 
+    def test_native_hook_enforces_prepared_effort_ceiling_and_catalog_publication(self):
+        self.native_hook_source_boundary("spawn_agent", effort_policy=True)
+
+    def test_native_hook_rejects_legacy_receipt_when_effort_policy_is_added(self):
+        self.native_hook_source_boundary("spawn_agent", legacy_effort_policy=True)
+
+    def test_native_hook_consumes_and_rechecks_saved_routing_policy(self):
+        self.native_hook_source_boundary("spawn_agent", saved_policy=True)
+
     def test_actual_flat_native_hook_rewrites_and_denies_wrong_locator(self):
         self.native_hook_source_boundary("collaborationspawn_agent")
 
@@ -225,7 +234,8 @@ class ConsumerTests(Fixture):
     def test_actual_native_audit_permission_and_current_binding_refusals(self):
         self.native_hook_source_boundary("collaborationspawn_agent", opaque=True, audit_controls=True)
 
-    def native_hook_source_boundary(self, tool_name, opaque=False, session_layout="root", audit_controls=False):
+    def native_hook_source_boundary(self, tool_name, opaque=False, session_layout="root", audit_controls=False,
+                                    effort_policy=False, legacy_effort_policy=False, saved_policy=False):
         session_id = "01a15564-fd5f-7550-aadb-de6160ef7b5d"
         caller = "native:" + session_id
         body = "Perform the bounded parser task and verify its assertions."
@@ -241,6 +251,21 @@ class ConsumerTests(Fixture):
             "explicit_choice": {"model": "gpt-6.1-sol", "effort": "medium",
                 "source": "direct_human_instruction", "instruction_quote": "Use Sol6.1 medium.",
                 "instruction_reference": {"kind": "chat_turn", "chat_id": "human:fixture", "turn_id": "human:1"}}}
+        if effort_policy:
+            settings_path = self.app / consumer.SETTINGS
+            settings = json.loads(settings_path.read_text())
+            settings.setdefault('jev_router', {})['allowed_efforts'] = {'gpt-6.1-sol': ['medium']}
+            settings_path.write_text(json.dumps(settings))
+        if saved_policy:
+            request.pop('explicit_choice')
+            request['capability_provenance']['models'] = [
+                {'model': 'gpt-6-luna', 'reasoning_efforts': ['medium']},
+                {'model': 'gpt-6.1-sol', 'reasoning_efforts': ['medium']}]
+            settings_path = self.app / consumer.SETTINGS
+            settings = json.loads(settings_path.read_text())
+            settings.setdefault('jev_router', {}).update(allowed_models=['gpt-6-luna'])
+            settings['saved_routing_policy'] = {'model': 'gpt-6-luna', 'effort': 'medium'}
+            settings_path.write_text(json.dumps(settings))
         prepare_args = [sys.executable, "-B", str(self.fixture_factory / "bin/factory.py"),
                         "route-subagent", "--caller-id", caller, "--work-dir", "work/native"]
         hook_args = [sys.executable, "-B",
@@ -280,13 +305,44 @@ class ConsumerTests(Fixture):
             return json.loads(result.stdout)["hookSpecificOutput"]
 
         positive = prepare()
+        if legacy_effort_policy:
+            settings_path = self.app / consumer.SETTINGS
+            settings = json.loads(settings_path.read_text())
+            settings.setdefault('jev_router', {})['allowed_efforts'] = {'gpt-6.1-sol': ['medium']}
+            settings_path.write_text(json.dumps(settings))
+            receipt_path = Path(positive['receipt_path'])
+            stored = json.loads(receipt_path.read_text())
+            stored.pop('project_model_policy')
+            stored['receipt'].pop('project_model_policy')
+            receipt_path.write_text(json.dumps(stored))
+            denied = hook(positive, 'tool:legacy-receipt-effort-policy')
+            self.assertEqual(denied['permissionDecision'], 'deny')
+            self.assertNotIn('updatedInput', denied)
+            self.assertFalse(receipt_path.with_suffix('.consume.json').exists())
+            return
+        from datetime import datetime, timezone
+        capability_catalog = json.loads((self.app / '.factory/routing-capabilities.json').read_text())
+        self.assertEqual(set(capability_catalog), {'generated_at', 'models'})
+        self.assertEqual(capability_catalog['generated_at'],
+                         datetime.fromtimestamp(request['capability_provenance']['captured_at'], timezone.utc).isoformat())
+        self.assertEqual(capability_catalog['models'],
+                         {'gpt-6-luna': ['medium'], 'gpt-6.1-sol': ['medium']}
+                         if saved_policy else {'gpt-6.1-sol': ['medium']})
+        self.assertEqual(positive['project_model_policy'], {
+            'allowed_models': ['gpt-6-luna'] if saved_policy else None,
+            **({'allowed_efforts': {'gpt-6.1-sol': ['medium']}} if effort_policy else {}),
+            **({'saved_routing_policy': {'model': 'gpt-6-luna', 'effort': 'medium'}} if saved_policy else {})})
+        self.assertEqual(positive['receipt']['project_model_policy'], positive['project_model_policy'])
+        if saved_policy:
+            self.assertEqual((positive['spawn_agent']['model'], positive['spawn_agent']['reasoning_effort']),
+                             ('gpt-6-luna', 'medium'))
         wrong = hook(positive, "tool:wrong-locator", wrong_locator=True)
         self.assertEqual(wrong["permissionDecision"], "deny")
         self.assertNotIn("updatedInput", wrong)
         self.assertFalse(Path(positive["receipt_path"]).with_suffix(".consume.json").exists())
         allowed = hook(positive, "call_fixture_original")
         self.assertEqual(allowed["permissionDecision"], "allow")
-        self.assertEqual(allowed["updatedInput"]["model"], "gpt-6.1-sol")
+        self.assertEqual(allowed["updatedInput"]["model"], "gpt-6-luna" if saved_policy else "gpt-6.1-sol")
         self.assertEqual(allowed["updatedInput"]["reasoning_effort"], "medium")
         self.assertEqual(allowed["updatedInput"]["fork_turns"], "none")
         self.assertEqual(positive["receipt"]["attempts"], 1)
@@ -388,6 +444,28 @@ class ConsumerTests(Fixture):
         unused = prepare()
         self.assertEqual(unused["source_binding"],
                          {"revision": self.settings["revision"], "source": self.settings["source"]})
+        policy_path = self.app / consumer.SETTINGS
+        original_settings = policy_path.read_bytes()
+        try:
+            changed = json.loads(original_settings)
+            changed.setdefault('jev_router', {})['allowed_efforts'] = {'gpt-6.1-sol': ['low']}
+            policy_path.write_text(json.dumps(changed))
+            effort_drift = hook(unused, "tool:effort-policy-drift")
+            self.assertEqual(effort_drift["permissionDecision"], "deny")
+            self.assertNotIn("updatedInput", effort_drift)
+        finally:
+            policy_path.write_bytes(original_settings)
+        if saved_policy:
+            original_settings = policy_path.read_bytes()
+            try:
+                changed = json.loads(original_settings)
+                changed['saved_routing_policy']['effort'] = 'low'
+                policy_path.write_text(json.dumps(changed))
+                drifted = hook(unused, 'tool:saved-routing-policy-drift')
+                self.assertEqual(drifted['permissionDecision'], 'deny')
+                self.assertNotIn('updatedInput', drifted)
+            finally:
+                policy_path.write_bytes(original_settings)
         (self.source / "package.json").write_text("source drift")
         refused = hook(unused, "tool:source-drift")
         self.assertEqual(refused["permissionDecision"], "deny")

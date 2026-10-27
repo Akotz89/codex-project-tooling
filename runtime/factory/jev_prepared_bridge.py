@@ -2,6 +2,7 @@
 from pathlib import Path
 import argparse
 from datetime import datetime
+from datetime import timezone
 import hashlib
 import json
 import math
@@ -9,12 +10,14 @@ import os
 import re
 import sys
 import stat
+import tempfile
 import time
 import uuid
 import unicodedata
 from .jev_router import (choose, http_choice, read_credential, ModelPolicyError,
                         SPAWN_AGENT_EFFORTS, collaboration_capability_pairs, assert_ordinary, eligible,
-                        assert_actual_assessment, validate_allowed_models)
+                        assert_actual_assessment, validate_allowed_models, validate_allowed_efforts,
+                        validate_saved_routing_policy)
 
 MAX_CONTEXT = 1024 * 1024
 
@@ -113,7 +116,8 @@ def human_override(choice):
 
 
 
-def route(request, root, key_file=None, jev_model='jev-latest', *, allowed_models=None, transport=None, max_task_bytes=8192):
+def route(request, root, key_file=None, jev_model='jev-latest', *, allowed_models=None,
+          allowed_efforts=None, saved_routing_policy=None, transport=None, max_task_bytes=8192):
     """Pure preparation core, compatible with Archon's separate native preflight.
 
     This library does not attest a project or persist evidence. Public commands
@@ -131,13 +135,27 @@ def route(request, root, key_file=None, jev_model='jev-latest', *, allowed_model
         capability = request.get('capability_provenance')
         if allowed_models is not None:
             allowed_models = validate_allowed_models(allowed_models)
+        if allowed_efforts is not None:
+            allowed_efforts = validate_allowed_efforts(allowed_efforts)
+        if saved_routing_policy is not None:
+            saved_routing_policy = validate_saved_routing_policy(saved_routing_policy)
+        capability_pairs = (collaboration_capability_pairs(capability) if capability is not None
+                            else eligible(request.get('catalog'), time.time()))
+        if saved_routing_policy is not None and not any(
+                (row['model'], row['effort']) == (saved_routing_policy['model'], saved_routing_policy['effort'])
+                and (allowed_models is None or row['model'] in allowed_models)
+                and (allowed_efforts is None or row['effort'] in allowed_efforts.get(row['model'], []))
+                for row in capability_pairs.values()):
+            raise ModelPolicyError('saved routing pair is unavailable or outside project ceilings')
         choice = request.get('explicit_choice')
         attribution = human_override(choice) if choice is not None else None
         if choice is not None and not any(
                 (row['model'], row['effort']) == (choice.get('model'), choice.get('effort'))
-                for row in (collaboration_capability_pairs(capability) if capability is not None
-                            else eligible(request.get('catalog'), time.time())).values()
-                if allowed_models is None or row['model'] in allowed_models):
+                for row in capability_pairs.values()
+                if (allowed_models is None or row['model'] in allowed_models)
+                and (allowed_efforts is None or row['effort'] in allowed_efforts.get(row['model'], []))
+                and (saved_routing_policy is None or (row['model'], row['effort']) ==
+                     (saved_routing_policy['model'], saved_routing_policy['effort']))):
             raise ModelPolicyError('human pair unavailable or forbidden')
         remaining, task, ordinary = request.get('remaining_ms'), request['task'], request['ordinary']
         if (remaining is not None and
@@ -152,7 +170,9 @@ def route(request, root, key_file=None, jev_model='jev-latest', *, allowed_model
             task += '\nHuman pair constraint: ' + json.dumps(choice, sort_keys=True)
         # Validate ordinary policy/capability before credential IO; ordinary is context only.
         _, receipt = choose(task, request.get('catalog'), None, jev_model, deadline,
-                            ordinary=ordinary, capability_provenance=capability, allowed_models=allowed_models, transport=transport,
+                            ordinary=ordinary, capability_provenance=capability, allowed_models=allowed_models,
+                            allowed_efforts=allowed_efforts, saved_routing_policy=saved_routing_policy,
+                            transport=transport,
                             max_task_bytes=max_task_bytes)
         if 'ordinary_worker' in receipt:
             try:
@@ -166,7 +186,9 @@ def route(request, root, key_file=None, jev_model='jev-latest', *, allowed_model
                     credential_source = receipt['credential_source']
                     pair, receipt = choose(task, request.get('catalog'), key, jev_model, deadline,
                                            ordinary=ordinary, capability_provenance=capability,
-                                           allowed_models=allowed_models, transport=transport, max_task_bytes=max_task_bytes)
+                                           allowed_models=allowed_models, allowed_efforts=allowed_efforts,
+                                           saved_routing_policy=saved_routing_policy,
+                                           transport=transport, max_task_bytes=max_task_bytes)
                     receipt['credential_source'] = credential_source
     except ModelPolicyError:
         return {'status': 'refused', 'receipt': {'status': 'refused', 'reason': 'worker_model_policy'}}
@@ -238,6 +260,59 @@ def _task_workdir(root, work_dir):
     return path
 
 
+def publish_routing_capabilities(root, capability):
+    """Atomically publish a fresh native capability catalog for the bound project."""
+    supplied_root = Path(root).absolute()
+    if any(part.is_symlink() for part in (supplied_root, *supplied_root.parents)):
+        raise ValueError('project root cannot contain symlinks')
+    root = supplied_root.resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError('project root is not a directory')
+    directory = root / '.factory'
+    if directory.is_symlink() or not directory.is_dir() or not directory.resolve().is_relative_to(root):
+        raise ValueError('project factory directory is missing or unsafe')
+    captured = capability.get('captured_at') if isinstance(capability, dict) else None
+    now = time.time()
+    if (isinstance(captured, bool) or not isinstance(captured, (int, float))
+            or not math.isfinite(captured) or not 0 <= now - captured <= 60):
+        raise ValueError('capability metadata expired; refresh from current native tool schema')
+    rows = capability.get('models')
+    if (capability.get('source') != 'current_runtime_tool_schema'
+            or capability.get('tool') != 'collaboration.spawn_agent'
+            or not _identifier(capability.get('caller_id'))
+            or not isinstance(rows, list) or not 1 <= len(rows) <= 32
+            or any(not isinstance(row, dict) or not isinstance(row.get('model'), str)
+                   or not isinstance(row.get('reasoning_efforts'), list)
+                   or len(row['reasoning_efforts']) > 16
+                   or any(not isinstance(effort, str) for effort in row['reasoning_efforts'])
+                   for row in rows)):
+        raise ValueError('malformed current native tool metadata')
+    pairs = collaboration_capability_pairs(capability)
+    models = {}
+    for row in pairs.values():
+        models.setdefault(row['model'], set()).add(row['effort'])
+    if not models:
+        raise ValueError('native capability catalog is empty')
+    catalog = {'generated_at': datetime.fromtimestamp(captured, timezone.utc).isoformat(),
+               'models': {model: sorted(efforts) for model, efforts in sorted(models.items())}}
+    destination = directory / 'routing-capabilities.json'
+    if destination.is_symlink() or not destination.resolve(strict=False).is_relative_to(root):
+        raise ValueError('routing capability catalog path is unsafe')
+    fd, temporary = tempfile.mkstemp(prefix='.routing-capabilities-', dir=directory)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf8') as stream:
+            json.dump(catalog, stream, sort_keys=True)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+        sync_directory(directory)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return catalog
+
+
 
 def withhold_launch_arguments(result):
     """Keep assessment evidence, never callable argument copies, after write failure."""
@@ -260,7 +335,7 @@ def withhold_launch_arguments(result):
 
 def prepare_subagent(request, root, caller_id, work_dir, *, transport=None):
     """Project-bound shared entry. All capability metadata is caller supplied."""
-    from .consumer import read_settings, project_binding, shared_root
+    from .consumer import read_settings, project_binding, shared_root, prepared_request
     root = shared_root(Path(root).resolve())
     settings = read_settings(root)
     binding = project_binding(root)
@@ -288,10 +363,8 @@ def prepare_subagent(request, root, caller_id, work_dir, *, transport=None):
     if 'catalog' in request:
         raise ValueError('shared subagent entry requires current native tool metadata')
     directory = _task_workdir(root, work_dir)
+    policy = prepared_request(settings, capability)
     config = settings.get('jev_router', {})
-    if not isinstance(config, dict):
-        raise ValueError('invalid project router configuration')
-    allowed_models = validate_allowed_models(config['allowed_models']) if 'allowed_models' in config else None
     packet = request.get('native_dispatch')
     native = native_dispatch_binding(packet) if packet is not None else None
     routed = dict(request)
@@ -300,7 +373,8 @@ def prepare_subagent(request, root, caller_id, work_dir, *, transport=None):
         if len(routed['task'].encode('utf8')) > 8192:
             raise ValueError('native dispatch task packet exceeds assessment bound')
     result = route(routed, root, config.get('key_file'), config.get('jev_model', 'jev-latest'),
-                   allowed_models=allowed_models, transport=transport)
+                   allowed_models=policy['allowed_models'], allowed_efforts=policy['allowed_efforts'],
+                   saved_routing_policy=policy['saved_routing_policy'], transport=transport)
     if native is not None:
         result['native_dispatch'] = native
     identity = 'jev-' + uuid.uuid4().hex
@@ -317,9 +391,13 @@ def prepare_subagent(request, root, caller_id, work_dir, *, transport=None):
                 'dispatch': 'not_invoked', 'result': 'not_observed', 'acceptance': 'not_performed',
                 'observed_model': None, 'observed_effort': None, 'worker_usage': None,
                 'before_dispatch': 'refresh caller metadata and verify project/caller identity; reconcile uncertain sends, never blind redispatch'}
-    policy = {'allowed_models': allowed_models}
-    metadata['project_model_policy'] = policy
-    result['receipt']['project_model_policy'] = policy
+    project_policy = {'allowed_models': policy['allowed_models']}
+    if policy['allowed_efforts'] is not None:
+        project_policy['allowed_efforts'] = policy['allowed_efforts']
+    if policy['saved_routing_policy'] is not None:
+        project_policy['saved_routing_policy'] = policy['saved_routing_policy']
+    metadata['project_model_policy'] = project_policy
+    result['receipt']['project_model_policy'] = project_policy
     if native is not None and result.get('status') in SUCCESS and 'spawn_agent' in result:
         locator = path.relative_to(root).as_posix()
         metadata['native_transport'] = native_transport_binding(locator, native)
@@ -354,6 +432,8 @@ def prepare_subagent(request, root, caller_id, work_dir, *, transport=None):
         result['status'] = 'refused'
         result['persistence'] = {'status': 'failed', 'path': str(path),
                                  'required_action': 'restore receipt persistence and prepare again before dispatch'}
+    if result['persistence']['status'] == 'persisted':
+        publish_routing_capabilities(root, capability)
     return result
 
 
