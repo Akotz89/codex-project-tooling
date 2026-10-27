@@ -13,6 +13,10 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from project_coordinator.runtime import InvalidEvent, apply_event, build_graph, digest
 
 
+# Sanitized actual MCP response, source SHA-256 545b9b1f1e14bdbffd2cbeeb2bb63906248573da7c905e6d4ae4f1d7184d7aff.
+ACTUAL_NATIVE_MCP_TEXT = r'''{"timedOut":false,"wake":{"reason":"turnCompleted","turnId":"01a17c95-144d-7f42-aacd-3abff2f7e42e","threadId":"01a17c95-1205-74d2-be32-7072d35e10d7","hostId":"local"},"polls":[{"schemaVersion":1,"cursor":"4d063448-70c1-4546-b542-9f7dc4841b97:1","revision":1,"changed":true,"thread":{"id":"01a17c95-1205-74d2-be32-7072d35e10d7","hostId":"local","status":{"type":"idle"}},"latestTurn":{"id":"01a17c95-144d-7f42-aacd-3abff2f7e42e","status":"completed","error":null,"startedAt":1793091507,"completedAt":1793091738,"durationMs":231591},"latestAssistantMessageId":"msg_0b36d520b8303534016ae06899bf6c8197b53299cefae2a9a3","latestAssistantMessage":{"id":"msg_0b36d520b8303534016ae06899bf6c8197b53299cefae2a9a3","turnId":"01a17c95-144d-7f42-aacd-3abff2f7e42e","phase":"final_answer","text":"Published the 13 frozen documents to codex/cpi388-level-1-19-benchmark-20261027. Commit 3b6375b3278a774c65780cfba071a14b9cd45695 has the expected parent b4a4dbc076ddaf6214c789f2f2b2d0a5e496dc88. The remote readback matched all 13 paths, sizes, and SHA-256 hashes; the isolated checkout is clean. All 26 links to package companions resolve. Twelve frozen references to paths outside the package are absent from the canonical root. None targets a listed companion; I left the document bytes unchanged. The staged diff also retained existing trailing-whitespace warnings. Requested settings were Luna/high; the host reported Luna as the active model, while observed reasoning effort was unavailable. Skipped PR creation and runtime/gameplay checks. Risk: those 12 out-of-package references remain unresolved."},"latestToolMarkerId":"exec-3b2772db-8c08-42cd-b5d3-7dd60a0e26c8","latestToolMarker":{"id":"exec-3b2772db-8c08-42cd-b5d3-7dd60a0e26c8","turnId":"01a17c95-144d-7f42-aacd-3abff2f7e42e","type":"commandExecution","name":"commandExecution","status":"completed"}}]}'''
+
+
 class Harness:
     def __init__(self, root, *, project_id="P-test", workers=None):
         self.root = root
@@ -73,6 +77,35 @@ class Harness:
                   "source_digest": "source-1", "scope_digest": "scope-1", "terminal": True, "quiescent": True,
                   "child_exit_code": 0, "acceptance": True, "artifacts": [artifact], "native_evidence": native, **changes}
         receipt = self.file(f"{name}-result.json", result)
+        return self.call("result", task_id=name, dispatch_id=dispatch, receipt=receipt)
+
+    def native_result(self, dispatch, name="A", *, raw=None, include_outcome=True, **changes):
+        task = self.task(name)
+        raw = raw or {"content": [{"type": "text", "text": ACTUAL_NATIVE_MCP_TEXT}], "isError": False}
+        try:
+            payload = json.loads(raw["content"][0]["text"])
+        except (KeyError, IndexError, TypeError, ValueError):
+            payload = json.loads(ACTUAL_NATIVE_MCP_TEXT)
+        if not isinstance(payload, dict):
+            payload = json.loads(ACTUAL_NATIVE_MCP_TEXT)
+        wake = payload["wake"]
+        turn = payload["polls"][0]["latestTurn"]
+        child_thread_id = wake["threadId"]
+        turn_id = wake["turnId"]
+        artifact = self.file(f"{name}-native-output.json", {"actual": "native output"})
+        native = self.file(f"{name}-native-result.json", raw)
+        result = {"thread_id": task["dispatch_thread_id"], "dispatch_id": dispatch,
+                  "source_digest": "source-1", "scope_digest": "scope-1", "artifacts": [artifact],
+                  "native_evidence": native,
+                  "caller_association": {"source": "graph_dispatch_and_native_launch",
+                      "caller_thread_id": "root", "task_id": name, "dispatch_id": dispatch,
+                      "child_thread_id": child_thread_id, "turn_id": turn_id},
+                  "caller_acceptance": {"caller_thread_id": "root", "accepted": True}}
+        if include_outcome:
+            result["native_outcome"] = {"kind": "collaboration_turn", "child_thread_id": child_thread_id,
+                "turn_id": turn_id, "status": turn["status"], "error": turn.get("error")}
+        result.update(changes)
+        receipt = self.file(f"{name}-native-result-receipt.json", result)
         return self.call("result", task_id=name, dispatch_id=dispatch, receipt=receipt)
 
 
@@ -169,6 +202,173 @@ def test_outcomes(h, changes, state, lease):
     result = h.result(h.issue(), **changes)
     assert result["action"] == state
     assert result["lease"] is lease
+
+
+def native_payload(**changes):
+    payload = json.loads(ACTUAL_NATIVE_MCP_TEXT)
+    for key, value in changes.items():
+        if key == "thread_status":
+            payload["polls"][0]["thread"]["status"]["type"] = value
+        elif key == "turn_status":
+            payload["polls"][0]["latestTurn"]["status"] = value
+        elif key == "turn_error":
+            payload["polls"][0]["latestTurn"]["error"] = value
+        elif key == "wake_thread_id":
+            payload["wake"]["threadId"] = value
+        elif key == "poll_turn_id":
+            payload["polls"][0]["latestTurn"]["id"] = value
+        elif key == "without_error":
+            payload["polls"][0]["latestTurn"].pop("error", None)
+        else:
+            payload[key] = value
+    return {"isError": False, "content": [{"type": "text", "text": json.dumps(payload)}]}
+
+
+def ambiguous_native_payload():
+    payload = json.loads(ACTUAL_NATIVE_MCP_TEXT)
+    payload["polls"].append(payload["polls"][0].copy())
+    return {"isError": False, "content": [{"type": "text", "text": json.dumps(payload)}]}
+
+
+def test_actual_nested_native_mcp_completion_is_caller_bound_and_reusable(h):
+    h.add()
+    dispatch = h.issue()
+    raw = {"isError": False, "content": [{"type": "text", "text": ACTUAL_NATIVE_MCP_TEXT}]}
+    payload = json.loads(ACTUAL_NATIVE_MCP_TEXT)
+    assert "caller_thread_id" not in payload and "task_id" not in payload and "dispatch_id" not in payload
+    assert "exit_code" not in ACTUAL_NATIVE_MCP_TEXT and "child_exit_code" not in ACTUAL_NATIVE_MCP_TEXT
+    assert h.native_result(dispatch, raw=raw)["action"] == "COMPLETE"
+    assert h.prepare()["action"] == "REUSE"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("child_thread_id", "tampered-child"),
+    ("turn_id", "tampered-turn"),
+    ("status", "failed"),
+    ("error", "tampered-error"),
+])
+def test_native_typed_outcome_must_match_unchanged_actual_mcp_evidence(h, field, value):
+    h.add()
+    dispatch = h.issue()
+    raw = {"isError": False, "content": [{"type": "text", "text": ACTUAL_NATIVE_MCP_TEXT}]}
+    payload = json.loads(ACTUAL_NATIVE_MCP_TEXT)
+    wake = payload["wake"]
+    turn = payload["polls"][0]["latestTurn"]
+    outcome = {"kind": "collaboration_turn", "child_thread_id": wake["threadId"],
+               "turn_id": wake["turnId"], "status": turn["status"], "error": turn["error"]}
+    outcome[field] = value
+    association = {"source": "graph_dispatch_and_native_launch", "caller_thread_id": "root",
+                   "task_id": "A", "dispatch_id": dispatch,
+                   "child_thread_id": outcome["child_thread_id"], "turn_id": outcome["turn_id"]}
+
+    with pytest.raises(InvalidEvent):
+        h.native_result(dispatch, raw=raw, native_outcome=outcome, caller_association=association)
+
+    assert raw["content"][0]["text"] == ACTUAL_NATIVE_MCP_TEXT
+    assert h.task()["status"] != "COMPLETE" and h.task()["lease"] is True
+
+
+@pytest.mark.parametrize("raw", [
+    {"isError": False, "content": [{"type": "text", "text": "{"}]},
+    {"isError": True, "content": [{"type": "text", "text": ACTUAL_NATIVE_MCP_TEXT}]},
+    {"isError": False, "content": [{"type": "text", "text": "null"}]},
+    native_payload(timedOut=True),
+    native_payload(turn_status="in_progress"),
+    native_payload(without_error=True),
+    native_payload(wake_thread_id="different-child"),
+    native_payload(poll_turn_id="different-turn"),
+    ambiguous_native_payload(),
+    {"isError": False, "content": [{"type": "text", "text": ACTUAL_NATIVE_MCP_TEXT},
+                                     {"type": "text", "text": ACTUAL_NATIVE_MCP_TEXT}]},
+])
+def test_native_malformed_absent_error_unknown_or_mismatched_raw_never_completes(h, raw):
+    h.add()
+    dispatch = h.issue()
+    with pytest.raises(InvalidEvent):
+        h.native_result(dispatch, raw=raw)
+    assert h.task()["status"] in {"ISSUING", "UNKNOWN"} and h.task()["lease"] is True
+
+
+def test_native_turn_error_fails_but_releases_only_when_quiescent(h):
+    h.add()
+    result = h.native_result(h.issue(), raw=native_payload(turn_error="worker failed"))
+    assert result["action"] == "FAILED" and result["lease"] is False
+
+
+def test_native_absent_outcome_never_completes(h):
+    h.add()
+    with pytest.raises(InvalidEvent):
+        h.native_result(h.issue(), include_outcome=False)
+    assert h.task()["status"] == "UNKNOWN" and h.task()["lease"] is True
+
+
+def test_native_nonquiescent_turn_retains_lease(h):
+    h.add()
+    result = h.native_result(h.issue(), raw=native_payload(thread_status="running"))
+    assert result["action"] == "FAILED" and result["lease"] is True
+
+
+@pytest.mark.parametrize("changes", [
+    {"caller_association": {"source": "graph_dispatch_and_native_launch", "caller_thread_id": "wrong",
+        "task_id": "A", "dispatch_id": "dispatch", "child_thread_id": "child", "turn_id": "turn"}},
+    {"caller_association": {"source": "graph_dispatch_and_native_launch", "caller_thread_id": "root",
+        "task_id": "wrong-task", "dispatch_id": "dispatch", "child_thread_id": "child", "turn_id": "turn"}},
+    {"caller_association": {"source": "graph_dispatch_and_native_launch", "caller_thread_id": "root",
+        "task_id": "A", "dispatch_id": "wrong-dispatch", "child_thread_id": "child", "turn_id": "turn"}},
+    {"caller_association": {"source": "graph_dispatch_and_native_launch", "caller_thread_id": "root",
+        "task_id": "A", "dispatch_id": "dispatch", "child_thread_id": "wrong-child", "turn_id": "turn"}},
+    {"caller_association": {"source": "graph_dispatch_and_native_launch", "caller_thread_id": "root",
+        "task_id": "A", "dispatch_id": "dispatch", "child_thread_id": "child", "turn_id": "wrong-turn"}},
+    {"child_exit_code": 0},
+])
+def test_native_wrong_caller_task_dispatch_child_or_turn_association_is_rejected(h, changes):
+    h.add()
+    dispatch = h.issue()
+    with pytest.raises(InvalidEvent):
+        h.native_result(dispatch, **changes)
+    assert h.task()["status"] in {"ISSUING", "UNKNOWN"} and h.task()["lease"] is True
+
+
+@pytest.mark.parametrize("acceptance", [None, {"caller_thread_id": "root", "accepted": False},
+                                         {"caller_thread_id": "other", "accepted": True}])
+def test_native_missing_false_or_wrong_caller_acceptance_never_completes(h, acceptance):
+    h.add()
+    result = h.native_result(h.issue(), caller_acceptance=acceptance)
+    assert result["action"] == "FAILED" and result["lease"] is False
+
+
+@pytest.mark.parametrize("changes", [
+    {"artifacts": []},
+    {"artifacts": [{"path": "missing", "sha256": "0" * 64, "size_bytes": 1}]},
+    {"artifacts": [{"path": "A-native-output.json", "sha256": "0" * 64, "size_bytes": 18}]},
+    {"native_evidence": {"path": "missing", "sha256": "0" * 64}},
+])
+def test_native_missing_or_drifted_evidence_and_artifacts_never_complete(h, changes):
+    h.add()
+    dispatch = h.issue()
+    if changes.get("native_evidence", {}).get("path") == "missing":
+        with pytest.raises(FileNotFoundError):
+            h.native_result(dispatch, **changes)
+    else:
+        result = h.native_result(dispatch, **changes)
+        assert result["action"] == "FAILED"
+
+
+def test_native_wrong_artifact_size_never_completes(h):
+    h.add()
+    dispatch = h.issue()
+    artifact = h.file("A-native-output.json", {"actual": "native output"})
+    artifact["size_bytes"] += 1
+    result = h.native_result(dispatch, artifacts=[artifact])
+    assert result["action"] == "FAILED"
+
+
+def test_native_raw_evidence_hash_drift_never_completes(h):
+    h.add()
+    evidence = h.file("A-native-result.json", {"fixture": "drift"})
+    evidence["sha256"] = "0" * 64
+    with pytest.raises(InvalidEvent, match="native evidence drift"):
+        h.native_result(h.issue(), native_evidence=evidence)
 
 
 def test_completed_reuse_and_changed_identity(h):
