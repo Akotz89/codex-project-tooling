@@ -108,7 +108,7 @@ def prepared_request(settings: dict, capability: dict) -> dict:
         raise ModelPolicyError("saved_routing_policy must be configured at the project settings top level")
     allowed_models = validate_allowed_models(config["allowed_models"]) if "allowed_models" in config else None
     allowed_efforts = validate_allowed_efforts(config["allowed_efforts"]) if "allowed_efforts" in config else None
-    saved = validate_saved_routing_policy(settings["saved_routing_policy"]) if "saved_routing_policy" in settings else None
+    saved = validate_saved_routing_policy(settings["saved_routing_policy"]) if settings.get("saved_routing_policy") is not None else None
     if saved is not None:
         pairs = collaboration_capability_pairs(capability)
         if not any((row["model"], row["effort"]) == (saved["model"], saved["effort"])

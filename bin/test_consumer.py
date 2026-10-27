@@ -219,6 +219,9 @@ class ConsumerTests(Fixture):
     def test_native_hook_consumes_and_rechecks_saved_routing_policy(self):
         self.native_hook_source_boundary("spawn_agent", saved_policy=True)
 
+    def test_native_hook_treats_explicit_null_saved_policy_as_automatic(self):
+        self.native_hook_source_boundary("spawn_agent", saved_null=True)
+
     def test_actual_flat_native_hook_rewrites_and_denies_wrong_locator(self):
         self.native_hook_source_boundary("collaborationspawn_agent")
 
@@ -235,7 +238,8 @@ class ConsumerTests(Fixture):
         self.native_hook_source_boundary("collaborationspawn_agent", opaque=True, audit_controls=True)
 
     def native_hook_source_boundary(self, tool_name, opaque=False, session_layout="root", audit_controls=False,
-                                    effort_policy=False, legacy_effort_policy=False, saved_policy=False):
+                                    effort_policy=False, legacy_effort_policy=False, saved_policy=False,
+                                    saved_null=False):
         session_id = "01a15564-fd5f-7550-aadb-de6160ef7b5d"
         caller = "native:" + session_id
         body = "Perform the bounded parser task and verify its assertions."
@@ -265,6 +269,11 @@ class ConsumerTests(Fixture):
             settings = json.loads(settings_path.read_text())
             settings.setdefault('jev_router', {}).update(allowed_models=['gpt-6-luna'])
             settings['saved_routing_policy'] = {'model': 'gpt-6-luna', 'effort': 'medium'}
+            settings_path.write_text(json.dumps(settings))
+        if saved_null:
+            settings_path = self.app / consumer.SETTINGS
+            settings = json.loads(settings_path.read_text())
+            settings['saved_routing_policy'] = None
             settings_path.write_text(json.dumps(settings))
         prepare_args = [sys.executable, "-B", str(self.fixture_factory / "bin/factory.py"),
                         "route-subagent", "--caller-id", caller, "--work-dir", "work/native"]
@@ -1456,6 +1465,103 @@ class InstallTests(Fixture):
             for _ in range(2):
                 self.assertEqual(factory.main(), 0)
                 self.assertEqual(consumer.read_settings(self.app)["jev_router"], router)
+
+    def test_init_preflights_invalid_saved_policy_before_sync_or_source_install(self):
+        factory = load("factory_invalid_preflight_test", HOME / "bin/factory.py")
+        original = json.dumps({**self.settings, "project_binding": consumer.project_binding(self.app),
+                               "saved_routing_policy": {"model": "unsupported", "effort": "low"}})
+        (self.app / consumer.SETTINGS).write_text(original)
+        with patch.object(sys, "argv", ["factory.py", "init"]), \
+             patch.object(factory.consumer, "project_root", return_value=self.app), \
+             patch.object(factory, "sync") as sync_mock, \
+             patch.object(factory, "install_source") as install_mock, \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(factory.main(), 1)
+        sync_mock.assert_not_called()
+        install_mock.assert_not_called()
+        self.assertEqual((self.app / consumer.SETTINGS).read_text(), original)
+
+    def test_init_preflights_project_binding_drift_before_sync_or_source_install(self):
+        factory = load("factory_binding_preflight_test", HOME / "bin/factory.py")
+        original = json.dumps({**self.settings, "project_binding": {"root": "foreign"}})
+        (self.app / consumer.SETTINGS).write_text(original)
+        with patch.object(sys, "argv", ["factory.py", "init"]), \
+             patch.object(factory.consumer, "project_root", return_value=self.app), \
+             patch.object(factory, "sync") as sync_mock, \
+             patch.object(factory, "install_source") as install_mock, \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(factory.main(), 1)
+        sync_mock.assert_not_called()
+        install_mock.assert_not_called()
+        self.assertEqual((self.app / consumer.SETTINGS).read_text(), original)
+
+    def test_init_refreshes_identity_and_preserves_same_binding_controls(self):
+        factory = load("factory_refresh_identity_test", HOME / "bin/factory.py")
+        binding = consumer.project_binding(self.app)
+        router = {"allowed_models": ["gpt-6-luna"],
+                  "allowed_efforts": {"gpt-6-luna": ["low", "medium"]}}
+        saved = {"model": "gpt-6-luna", "effort": "medium"}
+        operator = {"owner": "Aaron", "label": "keep"}
+        configure(self.app, {**self.settings, "project_binding": binding, "jev_router": router,
+                             "saved_routing_policy": saved, "operator_metadata": operator,
+                             "repository": "old-repository", "kind": "integration"})
+        refreshed = {**self.settings, "source": "refreshed source", "revision": "c" * 40,
+                     "bun": "refreshed bun", "repository": "new-repository", "kind": "integration",
+                     "project_binding": binding}
+        with patch.object(sys, "argv", ["factory.py", "init"]), \
+             patch.object(factory.consumer, "project_root", return_value=self.app), \
+             patch.object(factory, "sync"), \
+             patch.object(factory, "install_source", return_value=refreshed), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(factory.main(), 0)
+        installed = consumer.read_settings(self.app)
+        keys = ("source", "revision", "repository", "bun", "kind")
+        self.assertEqual({key: installed[key] for key in keys}, {key: refreshed[key] for key in keys})
+        self.assertEqual(installed["jev_router"], router)
+        self.assertEqual(installed["saved_routing_policy"], saved)
+        self.assertEqual(installed["operator_metadata"], operator)
+        before = {key: installed[key] for key in keys}
+        with patch.object(sys, "argv", ["factory.py", "init"]), \
+             patch.object(factory.consumer, "project_root", return_value=self.app), \
+             patch.object(factory, "sync"), \
+             patch.object(factory, "install_source", return_value=dict(refreshed)), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(factory.main(), 0)
+        after = consumer.read_settings(self.app)
+        self.assertEqual({key: after[key] for key in keys}, before)
+
+    def test_init_refuses_saved_pair_outside_refreshed_ceilings_without_writing(self):
+        factory = load("factory_refreshed_ceiling_test", HOME / "bin/factory.py")
+        binding = consumer.project_binding(self.app)
+        configure(self.app, {**self.settings, "project_binding": binding,
+                             "jev_router": {"allowed_models": ["gpt-6-luna"],
+                                            "allowed_efforts": {"gpt-6-luna": ["medium"]}},
+                             "saved_routing_policy": {"model": "gpt-6-luna", "effort": "medium"}})
+        before = (self.app / consumer.SETTINGS).read_bytes()
+        refreshed = {**self.settings, "jev_router": {"allowed_models": ["gpt-6-luna"],
+                                                     "allowed_efforts": {"gpt-6-luna": ["low"]}}}
+        with patch.object(sys, "argv", ["factory.py", "init"]), \
+             patch.object(factory.consumer, "project_root", return_value=self.app), \
+             patch.object(factory, "sync"), \
+             patch.object(factory, "install_source", return_value=refreshed), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(factory.main(), 1)
+        self.assertEqual((self.app / consumer.SETTINGS).read_bytes(), before)
+        self.assertFalse((self.app / consumer.SETTINGS).with_suffix(".tmp").exists())
+
+    def test_init_refuses_mismatched_source_binding_before_configure_writes(self):
+        factory = load("factory_returned_binding_test", HOME / "bin/factory.py")
+        original = (self.app / consumer.SETTINGS).read_bytes()
+        returned = {**self.settings, "project_binding": {"root": "foreign"}}
+        with patch.object(sys, "argv", ["factory.py", "init"]), \
+             patch.object(factory.consumer, "project_root", return_value=self.app), \
+             patch.object(factory, "sync"), \
+             patch.object(factory, "install_source", return_value=returned), \
+             patch.object(factory, "configure") as configure_mock, \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(factory.main(), 1)
+        configure_mock.assert_not_called()
+        self.assertEqual((self.app / consumer.SETTINGS).read_bytes(), original)
 
     def test_policy_pointer_preserves_existing_bytes_and_is_idempotent(self):
         agents = self.app / "engineering.md"

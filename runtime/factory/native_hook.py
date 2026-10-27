@@ -126,7 +126,7 @@ def validate(event, root, *, fresh=True, private_reader=None):
     current_policy = {'allowed_models': current_models}
     if current_efforts is not None:
         current_policy['allowed_efforts'] = current_efforts
-    current_saved = validate_saved_routing_policy(settings['saved_routing_policy']) if 'saved_routing_policy' in settings else None
+    current_saved = validate_saved_routing_policy(settings['saved_routing_policy']) if settings.get('saved_routing_policy') is not None else None
     if current_saved is not None:
         current_policy['saved_routing_policy'] = current_saved
     arguments, locator, native = dispatch_input(event)

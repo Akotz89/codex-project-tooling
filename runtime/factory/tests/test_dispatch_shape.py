@@ -213,7 +213,6 @@ class TypedAssessmentBridgeTests(unittest.TestCase):
         self.assertEqual(consumer.prepared_request({'saved_routing_policy': saved}, capability),
                          {'allowed_models': None, 'allowed_efforts': None, 'saved_routing_policy': saved})
         for settings in (
-                {'saved_routing_policy': None},
                 {'saved_routing_policy': {'model': 'gpt-6.1-sol', 'effort': 'xhigh'}},
                 {'jev_router': {'allowed_efforts': {'gpt-6.1-sol': ['low']}},
                  'saved_routing_policy': saved},
@@ -222,6 +221,9 @@ class TypedAssessmentBridgeTests(unittest.TestCase):
                 {'jev_router': {'saved_routing_policy': saved}}):
             with self.subTest(settings=settings), self.assertRaises(ValueError):
                 consumer.prepared_request(settings, capability)
+        automatic = {'allowed_models': None, 'allowed_efforts': None, 'saved_routing_policy': None}
+        self.assertEqual(consumer.prepared_request({}, capability), automatic)
+        self.assertEqual(consumer.prepared_request({'saved_routing_policy': None}, capability), automatic)
 
     def test_routing_policy_support_reports_match_provider_contract(self):
         consumer_report = consumer.routing_policy_support()
