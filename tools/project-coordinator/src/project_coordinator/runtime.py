@@ -935,8 +935,22 @@ def completion_valid(model, task):
         if result.get("thread_id") != dispatch_thread(model, task):
             return False
         native = result["native_evidence"]
-        if digest(canonical(model["project"]["root"], native["path"])) != native["sha256"]:
+        validate_file(native)
+        native_path = canonical(model["project"]["root"], native["path"])
+        if digest(native_path) != native["sha256"]:
             return False
+        if "native_outcome" in result:
+            with open(native_path) as stream:
+                raw = json.load(stream)
+            if (result.get("dispatch_id") != task.get("dispatch_id")
+                    or result.get("source_digest") != task.get("source_digest")
+                    or result.get("scope_digest") != task.get("scope_digest")):
+                return False
+            observed = native_completion(model, task, result, raw)
+            if not (observed["terminal"] and observed["quiescent"]
+                    and observed["status"] == "completed" and observed["error"] is None
+                    and observed["accepted"]):
+                return False
         if task.get("ack"):
             receipt_file(model, {"receipt": task["ack"]})
         return True
@@ -1006,6 +1020,78 @@ def normalize_native(raw):
                 require(string(payload["threadId"]), "native threadId must be a string")
                 return payload
     raise InvalidEvent("native receipt has no supported threadId payload")
+
+
+def normalize_native_completion(raw):
+    """Read one completed native collaboration turn from the supported MCP wait shape."""
+    require(isinstance(raw, dict) and raw.get("isError") is False,
+            "native completion must be a successful MCP result")
+    content = raw.get("content")
+    require(isinstance(content, list) and len(content) == 1
+            and isinstance(content[0], dict) and content[0].get("type") == "text"
+            and isinstance(content[0].get("text"), str),
+            "native completion requires one MCP text result")
+    try:
+        payload = json.loads(content[0]["text"])
+    except (TypeError, ValueError) as exc:
+        raise InvalidEvent("native completion text is malformed JSON") from exc
+    require(isinstance(payload, dict), "native completion payload must be an object")
+    require(payload.get("timedOut") is False, "native completion wait timed out")
+    wake = payload.get("wake")
+    polls = payload.get("polls")
+    require(isinstance(wake, dict) and wake.get("reason") == "turnCompleted",
+            "native completion wake is absent or unknown")
+    require(isinstance(polls, list) and len(polls) == 1 and isinstance(polls[0], dict),
+            "native completion must identify exactly one poll")
+    poll = polls[0]
+    thread = poll.get("thread")
+    turn = poll.get("latestTurn")
+    require(isinstance(thread, dict) and isinstance(thread.get("status"), dict)
+            and isinstance(turn, dict), "native completion poll is incomplete")
+    thread_id = wake.get("threadId")
+    turn_id = wake.get("turnId")
+    require(native_thread_id(thread_id) and native_thread_id(turn_id)
+            and thread.get("id") == thread_id and turn.get("id") == turn_id,
+            "native completion wake/poll identities mismatch")
+    status = turn.get("status")
+    require(isinstance(status, str) and status in {"completed", "failed", "cancelled"}
+            and "error" in turn,
+            "native completion turn status is unknown")
+    return {"child_thread_id": thread_id, "turn_id": turn_id,
+            "terminal": True, "quiescent": thread["status"].get("type") == "idle",
+            "status": status, "error": turn["error"]}
+
+
+def native_completion(model, task, result, raw):
+    """Validate the caller-bound native result without deriving metadata from raw API output."""
+    outcome = result.get("native_outcome")
+    require(isinstance(outcome, dict) and set(outcome) == {
+        "kind", "child_thread_id", "turn_id", "status", "error"
+    } and outcome.get("kind") == "collaboration_turn",
+            "native_outcome must be a tagged collaboration turn")
+    require(not ({"child_exit_code", "acceptance", "terminal", "quiescent"} & set(result)),
+            "native outcome cannot include process result fields")
+    caller = model["project"]["coordinator_thread_id"]
+    association = result.get("caller_association")
+    require(isinstance(association, dict) and association == {
+        "source": "graph_dispatch_and_native_launch",
+        "caller_thread_id": caller,
+        "task_id": task["id"],
+        "dispatch_id": task["dispatch_id"],
+        "child_thread_id": outcome.get("child_thread_id"),
+        "turn_id": outcome.get("turn_id"),
+    }, "native caller/task/dispatch association mismatch")
+    acceptance = result.get("caller_acceptance")
+    accepted = (isinstance(acceptance, dict)
+                and acceptance.get("caller_thread_id") == caller
+                and acceptance.get("accepted") is True)
+    observed = normalize_native_completion(raw)
+    require(outcome.get("child_thread_id") == observed["child_thread_id"]
+            and outcome.get("turn_id") == observed["turn_id"]
+            and outcome.get("status") == observed["status"]
+            and outcome.get("error") == observed["error"],
+            "native outcome does not match hash-verified raw evidence")
+    return {**observed, "accepted": accepted}
 
 
 def receipt_file(model, event):
@@ -1278,13 +1364,25 @@ def transition(state):
                     require(digest(native_path) == result["native_evidence"]["sha256"], "native evidence drift")
                     with open(native_path) as stream:
                         native_text = stream.read()
-                    require(task["dispatch_id"] in native_text, "native evidence lacks dispatch marker")
-                    require(dispatch_thread(model, task) in native_text, "native evidence lacks target thread")
-                    terminal = result.get("terminal") is True
-                    quiescent = terminal and result.get("quiescent") is True
-                    success = (quiescent and type(result.get("child_exit_code")) is int
-                               and result["child_exit_code"] == 0 and result.get("acceptance") is True
-                               and artifacts_valid(model, result.get("artifacts")))
+                    if "native_outcome" in result:
+                        try:
+                            native_raw = json.loads(native_text)
+                        except (TypeError, ValueError) as exc:
+                            raise InvalidEvent("native completion evidence is malformed JSON") from exc
+                        observed = native_completion(model, task, result, native_raw)
+                        terminal = observed["terminal"]
+                        quiescent = terminal and observed["quiescent"]
+                        success = (quiescent and observed["status"] == "completed"
+                                   and observed["error"] is None and observed["accepted"]
+                                   and artifacts_valid(model, result.get("artifacts")))
+                    else:
+                        require(task["dispatch_id"] in native_text, "native evidence lacks dispatch marker")
+                        require(dispatch_thread(model, task) in native_text, "native evidence lacks target thread")
+                        terminal = result.get("terminal") is True
+                        quiescent = terminal and result.get("quiescent") is True
+                        success = (quiescent and type(result.get("child_exit_code")) is int
+                                   and result["child_exit_code"] == 0 and result.get("acceptance") is True
+                                   and artifacts_valid(model, result.get("artifacts")))
                     task.update(status="COMPLETE" if success else "FAILED" if terminal else "UNKNOWN",
                                 lease=not (success or quiescent), result_receipt=event["receipt"])
                     if success:
