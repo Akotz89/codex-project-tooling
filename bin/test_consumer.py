@@ -14,8 +14,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from install import (POLICY_POINTER, HOME, TEMPLATE, configure, install_policy_pointer,
-                     install_source, sync)
+from install import (POLICY_POINTER, STATE_HOME_ENV, HOME, TEMPLATE, backup, backup_path,
+                     configure, install_policy_pointer, install_source, shared_state_root, sync)
 import consumer
 
 
@@ -93,6 +93,10 @@ class Fixture(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(dir=WORK, prefix="factory consumer ")
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
+        self.state_patch = patch.dict(
+            os.environ, {STATE_HOME_ENV: str(self.base / "shared state")})
+        self.state_patch.start()
+        self.addCleanup(self.state_patch.stop)
         self.app = self.base / "application with spaces"
         self.app.mkdir()
         self.git(self.app, "init", "-q")
@@ -1604,8 +1608,11 @@ class InstallTests(Fixture):
         with contextlib.redirect_stdout(io.StringIO()):
             sync(self.app)
         self.assertFalse(policy.exists())
-        backup = self.app / ".factory/backup/factory/WORKFLOW_POLICY.md"
+        backup = backup_path(self.app, Path("factory/WORKFLOW_POLICY.md"))
+        self.assertTrue(backup.is_relative_to(shared_state_root()))
+        self.assertFalse(backup.is_relative_to(self.app))
         self.assertEqual(backup.read_bytes(), policy_bytes)
+        self.assertFalse((self.app / ".factory/backup").exists())
         with contextlib.redirect_stdout(io.StringIO()):
             sync(self.app)
         self.assertFalse(policy.exists())
@@ -1700,7 +1707,7 @@ class InstallTests(Fixture):
         self.assertIn(b"factory/WORKFLOW_POLICY.md", (self.app / "engineering.md").read_bytes())
         self.assertNotIn(b"template/factory/WORKFLOW_POLICY.md", (self.app / "engineering.md").read_bytes())
         self.assertEqual(changed.read_bytes(), (TEMPLATE / "factory/RUNTIME_HOST.md").read_bytes())
-        self.assertEqual((self.app / ".factory/backup/factory/RUNTIME_HOST.md").read_bytes(),
+        self.assertEqual(backup_path(self.app, Path("factory/RUNTIME_HOST.md")).read_bytes(),
                          b"locally edited\r\n")
         with contextlib.redirect_stdout(io.StringIO()) as out:
             sync(self.app)
@@ -1759,14 +1766,50 @@ class InstallTests(Fixture):
         with contextlib.redirect_stdout(io.StringIO()):
             sync(self.app, True)
         self.assertEqual(path.read_bytes(), b"custom notes\r\n")
+        self.assertFalse(shared_state_root().exists())
         self.assertFalse((self.app / ".factory/backup").exists())
         with contextlib.redirect_stdout(io.StringIO()):
             sync(self.app)
             path.write_bytes(b"second custom version")
             sync(self.app)
-        base = self.app / ".factory/backup/factory/RUNTIME_HOST.md"
+        base = backup_path(self.app, Path("factory/RUNTIME_HOST.md"))
         self.assertEqual(base.read_bytes(), b"second custom version")
         self.assertFalse(base.with_suffix(".md.1").exists())
+
+    def test_backup_is_external_project_isolated_and_preserves_legacy_backups(self):
+        path = self.app / "factory/RUNTIME_HOST.md"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"first project preimage")
+        legacy = self.app / ".factory/backup/factory/RUNTIME_HOST.md"
+        legacy.parent.mkdir(parents=True)
+        legacy.write_bytes(b"existing in-project backup")
+        with contextlib.redirect_stdout(io.StringIO()):
+            sync(self.app)
+        first = backup_path(self.app, Path("factory/RUNTIME_HOST.md"))
+        self.assertEqual(first.read_bytes(), b"first project preimage")
+        self.assertFalse(first.is_relative_to(self.app))
+        self.assertEqual(legacy.read_bytes(), b"existing in-project backup")
+
+        other = self.base / "second project with spaces"
+        other.mkdir()
+        other_file = other / "factory/RUNTIME_HOST.md"
+        other_file.parent.mkdir()
+        other_file.write_bytes(b"second project preimage")
+        with contextlib.redirect_stdout(io.StringIO()):
+            backup(other, other_file, False)
+        second = backup_path(other, Path("factory/RUNTIME_HOST.md"))
+        self.assertNotEqual(first, second)
+        self.assertEqual(second.read_bytes(), b"second project preimage")
+
+    def test_backup_rejects_state_inside_project(self):
+        path = self.app / "factory/RUNTIME_HOST.md"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"preserve")
+        with patch.dict(os.environ, {STATE_HOME_ENV: str(self.app / ".state")}), \
+             self.assertRaisesRegex(ValueError, "outside the project repository"):
+            backup(self.app, path, False)
+        self.assertEqual(path.read_bytes(), b"preserve")
+        self.assertFalse((self.app / ".state").exists())
 
     def test_backup_replacement_is_atomic_and_preserves_last_good_backup(self):
         path = self.app / "factory/RUNTIME_HOST.md"
@@ -1774,7 +1817,7 @@ class InstallTests(Fixture):
         path.write_bytes(b"first preimage")
         with contextlib.redirect_stdout(io.StringIO()):
             sync(self.app)
-        backup = self.app / ".factory/backup/factory/RUNTIME_HOST.md"
+        backup = backup_path(self.app, Path("factory/RUNTIME_HOST.md"))
         self.assertEqual(backup.read_bytes(), b"first preimage")
         path.write_bytes(b"second preimage")
         with patch("install.os.replace", side_effect=OSError("interrupted backup")), \

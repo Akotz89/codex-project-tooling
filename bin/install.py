@@ -1,5 +1,6 @@
 """Install the factory into an application and preserve the user's own files."""
 from __future__ import annotations
+import hashlib
 import json
 import importlib.util
 import os
@@ -30,6 +31,7 @@ POLICY_POINTER = (b"Factory workflow policy: read `template/factory/WORKFLOW_POL
 OLD_POLICY_POINTER = (b"See [factory workflow policy](factory/WORKFLOW_POLICY.md) for "
                       b"factory-specific shared-workflow requirements.")
 LOCAL_POLICY_POINTER = OLD_POLICY_POINTER + b"\n"
+STATE_HOME_ENV = "CODEX_PROJECT_TOOLING_STATE_HOME"
 
 
 def within(root: Path, path: Path) -> Path:
@@ -38,10 +40,42 @@ def within(root: Path, path: Path) -> Path:
     return path
 
 
+def shared_state_root() -> Path:
+    override = os.environ.get(STATE_HOME_ENV)
+    if override:
+        return Path(override).expanduser().resolve()
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData/Local")
+        return (base / "codex-project-tooling").resolve()
+    if sys.platform == "darwin":
+        return (Path.home() / "Library/Application Support/codex-project-tooling").resolve()
+    base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
+    return (base / "codex-project-tooling").resolve()
+
+
+def backup_path(root: Path, path: Path) -> Path:
+    root = root.resolve()
+    source = Path(path)
+    if not source.is_absolute():
+        source = root / source
+    source = within(root, source)
+    state = shared_state_root()
+    if state.is_relative_to(root):
+        raise ValueError(f"Shared state must be outside the project repository: {state}")
+    project_key = hashlib.sha256(os.path.normcase(str(root)).encode("utf-8")).hexdigest()
+    destination = state / "backups" / project_key / source.relative_to(root)
+    resolved_destination = destination.resolve()
+    if not resolved_destination.is_relative_to(state):
+        raise ValueError(f"Backup path resolves outside shared state: {destination}")
+    if resolved_destination.is_relative_to(root):
+        raise ValueError(f"Backup path resolves inside the project repository: {destination}")
+    return destination
+
+
 def backup(root: Path, path: Path, dry: bool) -> None:
-    within(root, path)
-    dest = within(root, root / ".factory/backup" / path.relative_to(root))
-    print(f"preserve {path.relative_to(root)} -> {dest.relative_to(root)}")
+    source = within(root, path)
+    dest = backup_path(root, source)
+    print(f"preserve {path.relative_to(root)} -> {dest}")
     if not dry:
         dest.parent.mkdir(parents=True, exist_ok=True)
         fd, temporary_name = tempfile.mkstemp(prefix=f".{dest.name}.", suffix=".tmp",
@@ -146,7 +180,7 @@ def sync(root: Path, dry: bool = False) -> None:
     if additions and not dry:
         with ignore.open("a", encoding="utf-8") as fh:
             fh.write("\n" + "\n".join(additions) + "\n")
-    print("Your project files are preserved; changed factory files are backed up in .factory/backup.")
+    print("Project files are preserved; rollback copies are kept in shared state outside the repository.")
 
 
 def install_source(repository: str, revision: str, cache: Path, bun: str) -> dict:

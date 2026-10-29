@@ -3,15 +3,21 @@
 Upgrade an installed factory from a separate, reviewed successor checkout. Run
 `python <successor>/bin/factory.py init` from each adopting application repository.
 Keep the previous source checkout unchanged and available for projects that still
-bind to it and for rollback, together with each project's latest `.factory/backup/`
-preimages.
+bind to it and for rollback, together with each project's latest preimages in shared
+state outside the repository. The default is `$XDG_STATE_HOME/codex-project-tooling`
+or `~/.local/state/codex-project-tooling` on Linux,
+`%LOCALAPPDATA%\codex-project-tooling` on Windows, or
+`~/Library/Application Support/codex-project-tooling` on macOS. Set
+`CODEX_PROJECT_TOOLING_STATE_HOME` to select another shared state root; project
+paths are hashed to keep backups separate. Existing project-local `.factory/backup`
+files are left untouched.
 
 - `init` installs the files in `template/` and the Archon source pinned in
   `factory/pack.json`, then validates that source.
 - Files you write for your project are never overwritten: `MISSION.md`,
   `harness/END-TO-END.md`, `harness/harness.config.json`,
   `.factory/holdout/HOLDOUT.md`, and the other project files listed in the installer.
-- An installed factory file you changed is copied to its fixed `.factory/backup/`
+- An installed factory file you changed is copied to its fixed external shared-state
   path before the new version replaces it. Each path keeps only the immediate
   preimage; a later change replaces that backup atomically instead of adding a
   numbered copy. This supports one-step rollback.
@@ -44,7 +50,8 @@ before installation; scaffolding without them cannot run the adapters.
 
 Upgrade from a reviewed, independently pinned successor source, then rerun its
 official installer in each adopting project. Changed managed files are backed
-up under `.factory/backup`; personal files and native configuration are preserved.
+up in shared state outside the repository; personal files and native configuration
+are preserved.
 Keep the previous source and latest preimages for one-step rollback. Do not edit
 generated adapters or repoint an existing immutable source checkout. Frozen
 installations continue using their original implementation until explicitly adopted.

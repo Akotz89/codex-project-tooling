@@ -95,9 +95,15 @@ in the shared source checkout bound by the generated `factory/consumer.py` adapt
 The pointer is added to the project's root `engineering.md`, the conventions file
 the shared workflows read, without replacing existing guidance. The generic policy
 stays in the shared checkout rather than being copied into each project. On upgrade,
-an existing byte-identical copy is moved to the project's single rollback backup;
-a locally modified policy file is preserved and remains the project's referenced
-policy.
+an existing byte-identical copy is saved to shared state outside the project before
+removal; a locally modified policy file is preserved and remains the project's
+referenced policy. Rollback copies are isolated by project path under the operating
+system's application state directory (`$XDG_STATE_HOME/codex-project-tooling`
+or `~/.local/state/codex-project-tooling` on Linux,
+`%LOCALAPPDATA%\codex-project-tooling` on Windows, and
+`~/Library/Application Support/codex-project-tooling` on macOS). Set
+`CODEX_PROJECT_TOOLING_STATE_HOME` to choose another shared state root. Existing
+project-local `.factory/backup` files are left untouched.
 
 **2. Configure Archon.**
 
@@ -252,7 +258,8 @@ workflow PRs merge upstream, updating that pin moves new installs to the merged
 version. Upgrade existing installations from a separate reviewed successor
 checkout by running its `init` in each adopting project. Keep the previous source
 unchanged and retain each project's latest single preimage per changed managed file
-for one-step rollback; a later change atomically replaces that file's prior backup.
+outside the repository under the shared state directory described above, for
+one-step rollback; a later change atomically replaces that file's prior backup.
 Workflow improvements belong in Archon's SDLC pack.
 Neutral standalone Archon users do not need `MISSION.md`,
 the factory workflow policy or any other factory file; those are guidance and
