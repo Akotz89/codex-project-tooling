@@ -12,9 +12,11 @@ def canonical(value):
 
 
 def validate_policy(policy):
-    if not isinstance(policy, dict) or set(policy) != {
-            "project_id", "worker_roles", "linear_workspace", "acceptance_issue", "workflows"}:
+    required = {"project_id", "worker_roles", "linear_workspace", "acceptance_issue", "workflows"}
+    if not isinstance(policy, dict) or not required <= set(policy) or set(policy) - required - {"require_writer_paths"}:
         raise ValueError("explicit project policy with exactly the documented fields is required")
+    if "require_writer_paths" in policy and not isinstance(policy["require_writer_paths"], bool):
+        raise ValueError("policy: require_writer_paths must be a boolean")
     if not canonical(policy["project_id"]):
         raise ValueError("policy: invalid project_id")
     roles = policy["worker_roles"]

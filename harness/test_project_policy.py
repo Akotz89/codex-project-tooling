@@ -29,7 +29,7 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(validate_policy(copy.deepcopy(POLICY)), POLICY)
 
     def test_missing_malformed_and_ambiguous_policy_refused(self):
-        invalid = [None, [], {}, {**POLICY, "extra": True}]
+        invalid = [None, [], {}, {**POLICY, "extra": True}, {**POLICY, "require_writer_paths": "yes"}]
         invalid += [{key: value for key, value in POLICY.items() if key != missing}
                     for missing in POLICY]
         for field, values in {
