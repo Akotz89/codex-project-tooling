@@ -1,13 +1,14 @@
 import copy
 from test_project_policy import POLICY
 import json
+import shlex
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 import unittest
 
-from candidate_identity import identity
+from candidate_identity import identity, harness_digest
 from linear_intake import digest
 from post_builder import check_view, output_view
 from prepare_runtime import prepare
@@ -86,6 +87,49 @@ class OutputCandidateTests(unittest.TestCase):
         view_path.write_text(json.dumps(view))
         controls = prepare(self.candidate, view_path, self.summary, self.root / "controls", POLICY)
         self.assertEqual(controls["baseline"], view["post_builder"]["output_identity"])
+
+    def test_shared_harness_without_project_copies_keeps_controls(self):
+        policy = {**POLICY, "shared_harness": True, "require_writer_paths": True,
+                  "shared_harness_sha256": harness_digest(Path(__file__).resolve().parent.parent)}
+        for name in ("linear_intake.py", "candidate_identity.py", "project_policy.py", "acceptance.py", "test_acceptance.py"):
+            self.git("rm", "-f", "harness/" + name)
+            self.release["allowed_changes"].append("harness/" + name)
+        self.release["allowed_changes"] = list(dict.fromkeys(self.release["allowed_changes"]))
+        (self.candidate / "harness/project-policy.json").write_text(json.dumps(policy))
+        self.release["allowed_changes"].append("harness/project-policy.json")
+        self.git("add", ".")
+        self.commit()
+        for name in ("linear_intake.py", "candidate_identity.py", "project_policy.py", "acceptance.py", "post_builder.py", "prepare_runtime.py"):
+            self.assertFalse((self.candidate / "harness" / name).exists())
+        self.initial.write_text(json.dumps(self.release))
+        view = output_view(self.initial, self.builder, self.summary, "run", policy)
+        check_view(view, self.candidate, policy)
+        with self.assertRaises(ValueError):
+            check_view(view, self.candidate, {**policy, "require_writer_paths": False})
+        with self.assertRaisesRegex(ValueError, "approved policy pin"):
+            check_view(view, self.candidate, {**policy, "shared_harness_sha256": "0" * 64})
+        view_path = self.root / "shared-output-view.json"
+        view_path.write_text(json.dumps(view))
+        output = self.root / "shared-controls"
+        controls = prepare(self.candidate, view_path, self.summary, output, policy)
+        self.assertEqual(controls["baseline"], view["post_builder"]["output_identity"])
+        missing_root = subprocess.run(["python3", str(Path(__file__).resolve().parent / "prepare_runtime.py"),
+                                       str(view_path), str(self.summary), str(self.root / "missing-root-controls"),
+                                       "--policy", str(output / "policy.json")], capture_output=True, text=True)
+        self.assertEqual(missing_root.returncode, 2)
+        self.assertIn("requires --project-root", missing_root.stderr)
+        self.assertFalse((self.root / "missing-root-controls").exists())
+        for name, expected in (("baseline.json", controls["baseline"]), ("negative.json", controls["negative"])):
+            scenario = json.loads((output / name).read_text())
+            observed = subprocess.check_output(shlex.split(scenario["environment"]["candidate_command"]), text=True).strip()
+            self.assertEqual(observed, expected)
+        shared = Path(__file__).resolve().parent
+        for script, expected in ((shared / "linear_intake.py", 3),
+                                 (output / "negative/harness/linear_intake.py", 0)):
+            result = subprocess.run(["python3", str(script), str(output / "release.json"),
+                                     str(output / "missing-lease.json"), "--policy", str(output / "policy.json")],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, expected, result.stderr)
 
     def test_unrelated_path_changed_is_refused(self):
         (self.candidate / "governance.md").write_text("unexpected")

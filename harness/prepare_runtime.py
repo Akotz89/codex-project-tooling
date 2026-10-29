@@ -19,12 +19,14 @@ def write_json(path, value):
 
 def prepare(root, release_path, summary_path, output, policy):
     policy = validate_policy(policy)
+    shared = policy.get("shared_harness", False)
+    source_root = Path(__file__).resolve().parent.parent if shared else root
     release, summary = read_json(release_path), read_json(summary_path)
     check_view(release, root, policy)
     if not intake(release, summary, policy)["ready"]:
         raise ValueError("Root admission is not ready")
-    baseline = identity(root)
-    original = (root / "harness/linear_intake.py").read_text()
+    baseline = identity(root, harness_root=source_root, policy=policy) if shared else identity(root)
+    original = (source_root / "harness/linear_intake.py").read_text()
     start = '    if (task.get("status") != "ACKNOWLEDGED"'
     end = '        return {"ready": False, "reason": "task has no acknowledged matching ownership"}'
     if original.count(start) != 1 or original.count(end) != 1:
@@ -34,10 +36,14 @@ def prepare(root, release_path, summary_path, output, policy):
     output.mkdir(parents=True, exist_ok=False)
     negative = output / "negative"
     (negative / "harness").mkdir(parents=True)
-    for name in ("acceptance.py", "candidate_identity.py", "project_policy.py"):
-        shutil.copyfile(root / "harness" / name, negative / "harness" / name)
+    copied = ("acceptance.py", "candidate_identity.py", "project_policy.py")
+    if shared:
+        copied += ("post_builder.py", "prepare_runtime.py")
+    for name in copied:
+        shutil.copyfile(source_root / "harness" / name, negative / "harness" / name)
     (negative / "harness/linear_intake.py").write_text(defective)
-    defective_identity = identity(negative)
+    defective_identity = (identity(root, harness_root=negative, policy=policy, allow_unapproved_control=True)
+                          if shared else identity(negative))
     if defective_identity == baseline:
         raise AssertionError("mutation changed no executable identity")
     write_json(output / "policy.json", policy)
@@ -51,7 +57,7 @@ def prepare(root, release_path, summary_path, output, policy):
     def command(*args):
         return shlex.join([str(item) for item in args])
 
-    def scenario(target, candidate):
+    def scenario(target, candidate, control=False):
         cli = target / "harness/linear_intake.py"
         positive_argv = ("python", cli, output / "release.json", output / "summary.json", "--policy", output / "policy.json")
         missing_argv = ("python", cli, output / "release.json", output / "missing-lease.json", "--policy", output / "policy.json")
@@ -67,12 +73,15 @@ def prepare(root, release_path, summary_path, output, policy):
             {"id": "missing-ownership", "description": f"Execute {missing}. Require exit 3, ready=false and matching-ownership refusal. missing-lease.json is an explicitly altered negative INPUT derived from the real snapshot, not a live graph change. Admission of this input is a product failure."},
             {"id": "acceptance-contract", "description": f"Independently inspect {target / 'harness/acceptance.py'} against the accepted work order, then exercise at least one accepted and one stale/wrong-run/unresolved-finding fixture through that exact CLI, retaining actual invocation/output. Fixtures test the real acceptance parser; they are never evidence that native workflows ran."}
         ], "environment": {"ownership": "external", "setup": "", "start": "", "teardown": "",
-             "candidate_command": command("python", target / "harness/candidate_identity.py")},
+             "candidate_command": (command("python", target / "harness/candidate_identity.py",
+                                           "--project-root", root, "--policy", output / "policy.json",
+                                           *(["--control-unpinned"] if control else []))
+                                   if shared else command("python", target / "harness/candidate_identity.py"))},
              "candidate": candidate,
              "context": {"required_inputs": required_inputs, "target_root": str(target), "evidence_boundary": "Local executable integration only; no product deployment or end-user acceptance; source is shared, not a hidden holdout."}}
 
-    write_json(output / "baseline.json", scenario(root, baseline))
-    negative_scenario = scenario(negative, defective_identity)
+    write_json(output / "baseline.json", scenario(source_root, baseline))
+    negative_scenario = scenario(negative, defective_identity, control=True)
     # This control changes intake ownership only; don't conflate another parser's availability.
     negative_scenario["assertions"] = negative_scenario["assertions"][:2]
     write_json(output / "negative.json", negative_scenario)
@@ -92,9 +101,13 @@ if __name__ == "__main__":
     parser.add_argument("summary", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--policy", type=Path, required=True)
+    parser.add_argument("--project-root", type=Path)
     args = parser.parse_args()
     try:
-        print(json.dumps(prepare(Path(__file__).resolve().parent.parent, args.release.resolve(),
-                                 args.summary.resolve(), args.output.resolve(), load_policy(args.policy)), sort_keys=True))
+        policy = load_policy(args.policy)
+        if policy.get("shared_harness", False) and args.project_root is None:
+            raise ValueError("shared harness preparation requires --project-root")
+        root = args.project_root.resolve(strict=True) if args.project_root else Path(__file__).resolve().parent.parent
+        print(json.dumps(prepare(root, args.release.resolve(), args.summary.resolve(), args.output.resolve(), policy), sort_keys=True))
     except (ValueError, KeyError, TypeError, OSError, RecursionError) as error:
         parser.exit(2, f"runtime preparation held: {error}\n")

@@ -13,7 +13,7 @@ import sys
 import tempfile
 import unittest
 
-from candidate_identity import identity
+from candidate_identity import identity, bound_identity, harness_digest
 from acceptance import (NATIVE_OUTCOMES, SUITE_VERDICTS,
                         IMPLEMENTATION_RED_CAUSES, REVIEW_ACTIONS)
 
@@ -29,8 +29,12 @@ class AcceptanceTests(unittest.TestCase):
         self.directory = Path(self.temp.name)
         self.root = self.directory / "candidate"
         (self.root / "harness").mkdir(parents=True)
-        for name in ("acceptance.py", "linear_intake.py", "candidate_identity.py", "project_policy.py"):
-            shutil.copyfile(HERE / name, self.root / "harness" / name)
+        shared_policy = getattr(self, "shared_policy", None)
+        if shared_policy:
+            (self.root / "harness/project-policy.json").write_text(json.dumps(shared_policy))
+        else:
+            for name in ("acceptance.py", "linear_intake.py", "candidate_identity.py", "project_policy.py"):
+                shutil.copyfile(HERE / name, self.root / "harness" / name)
         (self.root / "fixture-target.txt").write_text("Explicit parser fixture target\n")
         for args in (["init", "-q"], ["add", "harness", "fixture-target.txt"],
                      ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
@@ -39,7 +43,7 @@ class AcceptanceTests(unittest.TestCase):
                            capture_output=True, timeout=10)
         self.head = subprocess.check_output(
             ["git", "-C", str(self.root), "rev-parse", "HEAD"], text=True).strip()
-        self.baseline = identity(self.root)
+        self.baseline = bound_identity(self.root, shared_policy) if shared_policy else identity(self.root)
         self.negative = "b" * 64 if self.baseline != "b" * 64 else "c" * 64
         self.wrong = "d" * 64
         self.bundle = {
@@ -947,6 +951,19 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual({entry["record"] for entry in expected},
                          {"implementation", "review", "runtime_suite"})
         self.assertIn("target.txt", result["feedback"][-1]["reason"])
+
+
+class SharedAcceptanceTests(unittest.TestCase):
+    def test_acceptance_binds_shared_harness_and_policy_without_project_copies(self):
+        fixture = AcceptanceTests()
+        fixture.shared_policy = {**POLICY, "shared_harness": True,
+                                 "shared_harness_sha256": harness_digest(HERE.parent)}
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        self.assertFalse((fixture.root / "harness/acceptance.py").exists())
+        fixture.run_cli(0, policy=fixture.shared_policy)
+        changed = {**fixture.shared_policy, "require_writer_paths": True}
+        fixture.run_cli(2, policy=changed)
 
 
 if __name__ == "__main__":

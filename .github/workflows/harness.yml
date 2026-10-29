@@ -15,3 +15,7 @@ jobs:
           python-version: '3.12'
       - run: python -m unittest discover -s harness -p test_linear_intake.py -v
       - run: python -m unittest discover -s harness -p test_project_policy.py -v
+      - run: python -m unittest discover -s harness -p test_shared_identity.py -v
+      - run: python -m unittest discover -s harness -p test_post_builder.py -v
+      - run: python -m unittest discover -s harness -p test_runtime_preparation.py -v
+      - run: PYTHONPATH=harness python -m unittest test_acceptance.SharedAcceptanceTests -v
