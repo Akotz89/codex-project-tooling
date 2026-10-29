@@ -77,7 +77,13 @@ def backup(root: Path, path: Path, dry: bool) -> None:
     dest = backup_path(root, source)
     print(f"preserve {path.relative_to(root)} -> {dest}")
     if not dry:
-        dest.parent.mkdir(parents=True, exist_ok=True)
+        relative_path = source.relative_to(root)
+        project_backup_root = dest.parents[len(relative_path.parts) - 1]
+        project_backup_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if os.name != "nt":
+            project_backup_root.chmod(0o700)
+            dest.parent.chmod(0o700)
         fd, temporary_name = tempfile.mkstemp(prefix=f".{dest.name}.", suffix=".tmp",
                                                dir=dest.parent)
         os.close(fd)

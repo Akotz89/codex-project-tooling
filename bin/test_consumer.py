@@ -6,6 +6,7 @@ import io
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1780,6 +1781,8 @@ class InstallTests(Fixture):
         path = self.app / "factory/RUNTIME_HOST.md"
         path.parent.mkdir(parents=True)
         path.write_bytes(b"first project preimage")
+        if os.name != "nt":
+            path.chmod(0o644)
         legacy = self.app / ".factory/backup/factory/RUNTIME_HOST.md"
         legacy.parent.mkdir(parents=True)
         legacy.write_bytes(b"existing in-project backup")
@@ -1789,6 +1792,10 @@ class InstallTests(Fixture):
         self.assertEqual(first.read_bytes(), b"first project preimage")
         self.assertFalse(first.is_relative_to(self.app))
         self.assertEqual(legacy.read_bytes(), b"existing in-project backup")
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE(first.parents[1].stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(first.parent.stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(first.stat().st_mode), 0o644)
 
         other = self.base / "second project with spaces"
         other.mkdir()
