@@ -23,11 +23,13 @@ _adapter_spec.loader.exec_module(adapters)
 PERSONAL = {"harness/harness.config.json", "harness/runtime.inputs.json",
             "harness/END-TO-END.md", "harness/mutations/defects.json", "MISSION.md",
             "FACTORY.md", "FACTORY_RULES.md", ".factory/holdout/HOLDOUT.md"}
-# The shared workflows read a root engineering.md for project conventions, so
-# the policy pointer goes there. A pointer an older install left in AGENTS.md
-# is harmless and stays.
-POLICY_POINTER = (b"See [factory workflow policy](factory/WORKFLOW_POLICY.md) for "
-                  b"factory-specific shared-workflow requirements.\n")
+# Shared workflows read this root conventions file. Point to the canonical policy
+# in their already-bound source checkout rather than installing another copy.
+POLICY_POINTER = (b"Factory workflow policy: read `template/factory/WORKFLOW_POLICY.md` "
+                  b"in the shared source checkout bound by the generated `factory/consumer.py` adapter.\n")
+OLD_POLICY_POINTER = (b"See [factory workflow policy](factory/WORKFLOW_POLICY.md) for "
+                      b"factory-specific shared-workflow requirements.")
+LOCAL_POLICY_POINTER = OLD_POLICY_POINTER + b"\n"
 
 
 def within(root: Path, path: Path) -> Path:
@@ -39,33 +41,54 @@ def within(root: Path, path: Path) -> Path:
 def backup(root: Path, path: Path, dry: bool) -> None:
     within(root, path)
     dest = within(root, root / ".factory/backup" / path.relative_to(root))
-    original = dest
-    n = 1
-    while dest.exists():
-        dest = original.with_name(original.name + f".{n}")
-        n += 1
     print(f"preserve {path.relative_to(root)} -> {dest.relative_to(root)}")
     if not dry:
         dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(path, dest)
+        fd, temporary_name = tempfile.mkstemp(prefix=f".{dest.name}.", suffix=".tmp",
+                                               dir=dest.parent)
+        os.close(fd)
+        temporary = Path(temporary_name)
+        try:
+            shutil.copy2(path, temporary)
+            os.replace(temporary, dest)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def install_policy_pointer(root: Path, dry: bool) -> None:
     path = within(root, root / "engineering.md")
+    local_policy = root / "factory/WORKFLOW_POLICY.md"
+    pointer = POLICY_POINTER
+    if (local_policy.is_symlink()
+            or (local_policy.is_file() and local_policy.read_bytes()
+                != (TEMPLATE / "factory/WORKFLOW_POLICY.md").read_bytes())):
+        pointer = LOCAL_POLICY_POINTER
     previous = path.read_bytes() if path.exists() else b""
-    if POLICY_POINTER.rstrip() in previous.splitlines():
+    lines = previous.splitlines(keepends=True)
+    if any(line.rstrip(b"\r\n") == pointer.rstrip(b"\r\n") for line in lines):
         return
     print("install engineering.md factory policy pointer")
     if not dry:
-        separator = b"" if not previous or previous.endswith((b"\n", b"\r")) else b"\n"
-        gap = b"" if not previous or previous.endswith((b"\n\n", b"\r\n\r\n")) else b"\n"
+        obsolete_pointer = (
+            POLICY_POINTER.rstrip(b"\r\n") if pointer == LOCAL_POLICY_POINTER
+            else OLD_POLICY_POINTER.rstrip(b"\r\n"))
+        if any(line.rstrip(b"\r\n") == obsolete_pointer for line in lines):
+            updated = b"".join(
+                (pointer.rstrip(b"\n") + (b"\r\n" if line.endswith(b"\r\n") else b"\n"))
+                if line.rstrip(b"\r\n") == obsolete_pointer else line
+                for line in lines
+            )
+        else:
+            separator = b"" if not previous or previous.endswith((b"\n", b"\r")) else b"\n"
+            gap = b"" if not previous or previous.endswith((b"\n\n", b"\r\n\r\n")) else b"\n"
+            updated = previous + separator + gap + pointer
         fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp",
                                                dir=path.parent)
         temporary = Path(temporary_name)
         try:
             with os.fdopen(fd, "wb") as handle:
                 fd = -1
-                handle.write(previous + separator + gap + POLICY_POINTER)
+                handle.write(updated)
                 handle.flush()
                 os.fsync(handle.fileno())
             if path.exists():
@@ -84,8 +107,16 @@ def sync(root: Path, dry: bool = False) -> None:
     except (OSError, ValueError, KeyError):
         project = None
     bound = adapters.binding(HOME, project)
-    # An installed file the user changed is backed up before the new version
-    # replaces it; personal files are never overwritten.
+    policy_path = within(root, root / "factory/WORKFLOW_POLICY.md")
+    policy_source = TEMPLATE / "factory/WORKFLOW_POLICY.md"
+    if (policy_path.is_file() and not policy_path.is_symlink()
+            and policy_path.read_bytes() == policy_source.read_bytes()):
+        backup(root, policy_path, dry)
+        print("remove redundant project copy of shared workflow policy")
+        if not dry:
+            policy_path.unlink()
+    # Changed managed files are backed up before replacement; personal files are
+    # never overwritten. The generic policy copy is removed separately above.
     for src in sorted(TEMPLATE.rglob("*")):
         # Development adapters keep disposable runtime/test data under the
         # template's work/. It is never a distributable project scaffold.
@@ -94,7 +125,7 @@ def sync(root: Path, dry: bool = False) -> None:
         if not src.is_file() or "__pycache__" in src.parts or src.suffix in {".pyc", ".pyo"}:
             continue
         rel = src.relative_to(TEMPLATE).as_posix()
-        if rel == "gitignore-additions.txt":
+        if rel in {"gitignore-additions.txt", "factory/WORKFLOW_POLICY.md"}:
             continue
         dest = within(root, root / rel)
         content = adapters.render(rel, bound) if rel in adapters.ENTRIES else src.read_bytes()

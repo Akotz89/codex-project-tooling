@@ -1573,12 +1573,44 @@ class InstallTests(Fixture):
             sync(self.app)
         installed = agents.read_bytes()
         self.assertTrue(installed.startswith(original))
-        self.assertEqual(installed.count(b"factory/WORKFLOW_POLICY.md"), 1)
+        self.assertEqual(installed.count(b"template/factory/WORKFLOW_POLICY.md"), 1)
         self.assertEqual(agents.stat().st_mtime_ns, preserved_time)
         with contextlib.redirect_stdout(io.StringIO()):
             sync(self.app)
         self.assertEqual(agents.read_bytes(), installed)
-        self.assertTrue((self.app / "factory/WORKFLOW_POLICY.md").is_file())
+        self.assertFalse((self.app / "factory/WORKFLOW_POLICY.md").exists())
+
+    def test_upgrade_migrates_old_policy_pointer_without_touching_other_bytes(self):
+        agents = self.app / "engineering.md"
+        original = (b"# Existing\r\n\r\n"
+                    b"See [factory workflow policy](factory/WORKFLOW_POLICY.md) for "
+                    b"factory-specific shared-workflow requirements.\r\n")
+        agents.write_bytes(original)
+        with contextlib.redirect_stdout(io.StringIO()):
+            install_policy_pointer(self.app, False)
+        current = agents.read_bytes()
+        self.assertTrue(current.startswith(b"# Existing\r\n\r\n"))
+        self.assertNotIn(b"See [factory workflow policy]", current)
+        self.assertEqual(current.count(b"template/factory/WORKFLOW_POLICY.md"), 1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            install_policy_pointer(self.app, False)
+        self.assertEqual(agents.read_bytes(), current)
+
+    def test_sync_removes_only_byte_identical_policy_copy_and_keeps_rollback(self):
+        policy = self.app / "factory/WORKFLOW_POLICY.md"
+        policy.parent.mkdir(parents=True)
+        policy_bytes = (TEMPLATE / "factory/WORKFLOW_POLICY.md").read_bytes()
+        policy.write_bytes(policy_bytes)
+        with contextlib.redirect_stdout(io.StringIO()):
+            sync(self.app)
+        self.assertFalse(policy.exists())
+        backup = self.app / ".factory/backup/factory/WORKFLOW_POLICY.md"
+        self.assertEqual(backup.read_bytes(), policy_bytes)
+        with contextlib.redirect_stdout(io.StringIO()):
+            sync(self.app)
+        self.assertFalse(policy.exists())
+        self.assertEqual(backup.read_bytes(), policy_bytes)
+        self.assertFalse(backup.with_name(backup.name + ".1").exists())
 
     def test_policy_pointer_failed_temp_write_preserves_original_and_cleans_temp(self):
         agents = self.app / "engineering.md"
@@ -1609,6 +1641,7 @@ class InstallTests(Fixture):
         with contextlib.redirect_stdout(io.StringIO()):
             sync(self.app)
         self.assertEqual(agents.read_bytes(), POLICY_POINTER)
+        self.assertFalse((self.app / "factory/WORKFLOW_POLICY.md").exists())
 
     def test_policy_pointer_goes_to_engineering_md_and_leaves_agents_md_alone(self):
         agents = self.app / "AGENTS.md"
@@ -1647,6 +1680,9 @@ class InstallTests(Fixture):
             path = self.app / rel
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
+        project_policy = self.app / "factory/WORKFLOW_POLICY.md"
+        project_policy.parent.mkdir(parents=True, exist_ok=True)
+        project_policy.write_bytes(b"project-specific policy notes\r\n")
         changed = self.app / "factory/RUNTIME_HOST.md"
         changed.parent.mkdir(parents=True, exist_ok=True)
         changed.write_bytes(b"locally edited\r\n")
@@ -1660,6 +1696,9 @@ class InstallTests(Fixture):
         self.assertEqual(provider.read_bytes(), provider_before)
         for rel, data in originals.items():
             self.assertEqual((self.app / rel).read_bytes(), data, rel)
+        self.assertEqual(project_policy.read_bytes(), b"project-specific policy notes\r\n")
+        self.assertIn(b"factory/WORKFLOW_POLICY.md", (self.app / "engineering.md").read_bytes())
+        self.assertNotIn(b"template/factory/WORKFLOW_POLICY.md", (self.app / "engineering.md").read_bytes())
         self.assertEqual(changed.read_bytes(), (TEMPLATE / "factory/RUNTIME_HOST.md").read_bytes())
         self.assertEqual((self.app / ".factory/backup/factory/RUNTIME_HOST.md").read_bytes(),
                          b"locally edited\r\n")
@@ -1726,8 +1765,24 @@ class InstallTests(Fixture):
             path.write_bytes(b"second custom version")
             sync(self.app)
         base = self.app / ".factory/backup/factory/RUNTIME_HOST.md"
-        self.assertEqual(base.read_bytes(), b"custom notes\r\n")
-        self.assertEqual(base.with_suffix(".md.1").read_bytes(), b"second custom version")
+        self.assertEqual(base.read_bytes(), b"second custom version")
+        self.assertFalse(base.with_suffix(".md.1").exists())
+
+    def test_backup_replacement_is_atomic_and_preserves_last_good_backup(self):
+        path = self.app / "factory/RUNTIME_HOST.md"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"first preimage")
+        with contextlib.redirect_stdout(io.StringIO()):
+            sync(self.app)
+        backup = self.app / ".factory/backup/factory/RUNTIME_HOST.md"
+        self.assertEqual(backup.read_bytes(), b"first preimage")
+        path.write_bytes(b"second preimage")
+        with patch("install.os.replace", side_effect=OSError("interrupted backup")), \
+             self.assertRaisesRegex(OSError, "interrupted backup"):
+            sync(self.app)
+        self.assertEqual(backup.read_bytes(), b"first preimage")
+        self.assertEqual(path.read_bytes(), b"second preimage")
+        self.assertEqual(list(backup.parent.glob(f".{backup.name}.*.tmp")), [])
 
 
 class NativeAssessmentPackagingTests(unittest.TestCase):

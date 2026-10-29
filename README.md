@@ -90,11 +90,14 @@ on a server, run the installation and configuration there over SSH.
 The installer writes the factory and project templates and installs the pinned
 Archon source. It preserves project configuration on upgrades. It does not configure
 provider authentication, change model tiers or start a schedule.
-It also adds one pointer to `factory/WORKFLOW_POLICY.md` in the project's root
-`engineering.md`, the conventions file the shared workflows read, without replacing
-existing guidance. That policy supplies the
-factory-specific bootstrap, runtime, review and state-label requirements that the
-general-purpose shared workflows intentionally do not assume.
+It also adds one pointer to the canonical `template/factory/WORKFLOW_POLICY.md`
+in the shared source checkout bound by the generated `factory/consumer.py` adapter.
+The pointer is added to the project's root `engineering.md`, the conventions file
+the shared workflows read, without replacing existing guidance. The generic policy
+stays in the shared checkout rather than being copied into each project. On upgrade,
+an existing byte-identical copy is moved to the project's single rollback backup;
+a locally modified policy file is preserved and remains the project's referenced
+policy.
 
 **2. Configure Archon.**
 
@@ -248,10 +251,11 @@ The source revision lives in [`pack.json`](template/factory/pack.json). Once the
 workflow PRs merge upstream, updating that pin moves new installs to the merged
 version. Upgrade existing installations from a separate reviewed successor
 checkout by running its `init` in each adopting project. Keep the previous source
-unchanged and retain the project backups for rollback.
+unchanged and retain each project's latest single preimage per changed managed file
+for one-step rollback; a later change atomically replaces that file's prior backup.
 Workflow improvements belong in Archon's SDLC pack.
 Neutral standalone Archon users do not need `MISSION.md`,
-`factory/WORKFLOW_POLICY.md` or any other factory file; those are guidance and
+the factory workflow policy or any other factory file; those are guidance and
 inputs supplied by this consumer.
 
 ---
@@ -465,7 +469,7 @@ runtime/                     maintained Python implementation and adapter loader
 template/                    project scaffolding and development entry adapters
   factory/consumer.py        compatibility path for the shared consumer
   factory/pack.json          shared source revision and required workflows
-  factory/WORKFLOW_POLICY.md factory requirements read through engineering.md
+  factory/WORKFLOW_POLICY.md canonical policy in the shared source checkout
   factory/RUNTIME_HOST.md    app startup and runtime scenario configuration
   harness/                   project checks and END-TO-END.md
 docs/first-hour.md            what to do after setup

@@ -3,15 +3,21 @@
 Upgrade an installed factory from a separate, reviewed successor checkout. Run
 `python <successor>/bin/factory.py init` from each adopting application repository.
 Keep the previous source checkout unchanged and available for projects that still
-bind to it and for rollback, together with their `.factory/backup/` preimages.
+bind to it and for rollback, together with each project's latest `.factory/backup/`
+preimages.
 
 - `init` installs the files in `template/` and the Archon source pinned in
   `factory/pack.json`, then validates that source.
 - Files you write for your project are never overwritten: `MISSION.md`,
   `harness/END-TO-END.md`, `harness/harness.config.json`,
   `.factory/holdout/HOLDOUT.md`, and the other project files listed in the installer.
-- An installed factory file you changed is copied to `.factory/backup/` before
-  the new version replaces it. Repeated upgrades keep numbered copies.
+- An installed factory file you changed is copied to its fixed `.factory/backup/`
+  path before the new version replaces it. Each path keeps only the immediate
+  preimage; a later change replaces that backup atomically instead of adding a
+  numbered copy. This supports one-step rollback.
+- The generic workflow policy stays in the pinned shared source checkout. On
+  upgrade, an existing byte-identical project copy is backed up once and removed;
+  a locally modified copy and its engineering.md reference are preserved.
 - Run `python factory/consumer.py doctor` afterwards. It checks the pinned source
   and that every shared workflow validates.
 
@@ -39,9 +45,9 @@ before installation; scaffolding without them cannot run the adapters.
 Upgrade from a reviewed, independently pinned successor source, then rerun its
 official installer in each adopting project. Changed managed files are backed
 up under `.factory/backup`; personal files and native configuration are preserved.
-Keep the previous source and backups for rollback. Do not edit generated adapters
-or repoint an existing immutable source checkout. Frozen installations continue
-using their original implementation until explicitly adopted.
+Keep the previous source and latest preimages for one-step rollback. Do not edit
+generated adapters or repoint an existing immutable source checkout. Frozen
+installations continue using their original implementation until explicitly adopted.
 
 CI, application helpers, mutation defaults and usage collection use the verified
 adopting root. Child runtime and routing processes relaunch the local adapter.
