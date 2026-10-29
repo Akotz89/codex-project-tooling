@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 import subprocess
 
-from candidate_identity import identity
+from candidate_identity import bound_identity
 from project_policy import PURPOSES, load_policy, validate_policy
 
 
@@ -376,7 +376,7 @@ def accept(bundle, directory, policy, failures=None):
     require(git(root, "rev-parse", "HEAD") == head, "candidate HEAD has drifted")
     require(not git(root, "status", "--porcelain", "--untracked-files=normal"),
             "candidate checkout is dirty; review cannot certify current files")
-    executable = identity(root)
+    executable = bound_identity(root, policy)
     require(candidate["executable_identity"] == executable, "candidate executable identity has drifted")
     allocation = obj(bundle["allocation"])
     require(allocation["issue"] == policy["acceptance_issue"] and allocation["project_id"] == policy["project_id"], "wrong allocation project or issue")

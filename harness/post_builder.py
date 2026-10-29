@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import subprocess
 
-from candidate_identity import identity
+from candidate_identity import bound_identity
 from project_policy import load_policy, validate_policy
 from linear_intake import digest, intake, read_json
 
@@ -126,7 +126,7 @@ def check_view(view, candidate, policy):
     if (Path(initial["candidate_root"]).resolve(strict=True) != candidate
             or not initial["candidate_branch"].startswith("codex/")
             or git(candidate, "rev-parse", "HEAD") != proof["output_commit"]
-            or identity(candidate) != proof["output_identity"]
+            or bound_identity(candidate, policy) != proof["output_identity"]
             or branch != initial["candidate_branch"]
             or git(candidate, "status", "--porcelain")):
         raise ValueError("output HEAD/base/branch or clean source has drifted")
@@ -144,7 +144,8 @@ def check_view(view, candidate, policy):
         path = source_path(root, row["path"])[1]
         pins[path] = row
     required = {source_path(candidate, name)[1] for name in tracked(candidate)}
-    if not required.issubset(pins) or candidate / "harness/acceptance.py" not in required:
+    if not required.issubset(pins) or (not policy.get("shared_harness", False)
+                                       and candidate / "harness/acceptance.py" not in required):
         raise ValueError("output tracked source pins are incomplete")
     for path, row in pins.items():
         if not path.is_file() or digest(path) != row["sha256"]:
@@ -191,7 +192,7 @@ def output_view(initial_path, builder_path, summary_path, expected_run_id, polic
     view = dict(initial, checkpoint_id=summary["checkpoint_id"], source_files=list(pins.values()),
                 post_builder={"input_release_path": str(initial_path),
                     "input_release_sha256": digest(initial_path), "output_commit": head,
-                    "output_identity": identity(candidate), "changed_paths": changes,
+                    "output_identity": bound_identity(candidate, policy), "changed_paths": changes,
                     "builder_run_id": expected_run_id, "builder_record_path": str(builder_path),
                     "builder_record_sha256": digest(builder_path),
                     "output_source_digest": hashlib.sha256(json.dumps(list(pins.values()), sort_keys=True).encode()).hexdigest()})

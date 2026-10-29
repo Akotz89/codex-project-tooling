@@ -13,10 +13,17 @@ def canonical(value):
 
 def validate_policy(policy):
     required = {"project_id", "worker_roles", "linear_workspace", "acceptance_issue", "workflows"}
-    if not isinstance(policy, dict) or not required <= set(policy) or set(policy) - required - {"require_writer_paths"}:
+    if not isinstance(policy, dict) or not required <= set(policy) or set(policy) - required - {"require_writer_paths", "shared_harness", "shared_harness_sha256"}:
         raise ValueError("explicit project policy with exactly the documented fields is required")
     if "require_writer_paths" in policy and not isinstance(policy["require_writer_paths"], bool):
         raise ValueError("policy: require_writer_paths must be a boolean")
+    if "shared_harness" in policy and not isinstance(policy["shared_harness"], bool):
+        raise ValueError("policy: shared_harness must be a boolean")
+    pin = policy.get("shared_harness_sha256")
+    if policy.get("shared_harness", False) and (not isinstance(pin, str) or not re.fullmatch(r"[0-9a-f]{64}", pin)):
+        raise ValueError("policy: shared harness requires an approved SHA-256 pin")
+    if "shared_harness_sha256" in policy and not policy.get("shared_harness", False):
+        raise ValueError("policy: shared harness pin requires shared mode")
     if not canonical(policy["project_id"]):
         raise ValueError("policy: invalid project_id")
     roles = policy["worker_roles"]

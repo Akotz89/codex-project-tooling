@@ -6,7 +6,7 @@ proves harness behavior; it does not prove a live workflow or product acceptance
 
 Every admission/acceptance API requires an explicit validated policy argument.
 Every operational CLI requires `--policy /absolute/path/to/project-policy.json`.
-The `--identity` diagnostics and `candidate_identity.py` only report source identity.
+The `--identity` diagnostics report individual source identity.
 There is no project policy default or repository search fallback.
 
 The caller owns this policy; save a project-specific copy outside the generic harness:
@@ -28,7 +28,10 @@ The caller owns this policy; save a project-specific copy outside the generic ha
 
 The exact fields and four workflow purposes are required. An optional boolean
 `require_writer_paths` rejects an empty writer scope when true; it defaults to false
-for callers that admit read-only work. Values must be nonempty
+for callers that admit read-only work. Set optional `shared_harness` to true when
+the harness is installed outside the candidate checkout; also set
+`shared_harness_sha256` to the approved digest of its six executable files.
+Values must be nonempty
 canonical strings; worker roles must be unique and match
 `[a-z][a-z0-9_-]{0,63}`; the workspace must be a URL segment and the issue an
 uppercase key plus numeric suffix. Workflow names must be distinct. The neutral
@@ -42,6 +45,17 @@ python harness/post_builder.py RELEASE.json BUILDER.json SUMMARY.json --expected
 python harness/prepare_runtime.py OUTPUT_VIEW.json SUMMARY.json CONTROLS_DIR --policy POLICY.json
 python harness/acceptance.py BUNDLE.json --policy POLICY.json
 ```
+
+For a shared installation, add `--project-root /absolute/candidate/checkout` to
+`prepare_runtime.py`. Its generated candidate commands bind that checkout's Git
+revision, the exact policy and the shared harness files. To calculate the pin from
+the reviewed shared checkout, run:
+
+```bash
+PYTHONPATH=harness python -c 'from candidate_identity import harness_digest; print(harness_digest("."))'
+```
+
+The project checkout no longer needs copies of the harness implementation.
 
 The equivalent Python signatures are `intake(release, summary, policy)`,
 `output_view(initial_path, builder_path, summary_path, expected_run_id, policy)`,
