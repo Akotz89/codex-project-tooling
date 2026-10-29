@@ -99,6 +99,12 @@ class IntakeTests(unittest.TestCase):
         self.assertTrue(result["ready"])
         self.assertEqual(result["writer_paths"], [])
 
+    def test_policy_can_require_a_writer_scope(self):
+        self.release["writer_paths"] = []
+        self.task["writer_paths"] = []
+        with self.assertRaises(ValueError):
+            intake(self.release, self.summary, {**POLICY, "require_writer_paths": True})
+
     def test_duplicate_task_identity_refused(self):
         self.summary["tasks"].append(dict(self.task))
         self.summary["bounds"]["total_tasks"] = 3

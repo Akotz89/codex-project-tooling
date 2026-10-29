@@ -86,7 +86,8 @@ def intake(release, summary, policy):
     if not isinstance(release["writer_paths"], list) or not isinstance(task["writer_paths"], list):
         raise ValueError("writer scope must be a list")
     claims = sorted(str((root / path).resolve()) for path in release["writer_paths"])
-    if (claims != sorted(task["writer_paths"])
+    if ((policy.get("require_writer_paths", False) and not claims)
+            or claims != sorted(task["writer_paths"])
             or any(not Path(path).is_relative_to(root) or Path(path) == root for path in claims)):
         raise ValueError("writer scope does not match allocated task")
     if task["linear_ref"].rstrip("/") != release["linear_ref"]:
